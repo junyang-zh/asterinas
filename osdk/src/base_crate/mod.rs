@@ -47,12 +47,8 @@ pub fn new_base_crate(
     std::env::set_current_dir(&base_crate_path).unwrap();
 
     // Add linker.ld file
-    let linker_ld = include_str!("x86_64-custom.ld.template");
-    fs::write("x86_64-custom.ld", linker_ld).unwrap();
-
-    // Add target json file
-    let target_json = include_str!("x86_64-custom.json.template");
-    fs::write("x86_64-custom.json", target_json).unwrap();
+    let linker_ld = include_str!("x86_64.ld.template");
+    fs::write("x86_64.ld", linker_ld).unwrap();
 
     // Overrite the main.rs file
     let main_rs = include_str!("main.rs.template");

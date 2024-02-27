@@ -1,5 +1,5 @@
 [workspace]
-
+resolver = "2"
 members = [
     "framework/aster-frame",
     "framework/libs/align_ext",
@@ -28,7 +28,6 @@ members = [
     "kernel/libs/typeflags",
     "kernel/libs/typeflags-util",
 ]
-
 exclude = [
     "osdk",
     "target/osdk/base",
@@ -37,3 +36,15 @@ exclude = [
     "kernel/libs/comp-sys/component-macro",
     "kernel/libs/comp-sys/controlled",
 ]
+
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+panic = "unwind"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = false
+panic = "unwind"

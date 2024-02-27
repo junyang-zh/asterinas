@@ -3,11 +3,7 @@
 mod bin;
 mod grub;
 
-use std::{
-    path::{Path, PathBuf},
-    process,
-    str::FromStr,
-};
+use std::{path::Path, process};
 
 use bin::strip_elf_for_qemu;
 
@@ -118,12 +114,17 @@ pub fn do_build(
 }
 
 fn build_kernel_elf(args: &CargoArgs, cargo_target_directory: impl AsRef<Path>) -> AsterBin {
-    let target_json_path = PathBuf::from_str("x86_64-custom.json").unwrap();
+    let target = "x86_64-unknown-none";
 
     let mut command = cargo();
     command.env_remove("RUSTUP_TOOLCHAIN");
+    // We disable RELRO and PIC here, they cause link failures
+    command.env(
+        "RUSTFLAGS",
+        "-C code-model=kernel -C link-arg=-Tx86_64.ld -C relocation-model=static -Zrelro-level=off",
+    );
     command.arg("build");
-    command.arg("--target").arg(&target_json_path);
+    command.arg("--target").arg(&target);
     command
         .arg("--target-dir")
         .arg(cargo_target_directory.as_ref());
@@ -135,9 +136,7 @@ fn build_kernel_elf(args: &CargoArgs, cargo_target_directory: impl AsRef<Path>) 
         process::exit(Errno::ExecuteCommand as _);
     }
 
-    let aster_bin_path = cargo_target_directory
-        .as_ref()
-        .join(target_json_path.file_stem().unwrap().to_str().unwrap());
+    let aster_bin_path = cargo_target_directory.as_ref().join(&target);
     let aster_bin_path = if args.profile == "dev" {
         aster_bin_path.join("debug")
     } else {
