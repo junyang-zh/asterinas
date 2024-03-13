@@ -9,12 +9,15 @@ use super::{
 };
 use crate::{
     arch::mm::PageTableFlags,
-    config::{KERNEL_STACK_SIZE, PAGE_SIZE},
     cpu::CpuSet,
     prelude::*,
     sync::{Mutex, MutexGuard},
     user::UserSpace,
-    vm::{page_table::KERNEL_PAGE_TABLE, VmAllocOptions, VmSegment},
+    vm::{
+        config::{KERNEL_STACK_SIZE, PAGE_SIZE},
+        page_table::KERNEL_PAGE_TABLE,
+        VmAllocOptions, VmSegment,
+    },
 };
 
 core::arch::global_asm!(include_str!("switch.S"));

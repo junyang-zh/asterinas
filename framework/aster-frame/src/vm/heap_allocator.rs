@@ -11,11 +11,13 @@ use log::debug;
 
 use super::paddr_to_vaddr;
 use crate::{
-    config::{KERNEL_HEAP_SIZE, PAGE_SIZE},
     prelude::*,
     sync::SpinLock,
     trap::disable_local,
-    vm::frame_allocator::FRAME_ALLOCATOR,
+    vm::{
+        config::{KERNEL_HEAP_SIZE, PAGE_SIZE},
+        frame_allocator::FRAME_ALLOCATOR,
+    },
     Error,
 };
 

@@ -8,6 +8,7 @@ pub type Vaddr = usize;
 /// Physical addresses.
 pub type Paddr = usize;
 
+pub mod config;
 pub(crate) mod dma;
 mod frame;
 mod frame_allocator;
@@ -34,7 +35,7 @@ pub use self::{
 };
 use crate::{
     boot::memory_region::{MemoryRegion, MemoryRegionType},
-    config::{KERNEL_OFFSET, PAGE_SIZE, PHYS_OFFSET},
+    vm::config::{kernel_loaded_offset, KERNEL_PHYS_SPACE_OFFSET, PAGE_SIZE},
 };
 
 /// Get physical address trait
@@ -43,9 +44,9 @@ pub trait HasPaddr {
 }
 
 pub fn vaddr_to_paddr(va: Vaddr) -> Option<Paddr> {
-    if (PHYS_OFFSET..=KERNEL_OFFSET).contains(&va) {
+    if (KERNEL_PHYS_SPACE_OFFSET..=kernel_loaded_offset()).contains(&va) {
         // can use offset to get the physical address
-        Some(va - PHYS_OFFSET)
+        Some(va - KERNEL_PHYS_SPACE_OFFSET)
     } else {
         page_table::vaddr_to_paddr(va)
     }
@@ -57,7 +58,7 @@ pub const fn is_page_aligned(p: usize) -> bool {
 
 /// Convert physical address to virtual address using offset, only available inside aster-frame
 pub(crate) fn paddr_to_vaddr(pa: usize) -> usize {
-    pa + PHYS_OFFSET
+    pa + KERNEL_PHYS_SPACE_OFFSET
 }
 
 /// Only available inside aster-frame
