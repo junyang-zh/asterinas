@@ -85,9 +85,9 @@ pub fn load_program_to_vm(
         );
     }
     process_vm.clear();
-    let vdso_text_base = map_vdso_to_vm(process_vm);
+    let vdso_text_base = map_vdso_to_vm(&process_vm);
     let elf_load_info = load_elf_to_vm(
-        process_vm,
+        &process_vm,
         &*file_header,
         elf_file,
         fs_resolver,

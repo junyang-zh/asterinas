@@ -95,7 +95,7 @@ fn lookup_and_parse_ldso(
 }
 
 fn load_ldso(root_vmar: &Vmar<Full>, ldso_file: &Dentry, ldso_elf: &Elf) -> Result<LdsoLoadInfo> {
-    let map_addr = map_segment_vmos(ldso_elf, root_vmar, ldso_file)?;
+    let (map_addr, _) = map_segment_vmos(ldso_elf, root_vmar, ldso_file)?;
     Ok(LdsoLoadInfo::new(
         ldso_elf.entry_point() + map_addr,
         map_addr,
@@ -120,7 +120,8 @@ fn init_and_map_vmos(
         None
     };
 
-    let map_addr = map_segment_vmos(elf, root_vmar, elf_file)?;
+    let (map_addr, map_size) = map_segment_vmos(elf, root_vmar, elf_file)?;
+    process_vm.replace_user_heap(map_addr + map_size);
     let mut aux_vec = init_aux_vec(elf, map_addr, vdso_text_base)?;
     let mut init_stack = InitStack::new_default_config(argv, envp);
     init_stack.init(root_vmar, elf, &ldso_load_info, &mut aux_vec)?;
@@ -184,7 +185,10 @@ impl ElfLoadInfo {
 }
 
 /// init vmo for each segment and then map segment to root vmar
-pub fn map_segment_vmos(elf: &Elf, root_vmar: &Vmar<Full>, elf_file: &Dentry) -> Result<Vaddr> {
+/// 
+/// return the base address of the mapped segments and the length from the base
+/// address to the end of the last segment
+pub fn map_segment_vmos(elf: &Elf, root_vmar: &Vmar<Full>, elf_file: &Dentry) -> Result<(Vaddr, usize)> {
     // all segments of the shared object must be mapped to a continuous vm range
     // to ensure the relative offset of each segment not changed.
     let base_addr = if elf.is_shared_object() {
@@ -192,17 +196,19 @@ pub fn map_segment_vmos(elf: &Elf, root_vmar: &Vmar<Full>, elf_file: &Dentry) ->
     } else {
         0
     };
+    let mut end_addr = base_addr;
     for program_header in &elf.program_headers {
         let type_ = program_header
             .get_type()
             .map_err(|_| Error::with_message(Errno::ENOEXEC, "parse program header type fails"))?;
         if type_ == program::Type::Load {
+            end_addr = end_addr.max(program_header.virtual_addr as usize + program_header.mem_size as usize);
             check_segment_align(program_header)?;
             let vmo = init_segment_vmo(program_header, elf_file)?;
             map_segment_vmo(program_header, vmo, root_vmar, base_addr)?;
         }
     }
-    Ok(base_addr)
+    Ok((base_addr, end_addr - base_addr))
 }
 
 fn base_map_addr(elf: &Elf, root_vmar: &Vmar<Full>) -> Result<Vaddr> {

@@ -497,11 +497,15 @@ impl Process {
         &self.process_vm
     }
 
+    pub fn vm_mut(&mut self) -> &mut ProcessVm {
+        &mut self.process_vm
+    }
+
     pub fn root_vmar(&self) -> &Vmar<Full> {
         self.process_vm.root_vmar()
     }
 
-    pub fn user_heap(&self) -> &UserHeap {
+    pub fn user_heap(&self) -> &SpinLock<Option<UserHeap>> {
         self.process_vm.user_heap()
     }
 

@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! This module defines the process initial stack.
+//! 
 //! The process initial stack, contains arguments, environmental variables and auxiliary vectors
-//! The data layout of init stack can be seen in Figure 3.9 in https://uclibc.org/docs/psABI-x86_64.pdf
+//! The data layout of init stack can be seen in Figure 3.9 in <https://uclibc.org/docs/psABI-x86_64.pdf>
+//! 
+//! Kernel may lose control of the process stack after the process is created. The process stack will
+//! be nothing more special than a normal memory region but with it's size managed by rlimit.
 
 use core::mem;
 
@@ -26,11 +30,6 @@ pub const INIT_STACK_SIZE: usize = 64 * 1024; // 64 KiB
  * Illustration of the virtual memory space containing the processes' init stack:
  *
  *  (high address)
- *  +---------------------+ <------+ Highest address
- *  |                     |          Preserved page
- *  +---------------------+
- *  |                     |          Random stack paddings
- *  |                     |
  *  +---------------------+ <------+ Top of stack
  *  |                     |
  *  | Null-terminated     |
@@ -65,10 +64,8 @@ pub const INIT_STACK_SIZE: usize = 64 * 1024; // 64 KiB
  *  | long argc           | <------+ Program arguments
  *  +---------------------+
  *  |                     |
- *  |                     |
+ *  | ...                 |
  *  +---------------------+
- *  |                     |
- *  +---------------------+ <------+ User stack default rlimit
  *  (low address)
  */
 pub struct InitStack {
@@ -101,9 +98,9 @@ impl InitStack {
 
     pub fn new_default_config(argv: Vec<CString>, envp: Vec<CString>) -> Self {
         let nr_pages_padding = {
-            let mut random_nr_pages_padding: [u8; 1] = [0];
-            getrandom::getrandom(&mut random_nr_pages_padding).unwrap();
-            random_nr_pages_padding[0] as usize + 1
+            let mut random_nr_pages_padding: u8 = 0;
+            getrandom::getrandom(random_nr_pages_padding.as_bytes_mut()).unwrap();
+            random_nr_pages_padding as usize + 1
         };
         let init_stack_top = USERSPACE_LOWEST_UNUSABLE_VADDR - PAGE_SIZE * nr_pages_padding;
         let init_stack_size = INIT_STACK_SIZE;

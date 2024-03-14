@@ -2,7 +2,7 @@
 
 #![allow(non_camel_case_types)]
 
-use super::{process_vm::user_heap::USER_HEAP_SIZE_LIMIT, program_loader::elf::INIT_STACK_SIZE};
+use super::{process_vm::DEFAULT_USER_HEAP_SIZE_LIMIT, program_loader::elf::INIT_STACK_SIZE};
 use crate::prelude::*;
 
 pub struct ResourceLimits {
@@ -22,7 +22,7 @@ impl ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         let stack_size = RLimit64::new(INIT_STACK_SIZE as u64);
-        let heap_size = RLimit64::new(USER_HEAP_SIZE_LIMIT as u64);
+        let heap_size = RLimit64::new(DEFAULT_USER_HEAP_SIZE_LIMIT as u64);
         let open_files = RLimit64::new(1024);
 
         let mut rlimits = Self {
