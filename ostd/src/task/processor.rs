@@ -11,7 +11,7 @@ use super::{
     task::{context_switch, TaskContext},
     Task, TaskStatus,
 };
-use crate::{cpu_local, trap};
+use crate::{cpu_local, exception};
 
 pub struct Processor {
     current: Option<Arc<Task>>,
@@ -98,8 +98,6 @@ fn switch_to_task(next_task: Arc<Task>) {
         );
     }
 
-    let irq_guard = trap::disable_local();
-
     let current_task_ctx_ptr = match current_task() {
         None => get_idle_task_ctx_ptr(),
         Some(current_task) => {
@@ -110,7 +108,7 @@ fn switch_to_task(next_task: Arc<Task>) {
             debug_assert_ne!(task_inner.task_status, TaskStatus::Sleeping);
             if task_inner.task_status == TaskStatus::Runnable {
                 drop(task_inner);
-                GLOBAL_SCHEDULER.lock().enqueue(current_task);
+                GLOBAL_SCHEDULER.lock_irq_disabled().enqueue(current_task);
             } else if task_inner.task_status == TaskStatus::Sleepy {
                 task_inner.task_status = TaskStatus::Sleeping;
             }
@@ -127,6 +125,7 @@ fn switch_to_task(next_task: Arc<Task>) {
 
     // Change the current task to the next task.
     {
+        let _irq_guard = exception::disable_local_irq();
         let mut processor = PROCESSOR.borrow_mut();
 
         // We cannot directly overwrite `current` at this point. Since we are running as `current`,
@@ -135,10 +134,8 @@ fn switch_to_task(next_task: Arc<Task>) {
         let old_current = processor.current.replace(next_task);
         processor.prev_task = old_current;
 
-        // Drop the mutable reference to `PROCESSOR` here.
+        // Drop the mutable reference to `PROCESSOR` and the IRQ guard here.
     }
-
-    drop(irq_guard);
 
     // SAFETY:
     // 1. `ctx` is only used in `schedule()`. We have exclusive access to both the current task

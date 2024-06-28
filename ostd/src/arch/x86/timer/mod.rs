@@ -18,8 +18,8 @@ use self::apic::APIC_TIMER_CALLBACK;
 use crate::{
     arch::x86::kernel,
     cpu_local,
+    exception::{disable_local_irq, IrqLine},
     task::disable_preempt,
-    trap::{disable_local, IrqLine},
 };
 
 /// The timer frequency (Hz). Here we choose 1000Hz since 1000Hz is easier for unit conversion and
@@ -62,7 +62,7 @@ pub fn register_callback<F>(func: F)
 where
     F: Fn() + Sync + Send + 'static,
 {
-    let _irq_guard = disable_local();
+    let _irq_guard = disable_local_irq();
     INTERRUPT_CALLBACKS.borrow_mut().push(Box::new(func));
 }
 
@@ -71,7 +71,7 @@ fn timer_callback(_: &TrapFrame) {
 
     {
         // Interrupts are disabled to prevent reentrancy.
-        let _irq_guard = disable_local();
+        let _irq_guard = disable_local_irq();
         // To prevent a preempting task setting up a new timer callback here, we disable preemption.
         let _preempt_guard = disable_preempt();
         for callback in INTERRUPT_CALLBACKS.borrow().iter() {

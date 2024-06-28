@@ -2,7 +2,7 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
-use ostd::{arch::timer, sync::RwLock, trap::SoftIrqLine};
+use ostd::{arch::timer, exception::SoftIrqLine, sync::RwLock};
 
 use crate::softirq_id::TIMER_SOFTIRQ_ID;
 
@@ -27,6 +27,7 @@ where
 }
 
 fn timer_softirq_handler() {
+    ostd::early_println!("timer_softirq_handler!");
     let callbacks = TIMER_SOFTIRQ_CALLBACKS.read_irq_disabled();
     for callback in callbacks.iter() {
         (callback)();
