@@ -17,6 +17,7 @@ use log::debug;
 #[cfg(feature = "intel_tdx")]
 use tdx_guest::tdcall;
 use trapframe::{GeneralRegs, UserContext as RawUserContext};
+use x86::msr::{rdmsr, wrmsr, IA32_FS_BASE};
 use x86_64::registers::rflags::RFlags;
 
 #[cfg(feature = "intel_tdx")]
@@ -668,4 +669,24 @@ impl Default for FpRegs {
 #[derive(Debug, Clone, Copy)]
 struct FxsaveArea {
     data: [u8; 512], // 512 bytes
+}
+
+/// Sets the base address for the CPU local storage by writing to the FS base model-specific register.
+/// This operation is marked as `unsafe` because it directly interfaces with low-level CPU registers.
+///
+/// # Safety
+///
+///  - This function is safe to call provided that the FS register is dedicated entirely for CPU local storage
+///    and is not concurrently accessed for other purposes.
+///  - The caller must ensure that `addr` is a valid address and properly aligned, as required by the CPU.
+///  - This function should only be called in contexts where the CPU is in a state to accept such changes,
+///    such as during processor initialization.
+pub(crate) unsafe fn set_cpu_local_base(addr: u64) {
+    wrmsr(IA32_FS_BASE, addr);
+}
+
+/// Gets the base address for the CPU local storage by reading the FS base model-specific register.
+pub(crate) fn get_cpu_local_base() -> u64 {
+    // Safety: the FS register is used as the base address for the CPU local storage in our implementation.
+    unsafe { rdmsr(IA32_FS_BASE) }
 }

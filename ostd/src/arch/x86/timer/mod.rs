@@ -15,7 +15,12 @@ use spin::Once;
 use trapframe::TrapFrame;
 
 use self::apic::APIC_TIMER_CALLBACK;
-use crate::{arch::x86::kernel, cpu_local, trap::IrqLine, CpuLocal};
+use crate::{
+    arch::x86::kernel,
+    cpu_local,
+    task::disable_preempt,
+    trap::{disable_local, IrqLine},
+};
 
 /// The timer frequency (Hz). Here we choose 1000Hz since 1000Hz is easier for unit conversion and
 /// convenient for timer. What's more, the frequency cannot be set too high or too low, 1000Hz is
@@ -57,19 +62,22 @@ pub fn register_callback<F>(func: F)
 where
     F: Fn() + Sync + Send + 'static,
 {
-    CpuLocal::borrow_with(&INTERRUPT_CALLBACKS, |callbacks| {
-        callbacks.borrow_mut().push(Box::new(func));
-    });
+    let _irq_guard = disable_local();
+    INTERRUPT_CALLBACKS.borrow_mut().push(Box::new(func));
 }
 
 fn timer_callback(_: &TrapFrame) {
     jiffies::ELAPSED.fetch_add(1, Ordering::SeqCst);
 
-    CpuLocal::borrow_with(&INTERRUPT_CALLBACKS, |callbacks| {
-        for callback in callbacks.borrow().iter() {
+    {
+        // Interrupts are disabled to prevent reentrancy.
+        let _irq_guard = disable_local();
+        // To prevent a preempting task setting up a new timer callback here, we disable preemption.
+        let _preempt_guard = disable_preempt();
+        for callback in INTERRUPT_CALLBACKS.borrow().iter() {
             (callback)();
         }
-    });
+    }
 
     if APIC_TIMER_CALLBACK.is_completed() {
         APIC_TIMER_CALLBACK.get().unwrap().call(());

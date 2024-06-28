@@ -8,6 +8,7 @@ pub type Vaddr = usize;
 /// Physical addresses.
 pub type Paddr = usize;
 
+pub mod cpu_local;
 pub(crate) mod dma;
 pub mod frame;
 pub(crate) mod heap_allocator;
