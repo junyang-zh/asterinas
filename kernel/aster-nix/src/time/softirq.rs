@@ -27,7 +27,6 @@ where
 }
 
 fn timer_softirq_handler() {
-    ostd::early_println!("timer_softirq_handler!");
     let callbacks = TIMER_SOFTIRQ_CALLBACKS.read_irq_disabled();
     for callback in callbacks.iter() {
         (callback)();

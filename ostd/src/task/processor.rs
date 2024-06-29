@@ -98,6 +98,8 @@ fn switch_to_task(next_task: Arc<Task>) {
         );
     }
 
+    debug_assert!(crate::arch::irq::is_local_enabled());
+
     let current_task_ctx_ptr = match current_task() {
         None => get_idle_task_ctx_ptr(),
         Some(current_task) => {
@@ -136,6 +138,8 @@ fn switch_to_task(next_task: Arc<Task>) {
 
         // Drop the mutable reference to `PROCESSOR` and the IRQ guard here.
     }
+
+    debug_assert!(crate::arch::irq::is_local_enabled());
 
     // SAFETY:
     // 1. `ctx` is only used in `schedule()`. We have exclusive access to both the current task

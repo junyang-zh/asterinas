@@ -243,9 +243,7 @@ impl UserPreemption {
         self.count = (self.count + 1) % Self::PREEMPTION_INTERVAL;
 
         if self.count == 0 {
-            crate::arch::irq::enable_local();
             crate::task::schedule();
-            crate::arch::irq::disable_local();
         }
     }
 }
@@ -290,6 +288,8 @@ impl UserContextApiInternal for UserContext {
         // Go back to user when it is syscall or cpu exception type is an immediately
         // recoverable Fault or Trap. Otherwise return to handle the exception.
         let return_reason = loop {
+            // Make sure that when running the user code, the local interrupt is enabled.
+            debug_assert!(crate::arch::irq::is_local_enabled());
             self.user_context.run();
 
             if let Some(return_reason) = user_mode_exception_handler(self) {
