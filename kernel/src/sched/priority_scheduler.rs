@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use ostd::{
-    cpu::{num_cpus, CpuId, CpuSet, PinCurrentCpu},
+    cpu::{num_cpus, AtomicCpuSet, CpuId, PinCurrentCpu},
     task::{
         scheduler::{inject_scheduler, EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags},
         AtomicCpuId, Priority, Task,
@@ -49,7 +49,7 @@ impl<T: PreemptSchedInfo> PreemptScheduler<T> {
         let mut selected = irq_guard.current_cpu();
         let mut minimum_load = usize::MAX;
 
-        for candidate in runnable.cpu_affinity().iter() {
+        for candidate in runnable.cpu_affinity().load().iter() {
             let rq = self.rq[candidate.as_usize()].lock();
             // A wild guess measuring the load of a runqueue. We assume that
             // real-time tasks are 4-times as important as normal tasks.
@@ -257,7 +257,7 @@ impl PreemptSchedInfo for Task {
         &self.schedule_info().cpu
     }
 
-    fn cpu_affinity(&self) -> &CpuSet {
+    fn cpu_affinity(&self) -> &AtomicCpuSet {
         &self.schedule_info().cpu_affinity
     }
 }
@@ -272,7 +272,7 @@ trait PreemptSchedInfo {
 
     fn cpu(&self) -> &AtomicCpuId;
 
-    fn cpu_affinity(&self) -> &CpuSet;
+    fn cpu_affinity(&self) -> &AtomicCpuSet;
 
     fn is_real_time(&self) -> bool {
         self.priority() < Self::REAL_TIME_TASK_PRIORITY

@@ -19,7 +19,11 @@ pub use self::{
     scheduler::info::{AtomicCpuId, Priority, TaskScheduleInfo},
 };
 pub(crate) use crate::arch::task::{context_switch, TaskContext};
-use crate::{cpu::CpuSet, prelude::*, user::UserSpace};
+use crate::{
+    cpu::{AtomicCpuSet, CpuSet},
+    prelude::*,
+    user::UserSpace,
+};
 
 /// A task that executes a function to the end.
 ///
@@ -221,7 +225,7 @@ impl TaskOptions {
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
                 priority: self.priority,
-                cpu_affinity: self.cpu_affinity,
+                cpu_affinity: AtomicCpuSet::new(self.cpu_affinity),
             },
         };
 

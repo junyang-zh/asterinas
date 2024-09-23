@@ -4,7 +4,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::cpu::{CpuId, CpuSet};
+use crate::cpu::{AtomicCpuSet, CpuId};
 
 /// Fields of a task that OSTD will never touch.
 ///
@@ -20,7 +20,7 @@ pub struct TaskScheduleInfo {
     /// The CPU that the task would like to be running on.
     pub cpu: AtomicCpuId,
     /// The CPUs that this task can run on.
-    pub cpu_affinity: CpuSet,
+    pub cpu_affinity: AtomicCpuSet,
 }
 
 /// The priority of a real-time task.

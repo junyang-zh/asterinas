@@ -50,6 +50,11 @@ impl Thread {
             .cloned()
     }
 
+    /// Returns the task associated with this thread.
+    pub fn task(&self) -> Arc<Task> {
+        self.task.upgrade().unwrap()
+    }
+
     /// Gets the Thread from task's data.
     ///
     /// # Panics
