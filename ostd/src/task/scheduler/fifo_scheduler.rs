@@ -4,7 +4,7 @@ use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 
 use super::{inject_scheduler, EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags};
 use crate::{
-    cpu::{num_cpus, PinCurrentCpu},
+    cpu::{num_cpus, CpuId, PinCurrentCpu},
     sync::SpinLock,
     task::{disable_preempt, AtomicCpuId, Task},
 };
@@ -23,7 +23,7 @@ struct FifoScheduler<T: FifoSchedInfo> {
 
 impl<T: FifoSchedInfo> FifoScheduler<T> {
     /// Creates a new instance of `FifoScheduler`.
-    fn new(nr_cpus: u32) -> Self {
+    fn new(nr_cpus: usize) -> Self {
         let mut rq = Vec::new();
         for _ in 0..nr_cpus {
             rq.push(SpinLock::new(FifoRunQueue::new()));
@@ -31,14 +31,14 @@ impl<T: FifoSchedInfo> FifoScheduler<T> {
         Self { rq }
     }
 
-    fn select_cpu(&self) -> u32 {
+    fn select_cpu(&self) -> CpuId {
         // FIXME: adopt more reasonable policy once we fully enable SMP.
-        0
+        CpuId::bsp()
     }
 }
 
 impl<T: FifoSchedInfo + Send + Sync> Scheduler<T> for FifoScheduler<T> {
-    fn enqueue(&self, runnable: Arc<T>, flags: EnqueueFlags) -> Option<u32> {
+    fn enqueue(&self, runnable: Arc<T>, flags: EnqueueFlags) -> Option<CpuId> {
         let mut still_in_rq = false;
         let target_cpu = {
             let mut cpu_id = self.select_cpu();
@@ -51,7 +51,7 @@ impl<T: FifoSchedInfo + Send + Sync> Scheduler<T> for FifoScheduler<T> {
             cpu_id
         };
 
-        let mut rq = self.rq[target_cpu as usize].disable_irq().lock();
+        let mut rq = self.rq[target_cpu.as_usize()].disable_irq().lock();
         if still_in_rq && let Err(_) = runnable.cpu().set_if_is_none(target_cpu) {
             return None;
         }
@@ -62,7 +62,7 @@ impl<T: FifoSchedInfo + Send + Sync> Scheduler<T> for FifoScheduler<T> {
 
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue<T>)) {
         let preempt_guard = disable_preempt();
-        let local_rq: &FifoRunQueue<T> = &self.rq[preempt_guard.current_cpu() as usize]
+        let local_rq: &FifoRunQueue<T> = &self.rq[preempt_guard.current_cpu().as_usize()]
             .disable_irq()
             .lock();
         f(local_rq);
@@ -70,7 +70,7 @@ impl<T: FifoSchedInfo + Send + Sync> Scheduler<T> for FifoScheduler<T> {
 
     fn local_mut_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue<T>)) {
         let preempt_guard = disable_preempt();
-        let local_rq: &mut FifoRunQueue<T> = &mut self.rq[preempt_guard.current_cpu() as usize]
+        let local_rq: &mut FifoRunQueue<T> = &mut self.rq[preempt_guard.current_cpu().as_usize()]
             .disable_irq()
             .lock();
         f(local_rq);

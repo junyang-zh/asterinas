@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     arch::mm::{current_page_table_paddr, PageTableEntry, PagingConsts},
-    cpu::{num_cpus, CpuExceptionInfo, CpuSet, PinCurrentCpu},
+    cpu::{all_cpus, CpuExceptionInfo, CpuSet, PinCurrentCpu},
     cpu_local,
     mm::{
         page_table::{self, PageTableItem},
@@ -104,7 +104,7 @@ impl VmSpace {
             let mut need_self_flush = false;
             let mut need_remote_flush = false;
 
-            for cpu in 0..num_cpus() {
+            for cpu in all_cpus() {
                 // The activation lock is held; other CPUs cannot activate this `VmSpace`.
                 let ptr =
                     ACTIVATED_VM_SPACE.get_on_cpu(cpu).load(Ordering::Relaxed) as *const VmSpace;
