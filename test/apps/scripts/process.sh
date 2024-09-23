@@ -11,6 +11,7 @@ echo "Start process test......"
 # These test programs are sorted by name.
 tests="
 clone3/clone_process
+cpu_affinity/cpu_affinity
 execve/execve
 eventfd2/eventfd2
 fork/fork
