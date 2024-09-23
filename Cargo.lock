@@ -1084,6 +1084,7 @@ dependencies = [
  "ostd-test",
  "owo-colors 3.5.0",
  "rsdp",
+ "smallvec",
  "spin 0.9.8",
  "static_assertions",
  "tdx-guest",
