@@ -29,6 +29,7 @@ TEST_APPS := \
 	mmap \
 	mongoose \
 	network \
+	pf_scale \
 	pipe \
 	pthread \
 	pty \
