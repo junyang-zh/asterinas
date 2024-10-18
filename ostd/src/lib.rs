@@ -54,6 +54,8 @@ pub use ostd_pod::Pod;
 
 pub use self::{error::Error, prelude::Result};
 
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Initializes OSTD.
 ///
 /// This function represents the first phase booting up the system. It makes
@@ -101,6 +103,8 @@ unsafe fn init() {
     arch::irq::enable_local();
 
     invoke_ffi_init_funcs();
+
+    INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// Indicates whether the kernel is in bootstrap context.
