@@ -6,6 +6,7 @@
 //! allocating pages rather untyped memory from this module.
 
 use alloc::vec::Vec;
+use core::{cell::RefCell, sync::atomic::Ordering};
 
 use align_ext::AlignExt;
 use buddy_system_allocator::FrameAllocator;
@@ -15,6 +16,7 @@ use spin::Once;
 use super::{cont_pages::ContPages, meta::PageMeta, Page};
 use crate::{
     boot::memory_region::MemoryRegionType,
+    cpu_local,
     mm::{Paddr, PAGE_SIZE},
     sync::SpinLock,
 };
@@ -61,20 +63,103 @@ impl CountingFrameAllocator {
 
 pub(in crate::mm) static PAGE_ALLOCATOR: Once<SpinLock<CountingFrameAllocator>> = Once::new();
 
+cpu_local! {
+    static LOCAL_CACHE: RefCell<LocalCache> = RefCell::new(LocalCache::new());
+}
+
+const LOCAL_CACHE_SIZE: usize = 64;
+const LOCAL_LOW_WATERMARK: usize = LOCAL_CACHE_SIZE / 2;
+const LOCAL_HIGH_WATERMARK: usize = LOCAL_CACHE_SIZE / 4 * 3;
+
+struct LocalCache {
+    cache_stack: [Option<Paddr>; LOCAL_CACHE_SIZE],
+    top: usize,
+}
+
+impl LocalCache {
+    pub const fn new() -> Self {
+        LocalCache {
+            cache_stack: [None; LOCAL_CACHE_SIZE],
+            top: 0,
+        }
+    }
+
+    pub fn alloc(&mut self) -> Paddr {
+        if self.top == 0 {
+            return self.alloc_slow();
+        }
+        self.top -= 1;
+        self.cache_stack[self.top].take().unwrap()
+    }
+
+    pub fn dealloc(&mut self, paddr: Paddr) {
+        if self.top == LOCAL_CACHE_SIZE {
+            self.dealloc_slow(paddr);
+            return;
+        }
+        self.cache_stack[self.top] = Some(paddr);
+        self.top += 1;
+    }
+
+    fn alloc_slow(&mut self) -> Paddr {
+        let paddr = PAGE_ALLOCATOR
+            .get()
+            .unwrap()
+            .lock()
+            .alloc(LOCAL_LOW_WATERMARK)
+            .unwrap()
+            * PAGE_SIZE;
+        for i in 0..LOCAL_LOW_WATERMARK {
+            self.cache_stack[i] = Some(paddr + i * PAGE_SIZE);
+        }
+        self.top = LOCAL_LOW_WATERMARK - 1;
+        self.cache_stack[self.top].unwrap()
+    }
+
+    fn dealloc_slow(&mut self, paddr: Paddr) {
+        let mut allocator = PAGE_ALLOCATOR.get().unwrap().lock();
+        let frame_num = paddr / PAGE_SIZE;
+        allocator.dealloc(frame_num, 1);
+        for i in LOCAL_HIGH_WATERMARK..LOCAL_CACHE_SIZE {
+            let frame_num = self.cache_stack[i].take().unwrap() / PAGE_SIZE;
+            allocator.dealloc(frame_num, 1);
+        }
+        self.top = LOCAL_HIGH_WATERMARK;
+    }
+}
+
 /// Allocate a single page.
 ///
 /// The metadata of the page is initialized with the given metadata.
 pub(crate) fn alloc_single<M: PageMeta>(metadata: M) -> Option<Page<M>> {
-    PAGE_ALLOCATOR
-        .get()
-        .unwrap()
-        .disable_irq()
-        .lock()
-        .alloc(1)
-        .map(|idx| {
+    if !crate::INITIALIZED.load(Ordering::Acquire) {
+        let mut allocator = PAGE_ALLOCATOR.get().unwrap().lock();
+        return allocator.alloc(1).map(|idx| {
             let paddr = idx * PAGE_SIZE;
             Page::from_unused(paddr, metadata)
-        })
+        });
+    }
+
+    let irq_guard = crate::trap::disable_local();
+    let local_guard = LOCAL_CACHE.get_with(&irq_guard);
+    let pa = local_guard.borrow_mut().alloc();
+
+    Some(Page::from_unused(pa, metadata))
+}
+
+pub(crate) fn dealloc_single(paddr: Paddr) {
+    if !crate::INITIALIZED.load(Ordering::Acquire) {
+        PAGE_ALLOCATOR
+            .get()
+            .unwrap()
+            .lock()
+            .dealloc(paddr / PAGE_SIZE, 1);
+        return;
+    }
+
+    let irq_guard = crate::trap::disable_local();
+    let local_guard = LOCAL_CACHE.get_with(&irq_guard);
+    local_guard.borrow_mut().dealloc(paddr);
 }
 
 /// Allocate a contiguous range of pages of a given length in bytes.
