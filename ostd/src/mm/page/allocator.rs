@@ -16,7 +16,7 @@ use super::{cont_pages::ContPages, meta::PageMeta, Page};
 use crate::{
     boot::memory_region::MemoryRegionType,
     mm::{Paddr, PAGE_SIZE},
-    sync::SpinLock,
+    sync::{LocalIrqDisabled, SpinLock},
 };
 
 /// FrameAllocator with a counter for allocated memory
@@ -59,7 +59,8 @@ impl CountingFrameAllocator {
     }
 }
 
-pub(in crate::mm) static PAGE_ALLOCATOR: Once<SpinLock<CountingFrameAllocator>> = Once::new();
+pub(in crate::mm) static PAGE_ALLOCATOR: Once<SpinLock<CountingFrameAllocator, LocalIrqDisabled>> =
+    Once::new();
 
 /// Allocate a single page.
 ///

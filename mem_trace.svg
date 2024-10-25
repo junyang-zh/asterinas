@@ -1,0 +1,981 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="406" onload="init(evt)" viewBox="0 0 1200 406" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="406.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="389" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="389" > </text>
+<g id="frames">
+<g >
+<title>aster_nix::thread::kernel_thread::create_new_kernel_task (64 samples, 11.74%)</title><rect x="10.0" y="149" width="138.6" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="13.00" y="159.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>unwinding::panicking::catch_unwind::do_call (384 samples, 70.46%)</title><rect x="358.6" y="309" width="831.4" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="361.59" y="319.5" >unwinding::panicking::catch_unwind::do_call</text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single (1 samples, 0.18%)</title><rect x="163.7" y="85" width="2.2" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="166.72" y="95.5" ></text>
+</g>
+<g >
+<title>core::option::Option::map (48 samples, 8.81%)</title><rect x="165.9" y="69" width="103.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="168.89" y="79.5" >core::option..</text>
+</g>
+<g >
+<title>aster_nix::syscall::arch::x86::syscall_dispatch (1 samples, 0.18%)</title><rect x="163.7" y="325" width="2.2" height="15.0" fill="rgb(221,73,17)" rx="2" ry="2" />
+<text  x="166.72" y="335.5" ></text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::Vmar_::new_fork (6 samples, 1.10%)</title><rect x="345.6" y="149" width="13.0" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="348.60" y="159.5" ></text>
+</g>
+<g >
+<title>aster_nix::syscall::handle_syscall (1 samples, 0.18%)</title><rect x="163.7" y="341" width="2.2" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="166.72" y="351.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::process::builder::ProcessBuilder::build (384 samples, 70.46%)</title><rect x="358.6" y="181" width="831.4" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="361.59" y="191.5" >aster_nix::process::process::builder::ProcessBuilder::build</text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child_process (6 samples, 1.10%)</title><rect x="345.6" y="229" width="13.0" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="348.60" y="239.5" ></text>
+</g>
+<g >
+<title>ostd::mm::mem_profile::AllocRecord::new (6 samples, 1.10%)</title><rect x="345.6" y="37" width="13.0" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="348.60" y="47.5" ></text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::Vmar_::handle_page_fault (7 samples, 1.28%)</title><rect x="148.6" y="213" width="15.1" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="151.57" y="223.5" ></text>
+</g>
+<g >
+<title>unwinding::panicking::catch_unwind::do_call (35 samples, 6.42%)</title><rect x="269.8" y="245" width="75.8" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="272.82" y="255.5" >unwindin..</text>
+</g>
+<g >
+<title>aster_nix::thread::task::create_new_user_task (1 samples, 0.18%)</title><rect x="163.7" y="181" width="2.2" height="15.0" fill="rgb(210,23,5)" rx="2" ry="2" />
+<text  x="166.72" y="191.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child (48 samples, 8.81%)</title><rect x="165.9" y="261" width="103.9" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="168.89" y="271.5" >aster_nix::p..</text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single (6 samples, 1.10%)</title><rect x="345.6" y="85" width="13.0" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="348.60" y="95.5" ></text>
+</g>
+<g >
+<title>aster_nix::thread::task::create_new_user_task::user_task_entry (48 samples, 8.81%)</title><rect x="165.9" y="325" width="103.9" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="168.89" y="335.5" >aster_nix::t..</text>
+</g>
+<g >
+<title>ostd::mm::vm_space::VmSpace::new (6 samples, 1.10%)</title><rect x="345.6" y="133" width="13.0" height="15.0" fill="rgb(217,59,14)" rx="2" ry="2" />
+<text  x="348.60" y="143.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::process::builder::ProcessBuilder::build (1 samples, 0.18%)</title><rect x="163.7" y="261" width="2.2" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="166.72" y="271.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single::{{closure}} (6 samples, 1.10%)</title><rect x="345.6" y="53" width="13.0" height="15.0" fill="rgb(242,170,40)" rx="2" ry="2" />
+<text  x="348.60" y="63.5" ></text>
+</g>
+<g >
+<title>core::ops::function::FnOnce::call_once (48 samples, 8.81%)</title><rect x="165.9" y="341" width="103.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="168.89" y="351.5" >core::ops::f..</text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single (48 samples, 8.81%)</title><rect x="165.9" y="85" width="103.9" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="168.89" y="95.5" >ostd::mm::pa..</text>
+</g>
+<g >
+<title>core::result::Result::unwrap (1 samples, 0.18%)</title><rect x="163.7" y="309" width="2.2" height="15.0" fill="rgb(235,142,34)" rx="2" ry="2" />
+<text  x="166.72" y="319.5" ></text>
+</g>
+<g >
+<title>aster_nix::syscall::handle_syscall (48 samples, 8.81%)</title><rect x="165.9" y="309" width="103.9" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="168.89" y="319.5" >aster_nix::s..</text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::handle_page_fault_wrapper (7 samples, 1.28%)</title><rect x="148.6" y="277" width="15.1" height="15.0" fill="rgb(214,41,10)" rx="2" ry="2" />
+<text  x="151.57" y="287.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_vm (6 samples, 1.10%)</title><rect x="345.6" y="213" width="13.0" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="348.60" y="223.5" ></text>
+</g>
+<g >
+<title>aster_nix::thread::exception::handle_page_fault_from_vm_space (7 samples, 1.28%)</title><rect x="148.6" y="261" width="15.1" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="151.57" y="271.5" ></text>
+</g>
+<g >
+<title>aster_nix::syscall::arch::x86::syscall_dispatch (384 samples, 70.46%)</title><rect x="358.6" y="245" width="831.4" height="15.0" fill="rgb(221,73,17)" rx="2" ry="2" />
+<text  x="361.59" y="255.5" >aster_nix::syscall::arch::x86::syscall_dispatch</text>
+</g>
+<g >
+<title>aster_nix::process::posix_thread::builder::PosixThreadBuilder::build (1 samples, 0.18%)</title><rect x="163.7" y="245" width="2.2" height="15.0" fill="rgb(233,132,31)" rx="2" ry="2" />
+<text  x="166.72" y="255.5" ></text>
+</g>
+<g >
+<title>core::result::Result::unwrap (6 samples, 1.10%)</title><rect x="345.6" y="261" width="13.0" height="15.0" fill="rgb(235,142,34)" rx="2" ry="2" />
+<text  x="348.60" y="271.5" ></text>
+</g>
+<g >
+<title>ostd::mm::mem_profile::AllocRecord::new (7 samples, 1.28%)</title><rect x="148.6" y="101" width="15.1" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="151.57" y="111.5" ></text>
+</g>
+<g >
+<title>aster_nix::thread::work_queue::worker_pool::WorkerPool::schedule (64 samples, 11.74%)</title><rect x="10.0" y="277" width="138.6" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic_in (1 samples, 0.18%)</title><rect x="163.7" y="213" width="2.2" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="166.72" y="223.5" ></text>
+</g>
+<g >
+<title>::call (64 samples, 11.74%)</title><rect x="10.0" y="341" width="138.6" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="13.00" y="351.5" >::call</text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::Vmar_::handle_page_fault (35 samples, 6.42%)</title><rect x="269.8" y="149" width="75.8" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="272.82" y="159.5" >aster_ni..</text>
+</g>
+<g >
+<title>core::result::Result::unwrap (48 samples, 8.81%)</title><rect x="165.9" y="277" width="103.9" height="15.0" fill="rgb(235,142,34)" rx="2" ry="2" />
+<text  x="168.89" y="287.5" >core::result..</text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child (384 samples, 70.46%)</title><rect x="358.6" y="213" width="831.4" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="361.59" y="223.5" >aster_nix::process::clone::clone_child</text>
+</g>
+<g >
+<title>aster_nix::thread::work_queue::WorkQueue::enqueue (64 samples, 11.74%)</title><rect x="10.0" y="293" width="138.6" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="13.00" y="303.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::Vmar_::new_fork (48 samples, 8.81%)</title><rect x="165.9" y="165" width="103.9" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="168.89" y="175.5" >aster_nix::v..</text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_vm (48 samples, 8.81%)</title><rect x="165.9" y="229" width="103.9" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="168.89" y="239.5" >aster_nix::p..</text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single (7 samples, 1.28%)</title><rect x="148.6" y="149" width="15.1" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="151.57" y="159.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single::{{closure}} (7 samples, 1.28%)</title><rect x="148.6" y="117" width="15.1" height="15.0" fill="rgb(242,170,40)" rx="2" ry="2" />
+<text  x="151.57" y="127.5" ></text>
+</g>
+<g >
+<title>core::option::Option::map (6 samples, 1.10%)</title><rect x="345.6" y="69" width="13.0" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="348.60" y="79.5" ></text>
+</g>
+<g >
+<title>ostd::task::kernel_stack::KernelStack::new_with_guard_page (64 samples, 11.74%)</title><rect x="10.0" y="69" width="138.6" height="15.0" fill="rgb(230,118,28)" rx="2" ry="2" />
+<text  x="13.00" y="79.5" >ostd::task::kerne..</text>
+</g>
+<g >
+<title> (384 samples, 70.46%)</title><rect x="358.6" y="325" width="831.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="361.59" y="335.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page_table::cursor::CursorMut::map (1 samples, 0.18%)</title><rect x="163.7" y="117" width="2.2" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="166.72" y="127.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child (6 samples, 1.10%)</title><rect x="345.6" y="245" width="13.0" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="348.60" y="255.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single::{{closure}} (35 samples, 6.42%)</title><rect x="269.8" y="53" width="75.8" height="15.0" fill="rgb(242,170,40)" rx="2" ry="2" />
+<text  x="272.82" y="63.5" >ostd::mm..</text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic (64 samples, 11.74%)</title><rect x="10.0" y="133" width="138.6" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="13.00" y="143.5" >alloc::sync::Arc:..</text>
+</g>
+<g >
+<title>ostd::task::TaskOptions::build (1 samples, 0.18%)</title><rect x="163.7" y="165" width="2.2" height="15.0" fill="rgb(254,225,53)" rx="2" ry="2" />
+<text  x="166.72" y="175.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::process_vm::ProcessVm::fork_from (6 samples, 1.10%)</title><rect x="345.6" y="197" width="13.0" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="348.60" y="207.5" ></text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::static_cap::::fork_from (6 samples, 1.10%)</title><rect x="345.6" y="181" width="13.0" height="15.0" fill="rgb(212,33,8)" rx="2" ry="2" />
+<text  x="348.60" y="191.5" ></text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::static_cap::::fork_from (48 samples, 8.81%)</title><rect x="165.9" y="197" width="103.9" height="15.0" fill="rgb(212,33,8)" rx="2" ry="2" />
+<text  x="168.89" y="207.5" >aster_nix::v..</text>
+</g>
+<g >
+<title>ostd::mm::page_table::node::PageTableNode::alloc (6 samples, 1.10%)</title><rect x="345.6" y="101" width="13.0" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="348.60" y="111.5" ></text>
+</g>
+<g >
+<title>core::ops::function::FnOnce::call_once (6 samples, 1.10%)</title><rect x="345.6" y="325" width="13.0" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="348.60" y="335.5" ></text>
+</g>
+<g >
+<title> (35 samples, 6.42%)</title><rect x="269.8" y="261" width="75.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="272.82" y="271.5" ></text>
+</g>
+<g >
+<title>core::option::Option::map (7 samples, 1.28%)</title><rect x="148.6" y="133" width="15.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="151.57" y="143.5" ></text>
+</g>
+<g >
+<title>ostd::mm::mem_profile::AllocRecord::new (384 samples, 70.46%)</title><rect x="358.6" y="37" width="831.4" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="361.59" y="47.5" >ostd::mm::mem_profile::AllocRecord::new</text>
+</g>
+<g >
+<title>aster_nix::thread::work_queue::worker_pool::LocalWorkerPool::add_worker (64 samples, 11.74%)</title><rect x="10.0" y="229" width="138.6" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="13.00" y="239.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>aster_nix::process::process_vm::ProcessVm::fork_from (48 samples, 8.81%)</title><rect x="165.9" y="213" width="103.9" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="168.89" y="223.5" >aster_nix::p..</text>
+</g>
+<g >
+<title>ostd::mm::vm_space::CursorMut::copy_from (48 samples, 8.81%)</title><rect x="165.9" y="149" width="103.9" height="15.0" fill="rgb(221,76,18)" rx="2" ry="2" />
+<text  x="168.89" y="159.5" >ostd::mm::vm..</text>
+</g>
+<g >
+<title>aster_nix::syscall::handle_syscall (384 samples, 70.46%)</title><rect x="358.6" y="261" width="831.4" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="361.59" y="271.5" >aster_nix::syscall::handle_syscall</text>
+</g>
+<g >
+<title>core::result::Result::unwrap (384 samples, 70.46%)</title><rect x="358.6" y="229" width="831.4" height="15.0" fill="rgb(235,142,34)" rx="2" ry="2" />
+<text  x="361.59" y="239.5" >core::result::Result::unwrap</text>
+</g>
+<g >
+<title>core::ops::function::FnOnce::call_once{{vtable.shim}} (35 samples, 6.42%)</title><rect x="269.8" y="341" width="75.8" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="272.82" y="351.5" >core::op..</text>
+</g>
+<g >
+<title>aster_nix::thread::oops::catch_panics_as_oops (35 samples, 6.42%)</title><rect x="269.8" y="309" width="75.8" height="15.0" fill="rgb(237,149,35)" rx="2" ry="2" />
+<text  x="272.82" y="319.5" >aster_ni..</text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::Vmar_::new_fork_root (6 samples, 1.10%)</title><rect x="345.6" y="165" width="13.0" height="15.0" fill="rgb(215,49,11)" rx="2" ry="2" />
+<text  x="348.60" y="175.5" ></text>
+</g>
+<g >
+<title>all (545 samples, 100%)</title><rect x="10.0" y="357" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="367.5" ></text>
+</g>
+<g >
+<title>aster_nix::thread::task::create_new_user_task::user_task_entry (6 samples, 1.10%)</title><rect x="345.6" y="309" width="13.0" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="348.60" y="319.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::posix_thread::builder::PosixThreadBuilder::build::{{closure}} (384 samples, 70.46%)</title><rect x="358.6" y="117" width="831.4" height="15.0" fill="rgb(238,153,36)" rx="2" ry="2" />
+<text  x="361.59" y="127.5" >aster_nix::process::posix_thread::builder::PosixThreadBuilder::build::{{closure}}</text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic (384 samples, 70.46%)</title><rect x="358.6" y="149" width="831.4" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="361.59" y="159.5" >alloc::sync::Arc::new_cyclic</text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child_process (1 samples, 0.18%)</title><rect x="163.7" y="277" width="2.2" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="166.72" y="287.5" ></text>
+</g>
+<g >
+<title>aster_nix::thread::kernel_thread::create_new_kernel_task::{{closure}} (64 samples, 11.74%)</title><rect x="10.0" y="101" width="138.6" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="13.00" y="111.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::vm_mapping::VmMapping::handle_page_fault (7 samples, 1.28%)</title><rect x="148.6" y="197" width="15.1" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="151.57" y="207.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page_table::cursor::CursorMut::map (48 samples, 8.81%)</title><rect x="165.9" y="117" width="103.9" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="168.89" y="127.5" >ostd::mm::pa..</text>
+</g>
+<g >
+<title>ostd::mm::vm_space::VmSpace::handle_page_fault (7 samples, 1.28%)</title><rect x="148.6" y="293" width="15.1" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="151.57" y="303.5" ></text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::static_cap::::handle_page_fault (35 samples, 6.42%)</title><rect x="269.8" y="165" width="75.8" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="272.82" y="175.5" >aster_ni..</text>
+</g>
+<g >
+<title>aster_nix::process::posix_thread::builder::PosixThreadBuilder::build (384 samples, 70.46%)</title><rect x="358.6" y="165" width="831.4" height="15.0" fill="rgb(233,132,31)" rx="2" ry="2" />
+<text  x="361.59" y="175.5" >aster_nix::process::posix_thread::builder::PosixThreadBuilder::build</text>
+</g>
+<g >
+<title>aster_nix::syscall::arch::x86::syscall_dispatch (6 samples, 1.10%)</title><rect x="345.6" y="277" width="13.0" height="15.0" fill="rgb(221,73,17)" rx="2" ry="2" />
+<text  x="348.60" y="287.5" ></text>
+</g>
+<g >
+<title>unwinding::panicking::catch_unwind (384 samples, 70.46%)</title><rect x="358.6" y="341" width="831.4" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="361.59" y="351.5" >unwinding::panicking::catch_unwind</text>
+</g>
+<g >
+<title>ostd::mm::mem_profile::AllocRecord::new (1 samples, 0.18%)</title><rect x="163.7" y="37" width="2.2" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="166.72" y="47.5" ></text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic_in (64 samples, 11.74%)</title><rect x="10.0" y="181" width="138.6" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="13.00" y="191.5" >alloc::sync::Arc:..</text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::Vmar_::new_fork_root (48 samples, 8.81%)</title><rect x="165.9" y="181" width="103.9" height="15.0" fill="rgb(215,49,11)" rx="2" ry="2" />
+<text  x="168.89" y="191.5" >aster_nix::v..</text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc (384 samples, 70.46%)</title><rect x="358.6" y="53" width="831.4" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="361.59" y="63.5" >ostd::mm::page::allocator::alloc</text>
+</g>
+<g >
+<title>aster_nix::vm::util::duplicate_frame (7 samples, 1.28%)</title><rect x="148.6" y="181" width="15.1" height="15.0" fill="rgb(221,74,17)" rx="2" ry="2" />
+<text  x="151.57" y="191.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single::{{closure}} (48 samples, 8.81%)</title><rect x="165.9" y="53" width="103.9" height="15.0" fill="rgb(242,170,40)" rx="2" ry="2" />
+<text  x="168.89" y="63.5" >ostd::mm::pa..</text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic_in (384 samples, 70.46%)</title><rect x="358.6" y="133" width="831.4" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="361.59" y="143.5" >alloc::sync::Arc::new_cyclic_in</text>
+</g>
+<g >
+<title>unwinding::panicking::catch_unwind (35 samples, 6.42%)</title><rect x="269.8" y="277" width="75.8" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="272.82" y="287.5" >unwindin..</text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single (35 samples, 6.42%)</title><rect x="269.8" y="85" width="75.8" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="272.82" y="95.5" >ostd::mm..</text>
+</g>
+<g >
+<title>aster_nix::thread::task::create_new_user_task (384 samples, 70.46%)</title><rect x="358.6" y="101" width="831.4" height="15.0" fill="rgb(210,23,5)" rx="2" ry="2" />
+<text  x="361.59" y="111.5" >aster_nix::thread::task::create_new_user_task</text>
+</g>
+<g >
+<title> (7 samples, 1.28%)</title><rect x="148.6" y="325" width="15.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="151.57" y="335.5" ></text>
+</g>
+<g >
+<title>ostd::mm::frame::options::FrameAllocOptions::alloc_single (7 samples, 1.28%)</title><rect x="148.6" y="165" width="15.1" height="15.0" fill="rgb(221,73,17)" rx="2" ry="2" />
+<text  x="151.57" y="175.5" ></text>
+</g>
+<g >
+<title>aster_nix::syscall::arch::x86::syscall_dispatch (48 samples, 8.81%)</title><rect x="165.9" y="293" width="103.9" height="15.0" fill="rgb(221,73,17)" rx="2" ry="2" />
+<text  x="168.89" y="303.5" >aster_nix::s..</text>
+</g>
+<g >
+<title>ostd::task::kernel_stack::KernelStack::new_with_guard_page (1 samples, 0.18%)</title><rect x="163.7" y="149" width="2.2" height="15.0" fill="rgb(230,118,28)" rx="2" ry="2" />
+<text  x="166.72" y="159.5" ></text>
+</g>
+<g >
+<title>core::ops::function::FnOnce::call_once (35 samples, 6.42%)</title><rect x="269.8" y="229" width="75.8" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="272.82" y="239.5" >core::op..</text>
+</g>
+<g >
+<title>aster_nix::thread::work_queue::worker_pool::WorkerPool::add_worker (64 samples, 11.74%)</title><rect x="10.0" y="245" width="138.6" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="13.00" y="255.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>ostd::mm::mem_profile::AllocRecord::new (64 samples, 11.74%)</title><rect x="10.0" y="37" width="138.6" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="13.00" y="47.5" >ostd::mm::mem_pro..</text>
+</g>
+<g >
+<title>aster_nix::thread::exception::handle_exception (35 samples, 6.42%)</title><rect x="269.8" y="197" width="75.8" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="272.82" y="207.5" >aster_ni..</text>
+</g>
+<g >
+<title>aster_nix::thread::task::create_new_user_task::user_task_entry (384 samples, 70.46%)</title><rect x="358.6" y="277" width="831.4" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="361.59" y="287.5" >aster_nix::thread::task::create_new_user_task::user_task_entry</text>
+</g>
+<g >
+<title>ostd::mm::page_table::node::PageTableNode::alloc (1 samples, 0.18%)</title><rect x="163.7" y="101" width="2.2" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="166.72" y="111.5" ></text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::vm_mapping::VmMapping::handle_page_fault (35 samples, 6.42%)</title><rect x="269.8" y="133" width="75.8" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="272.82" y="143.5" >aster_ni..</text>
+</g>
+<g >
+<title>ostd::task::kernel_stack::KernelStack::new_with_guard_page (384 samples, 70.46%)</title><rect x="358.6" y="69" width="831.4" height="15.0" fill="rgb(230,118,28)" rx="2" ry="2" />
+<text  x="361.59" y="79.5" >ostd::task::kernel_stack::KernelStack::new_with_guard_page</text>
+</g>
+<g >
+<title>aster_nix::thread::work_queue::submit_work_item (64 samples, 11.74%)</title><rect x="10.0" y="309" width="138.6" height="15.0" fill="rgb(235,139,33)" rx="2" ry="2" />
+<text  x="13.00" y="319.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>aster_nix::thread::work_queue::worker::Worker::new::{{closure}} (64 samples, 11.74%)</title><rect x="10.0" y="165" width="138.6" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="13.00" y="175.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic_in (64 samples, 11.74%)</title><rect x="10.0" y="117" width="138.6" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="13.00" y="127.5" >alloc::sync::Arc:..</text>
+</g>
+<g >
+<title>ostd::arch::x86::trap::handle_user_page_fault (7 samples, 1.28%)</title><rect x="148.6" y="309" width="15.1" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="151.57" y="319.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page_table::cursor::CursorMut::copy_from (48 samples, 8.81%)</title><rect x="165.9" y="133" width="103.9" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="168.89" y="143.5" >ostd::mm::pa..</text>
+</g>
+<g >
+<title>core::ops::function::FnOnce::call_once (384 samples, 70.46%)</title><rect x="358.6" y="293" width="831.4" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="361.59" y="303.5" >core::ops::function::FnOnce::call_once</text>
+</g>
+<g >
+<title>aster_nix::process::posix_thread::builder::PosixThreadBuilder::build::{{closure}} (1 samples, 0.18%)</title><rect x="163.7" y="197" width="2.2" height="15.0" fill="rgb(238,153,36)" rx="2" ry="2" />
+<text  x="166.72" y="207.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child_process (48 samples, 8.81%)</title><rect x="165.9" y="245" width="103.9" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="168.89" y="255.5" >aster_nix::p..</text>
+</g>
+<g >
+<title>ostd::mm::page_table::PageTable::create_user_page_table (6 samples, 1.10%)</title><rect x="345.6" y="117" width="13.0" height="15.0" fill="rgb(235,141,33)" rx="2" ry="2" />
+<text  x="348.60" y="127.5" ></text>
+</g>
+<g >
+<title>ostd::task::TaskOptions::build (384 samples, 70.46%)</title><rect x="358.6" y="85" width="831.4" height="15.0" fill="rgb(254,225,53)" rx="2" ry="2" />
+<text  x="361.59" y="95.5" >ostd::task::TaskOptions::build</text>
+</g>
+<g >
+<title>aster_nix::process::process::timer_manager::create_process_timer_callback::{{closure}} (64 samples, 11.74%)</title><rect x="10.0" y="325" width="138.6" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="13.00" y="335.5" >aster_nix::proces..</text>
+</g>
+<g >
+<title>aster_nix::thread::task::create_new_user_task::user_task_entry (35 samples, 6.42%)</title><rect x="269.8" y="213" width="75.8" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="272.82" y="223.5" >aster_ni..</text>
+</g>
+<g >
+<title>ostd::mm::frame::options::FrameAllocOptions::alloc_single (35 samples, 6.42%)</title><rect x="269.8" y="101" width="75.8" height="15.0" fill="rgb(221,73,17)" rx="2" ry="2" />
+<text  x="272.82" y="111.5" >ostd::mm..</text>
+</g>
+<g >
+<title>core::option::Option::map (1 samples, 0.18%)</title><rect x="163.7" y="69" width="2.2" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="166.72" y="79.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page_table::node::PageTableNode::alloc (48 samples, 8.81%)</title><rect x="165.9" y="101" width="103.9" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="168.89" y="111.5" >ostd::mm::pa..</text>
+</g>
+<g >
+<title>ostd::mm::mem_profile::AllocRecord::new (48 samples, 8.81%)</title><rect x="165.9" y="37" width="103.9" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="168.89" y="47.5" >ostd::mm::me..</text>
+</g>
+<g >
+<title>aster_nix::thread::exception::handle_page_fault_from_vmar (35 samples, 6.42%)</title><rect x="269.8" y="181" width="75.8" height="15.0" fill="rgb(236,146,35)" rx="2" ry="2" />
+<text  x="272.82" y="191.5" >aster_ni..</text>
+</g>
+<g >
+<title>aster_nix::vm::vmar::static_cap::::handle_page_fault (7 samples, 1.28%)</title><rect x="148.6" y="229" width="15.1" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="151.57" y="239.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child_process (384 samples, 70.46%)</title><rect x="358.6" y="197" width="831.4" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="361.59" y="207.5" >aster_nix::process::clone::clone_child_process</text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic (1 samples, 0.18%)</title><rect x="163.7" y="229" width="2.2" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="166.72" y="239.5" ></text>
+</g>
+<g >
+<title>unwinding::panic::catch_unwind (35 samples, 6.42%)</title><rect x="269.8" y="293" width="75.8" height="15.0" fill="rgb(251,214,51)" rx="2" ry="2" />
+<text  x="272.82" y="303.5" >unwindin..</text>
+</g>
+<g >
+<title> (7 samples, 1.28%)</title><rect x="148.6" y="341" width="15.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="151.57" y="351.5" ></text>
+</g>
+<g >
+<title>aster_nix::syscall::handle_syscall (6 samples, 1.10%)</title><rect x="345.6" y="293" width="13.0" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="348.60" y="303.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc (64 samples, 11.74%)</title><rect x="10.0" y="53" width="138.6" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="13.00" y="63.5" >ostd::mm::page::a..</text>
+</g>
+<g >
+<title>aster_nix::thread::task::create_new_user_task::{{closure}} (35 samples, 6.42%)</title><rect x="269.8" y="325" width="75.8" height="15.0" fill="rgb(214,45,10)" rx="2" ry="2" />
+<text  x="272.82" y="335.5" >aster_ni..</text>
+</g>
+<g >
+<title>unwinding::panicking::catch_unwind::do_call (6 samples, 1.10%)</title><rect x="345.6" y="341" width="13.0" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="348.60" y="351.5" ></text>
+</g>
+<g >
+<title>ostd::mm::page::allocator::alloc_single::{{closure}} (1 samples, 0.18%)</title><rect x="163.7" y="53" width="2.2" height="15.0" fill="rgb(242,170,40)" rx="2" ry="2" />
+<text  x="166.72" y="63.5" ></text>
+</g>
+<g >
+<title>core::option::Option::map (35 samples, 6.42%)</title><rect x="269.8" y="69" width="75.8" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="272.82" y="79.5" >core::op..</text>
+</g>
+<g >
+<title>aster_nix::thread::work_queue::worker::Worker::new (64 samples, 11.74%)</title><rect x="10.0" y="213" width="138.6" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="13.00" y="223.5" >aster_nix::thread..</text>
+</g>
+<g >
+<title>ostd::task::TaskOptions::build (64 samples, 11.74%)</title><rect x="10.0" y="85" width="138.6" height="15.0" fill="rgb(254,225,53)" rx="2" ry="2" />
+<text  x="13.00" y="95.5" >ostd::task::TaskO..</text>
+</g>
+<g >
+<title>ostd::mm::kspace::kvirt_area::KVirtArea::map_pages (1 samples, 0.18%)</title><rect x="163.7" y="133" width="2.2" height="15.0" fill="rgb(235,140,33)" rx="2" ry="2" />
+<text  x="166.72" y="143.5" ></text>
+</g>
+<g >
+<title>aster_nix::thread::exception::handle_page_fault_from_vmar (7 samples, 1.28%)</title><rect x="148.6" y="245" width="15.1" height="15.0" fill="rgb(236,146,35)" rx="2" ry="2" />
+<text  x="151.57" y="255.5" ></text>
+</g>
+<g >
+<title>aster_nix::process::clone::clone_child (1 samples, 0.18%)</title><rect x="163.7" y="293" width="2.2" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="166.72" y="303.5" ></text>
+</g>
+<g >
+<title>aster_nix::vm::util::duplicate_frame (35 samples, 6.42%)</title><rect x="269.8" y="117" width="75.8" height="15.0" fill="rgb(221,74,17)" rx="2" ry="2" />
+<text  x="272.82" y="127.5" >aster_ni..</text>
+</g>
+<g >
+<title>::schedule (64 samples, 11.74%)</title><rect x="10.0" y="261" width="138.6" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="13.00" y="271.5" >::schedule</text>
+</g>
+<g >
+<title>ostd::mm::mem_profile::AllocRecord::new (35 samples, 6.42%)</title><rect x="269.8" y="37" width="75.8" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="272.82" y="47.5" >ostd::mm..</text>
+</g>
+<g >
+<title>alloc::sync::Arc::new_cyclic (64 samples, 11.74%)</title><rect x="10.0" y="197" width="138.6" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="13.00" y="207.5" >alloc::sync::Arc:..</text>
+</g>
+</g>
+</svg>

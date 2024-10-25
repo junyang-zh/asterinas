@@ -56,6 +56,7 @@ use crate::syscall::{
     listen::sys_listen,
     lseek::sys_lseek,
     madvise::sys_madvise,
+    mem_profile::{sys_start_mem_profile, sys_stop_mem_profile},
     mkdir::{sys_mkdir, sys_mkdirat},
     mknod::{sys_mknod, sys_mknodat},
     mmap::sys_mmap,
@@ -312,4 +313,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_PREADV2 = 327          => sys_preadv2(args[..5]);
     SYS_PWRITEV2 = 328         => sys_pwritev2(args[..5]);
     SYS_CLONE3 = 435           => sys_clone3(args[..2], &user_ctx);
+
+    SYS_START_MEM_PROF = 1024 => sys_start_mem_profile(args[..0]);
+    SYS_STOP_MEM_PROF = 1025  => sys_stop_mem_profile(args[..0]);
 }

@@ -149,14 +149,17 @@ pub(super) unsafe fn drop_as_last<M: PageMeta>(ptr: *const MetaSlot) {
     // No handles means no usage. This also releases the page as unused for further
     // calls to `Page::from_unused`.
     (*ptr).usage.store(0, Ordering::Release);
+    let paddr = mapping::meta_to_page::<PagingConsts>(ptr as Vaddr);
+    crate::mm::debug_remove_profile(ptr as usize);
     // Deallocate the page.
     // It would return the page to the allocator for further use. This would be done
     // after the release of the metadata to avoid re-allocation before the metadata
     // is reset.
-    allocator::PAGE_ALLOCATOR.get().unwrap().lock().dealloc(
-        mapping::meta_to_page::<PagingConsts>(ptr as Vaddr) / PAGE_SIZE,
-        1,
-    );
+    allocator::PAGE_ALLOCATOR
+        .get()
+        .unwrap()
+        .lock()
+        .dealloc(paddr / PAGE_SIZE, 1);
 }
 
 mod private {

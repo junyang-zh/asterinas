@@ -54,6 +54,8 @@ impl<M: PageMeta> Page<M> {
     ///  - the physical address is out of bound or not aligned;
     ///  - the page is already in use.
     pub fn from_unused(paddr: Paddr, metadata: M) -> Self {
+        crate::mm::debug_profile(paddr, core::alloc::Layout::from_size_align(1, 1).unwrap());
+
         assert!(paddr % PAGE_SIZE == 0);
         assert!(paddr < MAX_PADDR.load(Ordering::Relaxed) as Paddr);
         let vaddr = mapping::page_to_meta::<PagingConsts>(paddr);

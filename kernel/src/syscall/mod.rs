@@ -63,6 +63,7 @@ mod link;
 mod listen;
 mod lseek;
 mod madvise;
+mod mem_profile;
 mod mkdir;
 mod mknod;
 mod mmap;
