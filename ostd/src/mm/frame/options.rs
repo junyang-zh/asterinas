@@ -2,7 +2,7 @@
 
 //! Options for allocating frames
 
-use super::{Frame, Segment};
+use super::{paddr_to_vaddr, Frame, Segment};
 use crate::{
     mm::{
         page::{self, meta::FrameMeta},
@@ -83,7 +83,8 @@ impl FrameAllocOptions {
         let page = page::allocator::alloc_single(FrameMeta::default()).ok_or(Error::NoMemory)?;
         let frame = Frame { page };
         if !self.uninit {
-            frame.writer().fill(0);
+            let vaddr = paddr_to_vaddr(frame.start_paddr());
+            unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, PAGE_SIZE) };
         }
 
         Ok(frame)
