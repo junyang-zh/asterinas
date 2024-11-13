@@ -53,7 +53,7 @@ impl EpollFile {
             interest: Mutex::new(BTreeSet::new()),
             ready: SpinLock::new(VecDeque::new()),
             pop_guard: Mutex::new(PopGuard),
-            pollee: Pollee::new(IoEvents::empty()),
+            pollee: Pollee::new(),
             weak_self: me.clone(),
         })
     }
@@ -235,7 +235,7 @@ impl EpollFile {
         // Even if the entry is already set to ready,
         // there might be new events that we are interested in.
         // Wake the poller anyway.
-        self.pollee.add_events(IoEvents::IN);
+        self.pollee.notify(IoEvents::IN);
     }
 
     fn pop_multi_ready(&self, max_events: usize, ep_events: &mut Vec<EpollEvent>) {
@@ -298,11 +298,6 @@ impl EpollFile {
             // exist, so we can just unwrap it.
             let weak_entry = ready.pop_front().unwrap();
 
-            // Clear the epoll file's events if there are no ready entries.
-            if ready.len() == 0 {
-                self.pollee.del_events(IoEvents::IN);
-            }
-
             let Some(entry) = Weak::upgrade(&weak_entry) else {
                 // The entry has been deleted.
                 continue;
@@ -318,6 +313,16 @@ impl EpollFile {
         None
     }
 
+    fn calc_io_events(&self) -> IoEvents {
+        let ready = self.ready.lock();
+
+        if !ready.is_empty() {
+            IoEvents::IN
+        } else {
+            IoEvents::empty()
+        }
+    }
+
     fn warn_unsupported_flags(&self, flags: &EpollFlags) {
         if flags.intersects(EpollFlags::EXCLUSIVE | EpollFlags::WAKE_UP) {
             warn!("{:?} contains unsupported flags", flags);
@@ -327,7 +332,8 @@ impl EpollFile {
 
 impl Pollable for EpollFile {
     fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
-        self.pollee.poll(mask, poller)
+        self.pollee
+            .poll_with(mask, poller, || self.calc_io_events())
     }
 }
 

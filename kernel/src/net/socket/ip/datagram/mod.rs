@@ -2,7 +2,10 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use aster_bigtcp::{socket::SocketEventObserver, wire::IpEndpoint};
+use aster_bigtcp::{
+    socket::{SocketEventObserver, SocketEvents},
+    wire::IpEndpoint,
+};
 use takeable::Takeable;
 
 use self::{bound::BoundDatagram, unbound::UnboundDatagram};
@@ -98,8 +101,7 @@ impl DatagramSocket {
     pub fn new(nonblocking: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| {
             let unbound_datagram = UnboundDatagram::new(me.clone() as _);
-            let pollee = Pollee::new(IoEvents::empty());
-            unbound_datagram.init_pollee(&pollee);
+            let pollee = Pollee::new();
             Self {
                 inner: RwLock::new(Takeable::new(Inner::Unbound(unbound_datagram))),
                 nonblocking: AtomicBool::new(nonblocking),
@@ -141,7 +143,6 @@ impl DatagramSocket {
                     return (err_inner, Err(err));
                 }
             };
-            bound_datagram.init_pollee(&self.pollee);
             (Inner::Bound(bound_datagram), Ok(()))
         })
     }
@@ -199,18 +200,20 @@ impl DatagramSocket {
         sent_bytes
     }
 
-    fn update_io_events(&self) {
+    fn calc_io_events(&self) -> IoEvents {
         let inner = self.inner.read();
-        let Inner::Bound(bound_datagram) = inner.as_ref() else {
-            return;
-        };
-        bound_datagram.update_io_events(&self.pollee);
+
+        match inner.as_ref() {
+            Inner::Unbound(unbound_datagram) => unbound_datagram.calc_io_events(),
+            Inner::Bound(bound_socket) => bound_socket.calc_io_events(),
+        }
     }
 }
 
 impl Pollable for DatagramSocket {
     fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
-        self.pollee.poll(mask, poller)
+        self.pollee
+            .poll_with(mask, poller, || self.calc_io_events())
     }
 }
 
@@ -283,7 +286,6 @@ impl Socket for DatagramSocket {
                     return (err_inner, Err(err));
                 }
             };
-            bound_datagram.init_pollee(&self.pollee);
             (Inner::Bound(bound_datagram), Ok(()))
         })
     }
@@ -388,7 +390,17 @@ impl Socket for DatagramSocket {
 }
 
 impl SocketEventObserver for DatagramSocket {
-    fn on_events(&self) {
-        self.update_io_events();
+    fn on_events(&self, events: SocketEvents) {
+        let mut io_events = IoEvents::empty();
+
+        if events.contains(SocketEvents::CAN_RECV) {
+            io_events |= IoEvents::IN;
+        }
+
+        if events.contains(SocketEvents::CAN_SEND) {
+            io_events |= IoEvents::OUT;
+        }
+
+        self.pollee.notify(io_events);
     }
 }
