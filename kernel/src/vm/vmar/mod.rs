@@ -202,6 +202,10 @@ impl VmarInner {
         for vm_mapping in self.vm_mappings.iter() {
             let range = vm_mapping.range();
 
+            // println!("range 0x{:x}..0x{:x}", range.start, range.end);
+            if range.start < last_end {
+                panic!("range.start 0x{:x}, last_end 0x{:x}, ROOT_VMAR_LOWEST_ADDR 0x{:x}", range.start, last_end, ROOT_VMAR_LOWEST_ADDR);
+            }
             debug_assert!(range.start >= last_end);
             debug_assert!(range.end <= highest_occupied);
 
@@ -382,41 +386,46 @@ impl Vmar_ {
         &self.vm_space
     }
 
-    /// Maps a `VmMapping` to this VMAR.
-    fn add_mapping(&self, mapping: VmMapping) {
-        self.inner.write().vm_mappings.insert(mapping);
-    }
+    // /// Maps a `VmMapping` to this VMAR.
+    // fn add_mapping(&self, mapping: VmMapping) {
+    //     self.inner.write().vm_mappings.insert(mapping);
+    // }
 
-    fn allocate_free_region_for_mapping(
+    fn allocate_free_region_for_mapping_and_add(
         &self,
         map_size: usize,
         offset: Option<usize>,
         align: usize,
         can_overwrite: bool,
+        vm_mapping: VmMapping,
     ) -> Result<Vaddr> {
         trace!("allocate free region, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}, can_overwrite = {}", map_size, offset, align, can_overwrite);
+        let mut inner = self.inner.write();
 
-        if can_overwrite {
+        let map_to_addr = if can_overwrite {
             // If can overwrite, the offset is ensured not to be `None`.
             let offset = offset.ok_or(Error::with_message(
                 Errno::EINVAL,
                 "offset cannot be None since can overwrite is set",
             ))?;
-            self.inner.write().alloc_free_region_exact_truncate(
+            inner.alloc_free_region_exact_truncate(
                 &self.vm_space,
                 offset,
                 map_size,
             )?;
-            Ok(offset)
+            offset
         } else if let Some(offset) = offset {
-            self.inner
-                .write()
-                .alloc_free_region_exact(offset, map_size)?;
-            Ok(offset)
+            inner.alloc_free_region_exact(offset, map_size)?;
+            offset
         } else {
-            let free_region = self.inner.write().alloc_free_region(map_size, align)?;
-            Ok(free_region.start)
-        }
+            let free_region = inner.alloc_free_region(map_size, align)?;
+            free_region.start
+        };
+
+        let vm_mapping = vm_mapping.set_map_to_addr(map_to_addr);
+        inner.vm_mappings.insert(vm_mapping);
+
+        Ok(map_to_addr)
     }
 
     pub(super) fn new_fork_root(self: &Arc<Self>) -> Result<Arc<Self>> {

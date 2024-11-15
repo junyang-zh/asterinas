@@ -78,7 +78,7 @@ impl Interval<Vaddr> for VmMapping {
 /***************************** Basic methods *********************************/
 
 impl VmMapping {
-    pub fn build_mapping<R1, R2>(option: VmarMapOptions<R1, R2>) -> Result<Self> {
+    pub fn build_add_mapping<R1, R2>(option: VmarMapOptions<R1, R2>) -> Result<Vaddr> {
         let VmarMapOptions {
             parent,
             vmo,
@@ -92,25 +92,26 @@ impl VmMapping {
             is_shared,
             handle_page_faults_around,
         } = option;
+
+        let vmo = vmo.map(|vmo| MappedVmo::new(vmo.to_dyn(), vmo_offset..vmo_limit));
+
         let Vmar(parent_vmar, _) = parent;
         let map_to_addr =
-            parent_vmar.allocate_free_region_for_mapping(size, offset, align, can_overwrite)?;
+            parent_vmar.allocate_free_region_for_mapping_and_add(size, offset, align, can_overwrite, Self {
+                vmo,
+                is_shared,
+                handle_page_faults_around,
+                map_size: NonZeroUsize::new(size).unwrap(),
+                map_to_addr: 0,
+                perms,
+            })?;
         trace!(
             "build mapping, map_range = 0x{:x}- 0x{:x}",
             map_to_addr,
             map_to_addr + size
         );
 
-        let vmo = vmo.map(|vmo| MappedVmo::new(vmo.to_dyn(), vmo_offset..vmo_limit));
-
-        Ok(Self {
-            vmo,
-            is_shared,
-            handle_page_faults_around,
-            map_size: NonZeroUsize::new(size).unwrap(),
-            map_to_addr,
-            perms,
-        })
+        Ok(map_to_addr)
     }
 
     pub(super) fn new_fork(&self) -> Result<VmMapping> {
@@ -123,6 +124,13 @@ impl VmMapping {
     /// Returns the mapping's start address.
     pub fn map_to_addr(&self) -> Vaddr {
         self.map_to_addr
+    }
+
+    pub fn set_map_to_addr(self, map_to_addr: Vaddr) -> Self {
+        Self {
+            map_to_addr,
+            ..self
+        }
     }
 
     /// Returns the mapping's end address.
@@ -569,10 +577,7 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
     /// On success, the virtual address of the new mapping is returned.
     pub fn build(self) -> Result<Vaddr> {
         self.check_options()?;
-        let parent_vmar = self.parent.0.clone();
-        let vm_mapping = VmMapping::build_mapping(self)?;
-        let map_to_addr = vm_mapping.map_to_addr();
-        parent_vmar.add_mapping(vm_mapping);
+        let map_to_addr = VmMapping::build_add_mapping(self)?;
         Ok(map_to_addr)
     }
 

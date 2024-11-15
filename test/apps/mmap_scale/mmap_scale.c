@@ -10,7 +10,7 @@
 #include <time.h>
 
 #define PAGE_SIZE 4096 // Typical page size in bytes
-#define NUM_PAGES 4096 // Number of pages to allocate for mmap
+#define NUM_PAGES 2048 // Number of pages to allocate for mmap
 #define WARMUP_ITERATIONS 10
 #define TEST_ITERATIONS 50
 #define MAX_THREADS 32
@@ -60,13 +60,21 @@ void *worker_thread(void *arg)
 			perror("mmap failed");
 			exit(EXIT_FAILURE);
 		}
-		for (size_t j = 0; j < 8; j++) {
+		for (size_t j = 0; j < 8; j+=2) {
 			if (mprotect(data->regions[i] + j * PAGE_SIZE,
-				     PAGE_SIZE, PROT_READ | PROT_WRITE) == -1) {
+				     PAGE_SIZE*2, PROT_READ | PROT_WRITE) == -1) {
 				perror("mprotect failed");
 				exit(EXIT_FAILURE);
 			}
 		}
+		// RELEASE下咋都跑不起来
+		// DEBUG下且粒度为1页 能跑1线程的，2线程panic
+		// DEBUG下且粒度为2页 能跑1线程的，2线程疑似死锁
+		// DEBUG下且粒度为4页 能跑1,2线程，3线程panic
+		// Uncaught panic:
+        // assertion failed: range.start >= last_end
+        // at /root/asterinas/kernel/src/vm/vmar/mod.rs:205
+		// DEBUG下且粒度为8页 能跑起来
 	}
 	for (size_t i = start_page; i < end_page - 7; i += 8) {
 		if(munmap(data->regions[i], 8 * PAGE_SIZE) == -1){
@@ -160,6 +168,7 @@ void run_multiple_avg_test(int num_threads)
 	for (int i = 0; i < WARMUP_ITERATIONS; i++) {
 		test_result_t result;
 		run_test(&result, num_threads);
+		printf("WARMUP %d\n", i);
 	}
 
 	// Calculate average time excluding the best and worst results
@@ -171,6 +180,7 @@ void run_multiple_avg_test(int num_threads)
 
 	for (int i = 0; i < TEST_ITERATIONS; i++) {
 		run_test(&test_result[i], num_threads);
+		printf("TEST %d\n", i);
 
 		if (test_result[i].completion_time < min) {
 			min = test_result[i].completion_time;

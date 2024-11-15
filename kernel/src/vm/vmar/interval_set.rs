@@ -52,12 +52,21 @@ where
     /// Inserts an interval item into the interval set.
     pub fn insert(&mut self, item: V) {
         let range = item.range();
-        self.btree.insert(range.start, item);
+        for v in self.btree.values() {
+            let v_range = v.range();
+            if is_intersected(&v_range, &range) {
+                panic!();
+            }
+        }
+        let t = self.btree.insert(range.start, item);
+        assert!(t.is_none());
     }
 
     /// Removes an interval item from the interval set.
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.btree.remove(key)
+        let t = self.btree.remove(key);
+        assert!(t.is_some());
+        t
     }
 
     /// Returns an iterator over the interval items in the interval set.
@@ -331,4 +340,13 @@ mod tests {
         set.clear();
         assert!(set.iter().next().is_none());
     }
+}
+
+
+/// Determines whether two ranges are intersected.
+/// returns false if one of the ranges has a length of 0
+pub fn is_intersected<K:Ord+Clone>(range1: &Range<K>, range2: &Range<K>) -> bool {
+    let range1 = range1.clone();
+    let range2 = range2.clone();
+    range1.start.max(range2.start) < range1.end.min(range2.end)
 }
