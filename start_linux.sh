@@ -5,8 +5,8 @@ mke2fs -F -O ^ext_attr -O ^resize_inode -O ^dir_index ${BENCHMARK_DIR}/../build/
 make initramfs
 taskset -c 0-47,96-143 /usr/local/qemu/bin/qemu-system-x86_64 \
     --no-reboot \
-    -smp 96 \
-    -m 96G \
+    -smp 32 \
+    -m 32G \
     -machine q35,kernel-irqchip=split \
     -cpu Icelake-Server,-pcid,+x2apic \
     --enable-kvm \
