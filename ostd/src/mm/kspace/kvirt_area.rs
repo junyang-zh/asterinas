@@ -2,23 +2,22 @@
 
 //! Kernel virtual memory allocation
 
-use alloc::collections::BTreeMap;
-use core::{any::TypeId, marker::PhantomData, ops::Range};
+use core::{
+    marker::PhantomData,
+    ops::Range,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use align_ext::AlignExt;
 
 use super::{KERNEL_PAGE_TABLE, TRACKED_MAPPED_PAGES_RANGE, VMALLOC_VADDR_RANGE};
 use crate::{
-    cpu::CpuSet,
     mm::{
         page::{meta::PageMeta, DynPage, Page},
         page_prop::PageProperty,
         page_table::PageTableItem,
-        tlb::{TlbFlushOp, TlbFlusher, FLUSH_ALL_RANGE_THRESHOLD},
         Paddr, Vaddr, PAGE_SIZE,
     },
-    sync::SpinLock,
-    task::disable_preempt,
     Error, Result,
 };
 
@@ -34,14 +33,14 @@ impl KVirtAreaFreeNode {
 
 pub struct VirtAddrAllocator {
     fullrange: Range<Vaddr>,
-    freelist: SpinLock<Option<BTreeMap<Vaddr, KVirtAreaFreeNode>>>,
+    end: AtomicUsize,
 }
 
 impl VirtAddrAllocator {
     const fn new(fullrange: Range<Vaddr>) -> Self {
         Self {
-            fullrange,
-            freelist: SpinLock::new(None),
+            fullrange: fullrange.start..fullrange.end,
+            end: AtomicUsize::new(fullrange.start),
         }
     }
 
@@ -49,79 +48,16 @@ impl VirtAddrAllocator {
     ///
     /// This is currently implemented with a simple FIRST-FIT algorithm.
     fn alloc(&self, size: usize) -> Result<Range<Vaddr>> {
-        let mut lock_guard = self.freelist.lock();
-        if lock_guard.is_none() {
-            let mut freelist: BTreeMap<Vaddr, KVirtAreaFreeNode> = BTreeMap::new();
-            freelist.insert(
-                self.fullrange.start,
-                KVirtAreaFreeNode::new(self.fullrange.clone()),
-            );
-            *lock_guard = Some(freelist);
+        let end = self.end.fetch_add(size, Ordering::AcqRel);
+        if end + size > self.fullrange.end {
+            return Err(Error::NoMemory);
         }
-        let freelist = lock_guard.as_mut().unwrap();
-        let mut allocate_range = None;
-        let mut to_remove = None;
-
-        for (key, value) in freelist.iter() {
-            if value.block.end - value.block.start >= size {
-                allocate_range = Some((value.block.end - size)..value.block.end);
-                to_remove = Some(*key);
-                break;
-            }
-        }
-
-        if let Some(key) = to_remove {
-            if let Some(freenode) = freelist.get_mut(&key) {
-                if freenode.block.end - size == freenode.block.start {
-                    freelist.remove(&key);
-                } else {
-                    freenode.block.end -= size;
-                }
-            }
-        }
-
-        if let Some(range) = allocate_range {
-            Ok(range)
-        } else {
-            Err(Error::KVirtAreaAllocError)
-        }
+        Ok(end..end + size)
     }
 
     /// Frees a kernel virtual area.
-    fn free(&self, range: Range<Vaddr>) {
-        let mut lock_guard = self.freelist.lock();
-        let freelist = lock_guard.as_mut().unwrap_or_else(|| {
-            panic!("Free a 'KVirtArea' when 'VirtAddrAllocator' has not been initialized.")
-        });
-        // 1. get the previous free block, check if we can merge this block with the free one
-        //     - if contiguous, merge this area with the free block.
-        //     - if not contiguous, create a new free block, insert it into the list.
-        let mut free_range = range.clone();
-
-        if let Some((prev_va, prev_node)) = freelist
-            .upper_bound_mut(core::ops::Bound::Excluded(&free_range.start))
-            .peek_prev()
-        {
-            if prev_node.block.end == free_range.start {
-                let prev_va = *prev_va;
-                free_range.start = prev_node.block.start;
-                freelist.remove(&prev_va);
-            }
-        }
-        freelist.insert(free_range.start, KVirtAreaFreeNode::new(free_range.clone()));
-
-        // 2. check if we can merge the current block with the next block, if we can, do so.
-        if let Some((next_va, next_node)) = freelist
-            .lower_bound_mut(core::ops::Bound::Excluded(&free_range.start))
-            .peek_next()
-        {
-            if free_range.end == next_node.block.start {
-                let next_va = *next_va;
-                free_range.end = next_node.block.end;
-                freelist.remove(&next_va);
-                freelist.get_mut(&free_range.start).unwrap().block.end = free_range.end;
-            }
-        }
+    fn free(&self, _range: Range<Vaddr>) {
+        // nop
     }
 }
 
@@ -213,19 +149,12 @@ impl KVirtArea<Tracked> {
         assert!(self.start() <= range.start && self.end() >= range.end);
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
         let mut cursor = page_table.cursor_mut(&range).unwrap();
-        let flusher = TlbFlusher::new(CpuSet::new_full(), disable_preempt());
-        let mut va = self.start();
+
         for page in pages.into_iter() {
             // SAFETY: The constructor of the `KVirtArea<Tracked>` structure has already ensured this
             // mapping does not affect kernel's memory safety.
-            if let Some(old) = unsafe { cursor.map(page.into(), prop) } {
-                flusher.issue_tlb_flush_with(TlbFlushOp::Address(va), old);
-                flusher.dispatch_tlb_flush();
-            }
-            va += PAGE_SIZE;
+            let _old = unsafe { cursor.map(page.into(), prop) };
         }
-        flusher.issue_tlb_flush(TlbFlushOp::Range(range));
-        flusher.dispatch_tlb_flush();
     }
 
     /// Gets the mapped tracked page.
@@ -275,13 +204,10 @@ impl KVirtArea<Untracked> {
 
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
         let mut cursor = page_table.cursor_mut(&va_range).unwrap();
-        let flusher = TlbFlusher::new(CpuSet::new_full(), disable_preempt());
         // SAFETY: The caller of `map_untracked_pages` has ensured the safety of this mapping.
         unsafe {
             cursor.map_pa(&pa_range, prop);
         }
-        flusher.issue_tlb_flush(TlbFlushOp::Range(va_range.clone()));
-        flusher.dispatch_tlb_flush();
     }
 
     /// Gets the mapped untracked page.
@@ -314,49 +240,19 @@ impl<M: AllocatorSelector + 'static> Drop for KVirtArea<M> {
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
         let range = self.start()..self.end();
         let mut cursor = page_table.cursor_mut(&range).unwrap();
-        let flusher = TlbFlusher::new(CpuSet::new_full(), disable_preempt());
-        let tlb_prefer_flush_all = self.end() - self.start() > FLUSH_ALL_RANGE_THRESHOLD;
 
         loop {
             let result = unsafe { cursor.take_next(self.end() - cursor.virt_addr()) };
             match result {
-                PageTableItem::Mapped { va, page, .. } => match TypeId::of::<M>() {
-                    id if id == TypeId::of::<Tracked>() => {
-                        if !flusher.need_remote_flush() && tlb_prefer_flush_all {
-                            // Only on single-CPU cases we can drop the page immediately before flushing.
-                            drop(page);
-                            continue;
-                        }
-                        flusher.issue_tlb_flush_with(TlbFlushOp::Address(va), page);
-                    }
-                    id if id == TypeId::of::<Untracked>() => {
-                        panic!("Found tracked memory mapped into untracked `KVirtArea`");
-                    }
-                    _ => panic!("Unexpected `KVirtArea` type"),
-                },
-                PageTableItem::MappedUntracked { va, .. } => match TypeId::of::<M>() {
-                    id if id == TypeId::of::<Untracked>() => {
-                        if !flusher.need_remote_flush() && tlb_prefer_flush_all {
-                            continue;
-                        }
-                        flusher.issue_tlb_flush(TlbFlushOp::Address(va));
-                    }
-                    id if id == TypeId::of::<Tracked>() => {
-                        panic!("Found untracked memory mapped into tracked `KVirtArea`");
-                    }
-                    _ => panic!("Unexpected `KVirtArea` type"),
-                },
                 PageTableItem::NotMapped { .. } => {
                     break;
                 }
+                _ => {
+                    // Not flushing TLB for mapped pages are fine as it's never reused.
+                    // FIXME: think of a way to flush if we want to reuse.
+                }
             }
         }
-
-        if !flusher.need_remote_flush() && tlb_prefer_flush_all {
-            flusher.issue_tlb_flush(TlbFlushOp::All);
-        }
-
-        flusher.dispatch_tlb_flush();
 
         // 2. free the virtual block
         let allocator = M::select_allocator();

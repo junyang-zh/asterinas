@@ -98,6 +98,8 @@ unsafe fn init() {
 
     bus::init();
 
+    mm::this_cpu_init_tlb_recycler();
+
     arch::irq::enable_local();
 
     invoke_ffi_init_funcs();
