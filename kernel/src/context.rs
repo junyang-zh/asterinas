@@ -5,8 +5,8 @@
 use core::mem;
 
 use ostd::{
-    mm::{Fallible, Infallible, VmReader, VmSpace, VmWriter},
-    task::Task,
+    mm::{Fallible, Infallible, VmReader, VmWriter},
+    task::{CurrentTask, CurrentUserMode},
 };
 
 use crate::{
@@ -21,20 +21,25 @@ pub struct Context<'a> {
     pub process: &'a Process,
     pub posix_thread: &'a PosixThread,
     pub thread: &'a Thread,
-    pub task: &'a Task,
+    pub task: CurrentTask,
 }
 
 impl Context<'_> {
     /// Gets the userspace of the current task.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the current task does not have a user space,
+    /// or if the user space of the task is already borrowed.
     pub fn user_space(&self) -> CurrentUserSpace {
-        CurrentUserSpace::new(self.task)
+        CurrentUserSpace::borrow_from(&self.task)
     }
 }
 
 /// The user's memory space of the current task.
 ///
 /// It provides methods to read from or write to the user space efficiently.
-pub struct CurrentUserSpace<'a>(&'a VmSpace);
+pub struct CurrentUserSpace<'a>(CurrentUserMode<'a>);
 
 /// Gets the [`CurrentUserSpace`] from the current task.
 ///
@@ -43,7 +48,7 @@ pub struct CurrentUserSpace<'a>(&'a VmSpace);
 #[macro_export]
 macro_rules! current_userspace {
     () => {
-        CurrentUserSpace::new(&ostd::task::Task::current().unwrap())
+        CurrentUserSpace::borrow_from(&ostd::task::Task::current().unwrap())
     };
 }
 
@@ -60,14 +65,11 @@ impl<'a> CurrentUserSpace<'a> {
     ///
     /// # Panics
     ///
-    /// This method will panic in debug builds if the specified `task` is not the current task.
-    pub fn new(task: &'a Task) -> Self {
-        let user_space = task.user_space().unwrap();
-        debug_assert!(Arc::ptr_eq(
-            task.user_space().unwrap(),
-            Task::current().unwrap().user_space().unwrap()
-        ));
-        Self(user_space.vm_space())
+    /// This method will panic if
+    ///  - the specified `task` does not have a user space;
+    ///  - the user space of the task is already borrowed.
+    pub fn borrow_from(task: &'a CurrentTask) -> Self {
+        Self(task.user_mode().expect("no user mode from current task"))
     }
 
     /// Creates a reader to read data from the user space of the current task.

@@ -12,9 +12,10 @@ mod utils;
 use core::{
     any::Any,
     borrow::Borrow,
-    cell::{Cell, SyncUnsafeCell},
+    cell::{BorrowError, BorrowMutError, Cell, Ref, RefCell, RefMut, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
+    result::Result,
 };
 
 use kernel_stack::KernelStack;
@@ -27,7 +28,11 @@ pub use self::{
     scheduler::info::{AtomicCpuId, TaskScheduleInfo},
 };
 pub(crate) use crate::arch::task::{context_switch, TaskContext};
-use crate::{prelude::*, user::UserSpace};
+use crate::{
+    mm::{Fallible, Vaddr, VmReader, VmWriter, MAX_USERSPACE_VADDR},
+    prelude::*,
+    user::{ReturnReason, UserContextApiInternal, UserMode},
+};
 
 /// A task that executes a function to the end.
 ///
@@ -39,7 +44,7 @@ pub struct Task {
     #[allow(clippy::type_complexity)]
     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
     data: Box<dyn Any + Send + Sync>,
-    user_space: Option<Arc<UserSpace>>,
+    user_mode: Option<RefCell<UserMode>>,
     ctx: SyncUnsafeCell<TaskContext>,
     /// kernel stack, note that the top is SyscallFrame/TrapFrame
     #[allow(dead_code)]
@@ -47,6 +52,12 @@ pub struct Task {
 
     schedule_info: TaskScheduleInfo,
 }
+
+// The only non-`Sync`/`Send` field in `Task` is `user_mode`, which is
+// `RefCell<UserMode>`. We ensure safety by accessing it only through
+// `CurrentTask` which is neither `Sync` nor `Send`.
+unsafe impl Sync for Task {}
+unsafe impl Send for Task {}
 
 impl Task {
     /// Gets the current task.
@@ -57,26 +68,6 @@ impl Task {
 
         // SAFETY: `current_task` is the current task.
         Some(unsafe { CurrentTask::new(current_task) })
-    }
-
-    pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
-        &self.ctx
-    }
-
-    /// Sets thread-local storage pointer.
-    pub fn set_tls_pointer(&self, tls: usize) {
-        let ctx_ptr = self.ctx.get();
-
-        // SAFETY: it's safe to set user tls pointer in kernel context.
-        unsafe { (*ctx_ptr).set_tls_pointer(tls) }
-    }
-
-    /// Gets thread-local storage pointer.
-    pub fn tls_pointer(&self) -> usize {
-        let ctx_ptr = self.ctx.get();
-
-        // SAFETY: it's safe to get user tls pointer in kernel context.
-        unsafe { (*ctx_ptr).tls_pointer() }
     }
 
     /// Yields execution so that another task may be scheduled.
@@ -104,134 +95,46 @@ impl Task {
         &self.schedule_info
     }
 
-    /// Returns the user space of this task, if it has.
-    pub fn user_space(&self) -> Option<&Arc<UserSpace>> {
-        if self.user_space.is_some() {
-            Some(self.user_space.as_ref().unwrap())
-        } else {
-            None
-        }
+    /// Sets the architectural thread local storage (TLS) pointer of this task.
+    pub fn set_tls_pointer(&self, tls: usize) {
+        let ctx_ptr = self.ctx.get();
+
+        // SAFETY: it's safe to set user tls pointer in kernel context since
+        // the kernel won't use this pointer.
+        unsafe { (*ctx_ptr).set_tls_pointer(tls) }
     }
-}
 
-/// Options to create or spawn a new task.
-pub struct TaskOptions {
-    func: Option<Box<dyn FnOnce() + Send>>,
-    data: Option<Box<dyn Any + Send + Sync>>,
-    user_space: Option<Arc<UserSpace>>,
-}
-
-impl TaskOptions {
-    /// Creates a set of options for a task.
-    pub fn new<F>(func: F) -> Self
-    where
-        F: FnOnce() + Send + Sync + 'static,
-    {
-        Self {
-            func: Some(Box::new(func)),
-            data: None,
-            user_space: None,
+    /// Activates the user space of this task if it has.
+    ///
+    /// # Safety
+    ///
+    /// This task should not be running anywhere.
+    pub(crate) unsafe fn activate(&self) {
+        if let Some(user_mode) = self.user_mode.as_ref() {
+            // If the safety precondition holds, we can safely borrow here
+            // even if `Task` is `Sync` because only a running task can
+            // access the user space through `CurrentTask`.
+            user_mode.borrow().vm_space().activate();
         }
     }
 
-    /// Sets the function that represents the entry point of the task.
-    pub fn func<F>(mut self, func: F) -> Self
-    where
-        F: Fn() + Send + 'static,
-    {
-        self.func = Some(Box::new(func));
-        self
-    }
-
-    /// Sets the data associated with the task.
-    pub fn data<T>(mut self, data: T) -> Self
-    where
-        T: Any + Send + Sync,
-    {
-        self.data = Some(Box::new(data));
-        self
-    }
-
-    /// Sets the user space associated with the task.
-    pub fn user_space(mut self, user_space: Option<Arc<UserSpace>>) -> Self {
-        self.user_space = user_space;
-        self
-    }
-
-    /// Builds a new task without running it immediately.
-    pub fn build(self) -> Result<Task> {
-        /// all task will entering this function
-        /// this function is mean to executing the task_fn in Task
-        extern "C" fn kernel_task_entry() -> ! {
-            let current_task = Task::current()
-                .expect("no current task, it should have current task in kernel task entry");
-
-            // SAFETY: The `func` field will only be accessed by the current task in the task
-            // context, so the data won't be accessed concurrently.
-            let task_func = unsafe { current_task.func.get() };
-            let task_func = task_func
-                .take()
-                .expect("task function is `None` when trying to run");
-            task_func();
-
-            // Manually drop all the on-stack variables to prevent memory leakage!
-            // This is needed because `scheduler::exit_current()` will never return.
-            //
-            // However, `current_task` _borrows_ the current task without holding
-            // an extra reference count. So we do nothing here.
-
-            scheduler::exit_current();
-        }
-
-        let kstack = KernelStack::new_with_guard_page()?;
-
-        let mut ctx = SyncUnsafeCell::new(TaskContext::default());
-        if let Some(user_space) = self.user_space.as_ref() {
-            ctx.get_mut().set_tls_pointer(user_space.tls_pointer());
-        };
-        ctx.get_mut()
-            .set_instruction_pointer(kernel_task_entry as usize);
-        // We should reserve space for the return address in the stack, otherwise
-        // we will write across the page boundary due to the implementation of
-        // the context switch.
-        //
-        // According to the System V AMD64 ABI, the stack pointer should be aligned
-        // to at least 16 bytes. And a larger alignment is needed if larger arguments
-        // are passed to the function. The `kernel_task_entry` function does not
-        // have any arguments, so we only need to align the stack pointer to 16 bytes.
-        ctx.get_mut().set_stack_pointer(kstack.end_vaddr() - 16);
-
-        let new_task = Task {
-            func: ForceSync::new(Cell::new(self.func)),
-            data: self.data.unwrap(),
-            user_space: self.user_space,
-            ctx,
-            kstack,
-            schedule_info: TaskScheduleInfo {
-                cpu: AtomicCpuId::default(),
-            },
-        };
-
-        Ok(new_task)
-    }
-
-    /// Builds a new task and runs it immediately.
-    pub fn spawn(self) -> Result<Arc<Task>> {
-        let task = Arc::new(self.build()?);
-        task.run();
-        Ok(task)
+    pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
+        &self.ctx
     }
 }
 
 /// The current task.
 ///
 /// This type is not `Send`, so it cannot outlive the current task.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CurrentTask(NonNull<Task>);
 
-// The intern `NonNull<Task>` contained by `CurrentTask` implies that `CurrentTask` is `!Send`.
-// But it is still good to do this explicitly because this property is key for soundness.
+// The intern `NonNull<Task>` contained by `CurrentTask` implies that
+// `CurrentTask` is `!Send` and `!Sync`.
+// But it is still good to do these explicitly because this property is key for
+// soundness.
 impl !Send for CurrentTask {}
+impl !Sync for CurrentTask {}
 
 impl CurrentTask {
     /// # Safety
@@ -241,8 +144,13 @@ impl CurrentTask {
         Self(task)
     }
 
-    /// Returns a cloned `Arc<Task>`.
-    pub fn cloned(&self) -> Arc<Task> {
+    /// Returns the user mode of this task, if it has.
+    pub fn user_mode(&self) -> Option<CurrentUserMode<'_>> {
+        self.as_ref().user_mode.as_ref().map(CurrentUserMode)
+    }
+
+    /// Returns a cloned `Arc<Task>` that is owning and shareable.
+    pub fn to_owned(&self) -> Arc<Task> {
         let ptr = self.0.as_ptr();
 
         // SAFETY: The current task is always a valid task and it is always contained in an `Arc`.
@@ -287,6 +195,215 @@ pub trait TaskContextApi {
 
     /// Gets stack pointer
     fn stack_pointer(&self) -> usize;
+}
+
+/// The currently running user mode.
+// FIXME: `RefCell` is suspicious to be interrupt-safe. But we see it
+// implemented by `Cell` so in interrupts it should see no inconsistency.
+// Nevertheless we should devise something like `Send` or `Sync` for
+// interrupt safety.
+pub struct CurrentUserMode<'t>(&'t RefCell<UserMode>);
+
+// `RefCell` implies them nontheless, but it is good to do these explicitly.
+impl !Send for CurrentUserMode<'_> {}
+impl !Sync for CurrentUserMode<'_> {}
+
+impl<'t> CurrentUserMode<'t> {
+    /// Starts executing in the user mode.
+    ///
+    /// The method returns for one of three possible reasons indicated by [`ReturnReason`].
+    ///  1. A system call is issued by the user space;
+    ///  2. A CPU exception is triggered by the user space;
+    ///  3. A kernel event is pending, as indicated by the given closure.
+    ///
+    /// After handling whatever user or kernel events that cause the method to
+    /// return and updating the user-mode CPU context, this method can be
+    /// invoked again to go back to the user space.
+    ///
+    /// # Panics
+    ///
+    /// This function would panic if it is called in the interrupt context.
+    pub fn execute<F>(&mut self, has_kernel_event: F) -> ReturnReason
+    where
+        F: FnMut() -> bool,
+    {
+        crate::task::atomic_mode::might_sleep();
+        self.0.borrow_mut().context_mut().execute(has_kernel_event)
+    }
+
+    /// Borrows the user mode.
+    ///
+    /// # Panics
+    ///
+    /// This function would panic if the user mode is already borrowed mutably.
+    /// For a non-panicking version, see [`Self::try_borrow`].
+    pub fn borrow(&self) -> Ref<'t, UserMode> {
+        self.0.borrow()
+    }
+
+    /// Tries to borrow the user mode mutably.
+    pub fn try_borrow(&self) -> Result<Ref<'t, UserMode>, BorrowError> {
+        self.0.try_borrow()
+    }
+
+    /// Borrows the user mode mutably.
+    ///
+    /// # Panics
+    ///
+    /// This function would panic if the user mode is already borrowed.
+    /// For a non-panicking version, see [`Self::try_borrow_mut`].
+    pub fn borrow_mut(&self) -> RefMut<'t, UserMode> {
+        self.0.borrow_mut()
+    }
+
+    /// Tries to borrow the user mode mutably.
+    pub fn try_borrow_mut(&self) -> Result<RefMut<'t, UserMode>, BorrowMutError> {
+        self.0.try_borrow_mut()
+    }
+
+    /// Creates a reader to read data from the current user space.
+    ///
+    /// Returns `Err` if this `VmSpace` is not belonged to the user space of the current task
+    /// or the `vaddr` and `len` do not represent a user space memory range.
+    pub fn reader(&self, vaddr: Vaddr, len: usize) -> crate::Result<VmReader<'t, Fallible>> {
+        if vaddr.checked_add(len).unwrap_or(usize::MAX) > MAX_USERSPACE_VADDR {
+            return Err(crate::Error::AccessDenied);
+        }
+
+        // `VmReader` is neither `Sync` nor `Send`, so it will not live longer than the current
+        // task. This ensures that the correct page table is activated during the usage period of
+        // the `VmReader`.
+        //
+        // SAFETY: The memory range is in user space, as checked above.
+        Ok(unsafe { VmReader::<Fallible>::from_user_space(vaddr as *const u8, len) })
+    }
+
+    /// Creates a writer to write data into the current user space.
+    ///
+    /// Returns `Err` if this `VmSpace` is not belonged to the user space of the current task
+    /// or the `vaddr` and `len` do not represent a user space memory range.
+    pub fn writer(&self, vaddr: Vaddr, len: usize) -> crate::Result<VmWriter<'t, Fallible>> {
+        if vaddr.checked_add(len).unwrap_or(usize::MAX) > MAX_USERSPACE_VADDR {
+            return Err(crate::Error::AccessDenied);
+        }
+
+        // `VmWriter` is neither `Sync` nor `Send`, so it will not live longer than the current
+        // task. This ensures that the correct page table is activated during the usage period of
+        // the `VmWriter`.
+        //
+        // SAFETY: The memory range is in user space, as checked above.
+        Ok(unsafe { VmWriter::<Fallible>::from_user_space(vaddr as *mut u8, len) })
+    }
+}
+
+/// Options to create or spawn a new task.
+pub struct TaskOptions {
+    func: Option<Box<dyn FnOnce() + Send>>,
+    data: Option<Box<dyn Any + Send + Sync>>,
+    user_mode: Option<UserMode>,
+}
+
+impl TaskOptions {
+    /// Creates a set of options for a task.
+    pub fn new<F>(func: F) -> Self
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        Self {
+            func: Some(Box::new(func)),
+            data: None,
+            user_mode: None,
+        }
+    }
+
+    /// Sets the function that represents the entry point of the task.
+    pub fn func<F>(mut self, func: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
+        self.func = Some(Box::new(func));
+        self
+    }
+
+    /// Sets the data associated with the task.
+    pub fn data<T>(mut self, data: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        self.data = Some(Box::new(data));
+        self
+    }
+
+    /// Sets the user space associated with the task.
+    pub fn user_mode(mut self, user_mode: Option<UserMode>) -> Self {
+        self.user_mode = user_mode;
+        self
+    }
+
+    /// Builds a new task without running it immediately.
+    pub fn build(self) -> crate::prelude::Result<Task> {
+        /// all task will entering this function
+        /// this function is mean to executing the task_fn in Task
+        extern "C" fn kernel_task_entry() -> ! {
+            let current_task = Task::current()
+                .expect("no current task, it should have current task in kernel task entry");
+
+            // SAFETY: The `func` field will only be accessed by the current task in the task
+            // context, so the data won't be accessed concurrently.
+            let task_func = unsafe { current_task.func.get() };
+            let task_func = task_func
+                .take()
+                .expect("task function is `None` when trying to run");
+            task_func();
+
+            // Manually drop all the on-stack variables to prevent memory leakage!
+            // This is needed because `scheduler::exit_current()` will never return.
+            //
+            // However, `current_task` _borrows_ the current task without holding
+            // an extra reference count. So we do nothing here.
+
+            scheduler::exit_current();
+        }
+
+        let kstack = KernelStack::new_with_guard_page()?;
+
+        let mut ctx = SyncUnsafeCell::new(TaskContext::default());
+        if let Some(user_mode) = self.user_mode.as_ref() {
+            ctx.get_mut()
+                .set_tls_pointer(user_mode.context().tls_pointer());
+        };
+        ctx.get_mut()
+            .set_instruction_pointer(kernel_task_entry as usize);
+        // We should reserve space for the return address in the stack, otherwise
+        // we will write across the page boundary due to the implementation of
+        // the context switch.
+        //
+        // According to the System V AMD64 ABI, the stack pointer should be aligned
+        // to at least 16 bytes. And a larger alignment is needed if larger arguments
+        // are passed to the function. The `kernel_task_entry` function does not
+        // have any arguments, so we only need to align the stack pointer to 16 bytes.
+        ctx.get_mut().set_stack_pointer(kstack.end_vaddr() - 16);
+
+        let new_task = Task {
+            func: ForceSync::new(Cell::new(self.func)),
+            data: self.data.unwrap(),
+            user_mode: self.user_mode.map(RefCell::new),
+            ctx,
+            kstack,
+            schedule_info: TaskScheduleInfo {
+                cpu: AtomicCpuId::default(),
+            },
+        };
+
+        Ok(new_task)
+    }
+
+    /// Builds a new task and runs it immediately.
+    pub fn spawn(self) -> crate::prelude::Result<Arc<Task>> {
+        let task = Arc::new(self.build()?);
+        task.run();
+        Ok(task)
+    }
 }
 
 #[cfg(ktest)]

@@ -80,11 +80,6 @@ impl<R> PageFaultHandler for Vmar<R> {
 }
 
 impl<R> Vmar<R> {
-    /// FIXME: This function should require access control
-    pub fn vm_space(&self) -> &Arc<VmSpace> {
-        self.0.vm_space()
-    }
-
     /// Resizes the original mapping.
     ///
     /// The range of the mapping goes from `map_addr..map_addr + old_size` to

@@ -71,8 +71,10 @@ pub struct Process {
     // Mutable Part
     /// The executable path.
     executable_path: RwLock<String>,
-    /// The threads
-    tasks: Mutex<Vec<Arc<Task>>>,
+    /// The main thread whose tid is the same as the pid.
+    main_thread: Arc<Task>,
+    /// Other threads.
+    threads: Mutex<Vec<Arc<Task>>>,
     /// Process status
     status: ProcessStatus,
     /// Parent process
@@ -181,7 +183,8 @@ impl Process {
     fn new(
         pid: Pid,
         parent: Weak<Process>,
-        tasks: Vec<Arc<Task>>,
+        main_thread: Arc<Task>,
+        threads: Vec<Arc<Task>>,
         executable_path: String,
         process_vm: ProcessVm,
 
@@ -201,7 +204,8 @@ impl Process {
 
         Arc::new_cyclic(|process_ref: &Weak<Process>| Self {
             pid,
-            tasks: Mutex::new(tasks),
+            main_thread,
+            threads: Mutex::new(threads),
             executable_path: RwLock::new(executable_path),
             process_vm,
             children_wait_queue,

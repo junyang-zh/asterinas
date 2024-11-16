@@ -180,7 +180,7 @@ impl Waiter {
     pub fn new_pair() -> (Self, Arc<Waker>) {
         let waker = Arc::new(Waker {
             has_woken: AtomicBool::new(false),
-            task: Task::current().unwrap().cloned(),
+            task: Task::current().unwrap().to_owned(),
         });
         let waiter = Self {
             waker: waker.clone(),

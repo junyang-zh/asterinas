@@ -256,9 +256,11 @@ extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
 /// Handles page fault from user space.
 fn handle_user_page_fault(f: &mut TrapFrame, page_fault_addr: u64) {
     let current_task = Task::current().unwrap();
-    let user_space = current_task
-        .user_space()
-        .expect("the user space is missing when a page fault from the user happens.");
+    let user_mode = current_task
+        .user_mode()
+        .expect("the user space is missing when a page fault from the user happens.")
+        .borrow();
+    let vm_space = user_mode.vm_space();
 
     let info = CpuExceptionInfo {
         page_fault_addr: page_fault_addr as usize,
@@ -266,7 +268,7 @@ fn handle_user_page_fault(f: &mut TrapFrame, page_fault_addr: u64) {
         error_code: f.error_code,
     };
 
-    let res = user_space.vm_space().handle_page_fault(&info);
+    let res = vm_space.handle_page_fault(&info);
     // Copying bytes by bytes can recover directly
     // if handling the page fault successfully.
     if res.is_ok() {

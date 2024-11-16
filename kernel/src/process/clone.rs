@@ -5,7 +5,7 @@ use core::{num::NonZeroU64, sync::atomic::Ordering};
 use ostd::{
     cpu::UserContext,
     task::Task,
-    user::{UserContextApi, UserSpace},
+    user::UserContextApi,
 };
 
 use super::{

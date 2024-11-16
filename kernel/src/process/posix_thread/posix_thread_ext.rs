@@ -3,7 +3,7 @@
 use ostd::{
     cpu::UserContext,
     task::Task,
-    user::{UserContextApi, UserSpace},
+    user::UserContextApi,
 };
 
 use super::{builder::PosixThreadBuilder, name::ThreadName, PosixThread};

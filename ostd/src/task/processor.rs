@@ -55,8 +55,10 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     };
 
     let next_task_ctx_ptr = next_task.ctx().get().cast_const();
-    if let Some(next_user_space) = next_task.user_space() {
-        next_user_space.vm_space().activate();
+    // FIXME: THIS IS ACTUALLY NOT SAFE. we don't have any guarentee that the
+    // next task is not running on any other CPUs.
+    unsafe {
+        next_task.activate();
     }
 
     // Change the current task to the next task.

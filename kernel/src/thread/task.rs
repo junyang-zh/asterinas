@@ -2,7 +2,7 @@
 
 use ostd::{
     task::{Task, TaskOptions},
-    user::{ReturnReason, UserContextApi, UserMode, UserSpace},
+    user::{ReturnReason, UserContextApi, UserMode},
 };
 
 use super::{oops, Thread};

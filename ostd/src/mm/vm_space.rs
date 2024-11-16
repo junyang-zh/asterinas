@@ -9,26 +9,24 @@
 //! powerful concurrent accesses to the page table, and suffers from the same
 //! validity concerns as described in [`super::page_table::cursor`].
 
-use core::{ops::Range, sync::atomic::Ordering};
+use core::{
+    ops::{Deref, Range},
+    sync::atomic::Ordering,
+};
 
 use crate::{
-    arch::mm::{
-        current_page_table_paddr, tlb_flush_all_excluding_global, PageTableEntry, PagingConsts,
-    },
+    arch::mm::{tlb_flush_all_excluding_global, PageTableEntry, PagingConsts},
     cpu::{AtomicCpuSet, CpuExceptionInfo, CpuSet, PinCurrentCpu},
     cpu_local_cell,
     mm::{
-        io::Fallible,
         kspace::KERNEL_PAGE_TABLE,
         page::DynPage,
         page_table::{self, PageTable, PageTableItem, UserMode},
         tlb::{TlbFlushOp, TlbFlusher, FLUSH_ALL_RANGE_THRESHOLD},
-        Frame, PageProperty, VmReader, VmWriter, MAX_USERSPACE_VADDR,
+        Frame, PageProperty,
     },
     prelude::*,
-    sync::{RwLock, RwLockReadGuard},
     task::{disable_preempt, DisabledPreemptGuard},
-    Error,
 };
 
 /// Virtual memory space.
@@ -50,9 +48,6 @@ use crate::{
 pub struct VmSpace {
     pt: PageTable<UserMode>,
     page_fault_handler: Option<fn(&VmSpace, &CpuExceptionInfo) -> core::result::Result<(), ()>>,
-    /// A CPU can only activate a `VmSpace` when no mutable cursors are alive.
-    /// Cursors hold read locks and activation require a write lock.
-    activation_lock: RwLock<()>,
     cpus: AtomicCpuSet,
 }
 
@@ -62,37 +57,7 @@ impl VmSpace {
         Self {
             pt: KERNEL_PAGE_TABLE.get().unwrap().create_user_page_table(),
             page_fault_handler: None,
-            activation_lock: RwLock::new(()),
             cpus: AtomicCpuSet::new(CpuSet::new_empty()),
-        }
-    }
-
-    /// Clears the user space mappings in the page table.
-    ///
-    /// This method returns error if the page table is activated on any other
-    /// CPUs or there are any cursors alive.
-    pub fn clear(&self) -> core::result::Result<(), VmSpaceClearError> {
-        let preempt_guard = disable_preempt();
-        let _guard = self
-            .activation_lock
-            .try_write()
-            .ok_or(VmSpaceClearError::CursorsAlive)?;
-
-        let cpus = self.cpus.load();
-        let cpu = preempt_guard.current_cpu();
-        let cpus_set_is_empty = cpus.is_empty();
-        let cpus_set_is_single_self = cpus.count() == 1 && cpus.contains(cpu);
-
-        if cpus_set_is_empty || cpus_set_is_single_self {
-            // SAFETY: We have ensured that the page table is not activated on
-            // other CPUs and no cursors are alive.
-            unsafe { self.pt.clear() };
-            if cpus_set_is_single_self {
-                tlb_flush_all_excluding_global();
-            }
-            Ok(())
-        } else {
-            Err(VmSpaceClearError::PageTableActivated(cpus))
         }
     }
 
@@ -118,47 +83,12 @@ impl VmSpace {
     /// The creation of the cursor may block if another cursor having an
     /// overlapping range is alive. The modification to the mapping by the
     /// cursor may also block or be overridden the mapping of another cursor.
-    pub fn cursor_mut(&self, va: &Range<Vaddr>) -> Result<CursorMut<'_, '_, '_>> {
-        Ok(self.pt.cursor_mut(va).map(|pt_cursor| {
-            let activation_lock = self.activation_lock.read();
-
-            CursorMut {
-                space: self,
-                pt_cursor,
-                activation_lock,
-                flusher: TlbFlusher::new(self.cpus.load(), disable_preempt()),
-            }
+    pub fn cursor_mut(&self, va: &Range<Vaddr>) -> Result<CursorMut<'_, '_>> {
+        Ok(self.pt.cursor_mut(va).map(|pt_cursor| CursorMut {
+            space: self,
+            pt_cursor,
+            flusher: TlbFlusher::new(self.cpus.load(), disable_preempt()),
         })?)
-    }
-
-    /// Activates the page table on the current CPU.
-    pub(crate) fn activate(self: &Arc<Self>) {
-        let preempt_guard = disable_preempt();
-        let cpu = preempt_guard.current_cpu();
-
-        let last_ptr = ACTIVATED_VM_SPACE.load();
-
-        if last_ptr == Arc::as_ptr(self) {
-            return;
-        }
-
-        // Ensure no mutable cursors (which holds read locks) are alive before
-        // we add the CPU to the CPU set.
-        let _activation_lock = self.activation_lock.write();
-
-        // Record ourselves in the CPU set and the activated VM space pointer.
-        self.cpus.add(cpu, Ordering::Relaxed);
-        let self_ptr = Arc::into_raw(Arc::clone(self)) as *mut VmSpace;
-        ACTIVATED_VM_SPACE.store(self_ptr);
-
-        if !last_ptr.is_null() {
-            // SAFETY: The pointer is cast from an `Arc` when it's activated
-            // the last time, so it can be restored and only restored once.
-            let last = unsafe { Arc::from_raw(last_ptr) };
-            last.cpus.remove(cpu, Ordering::Relaxed);
-        }
-
-        self.pt.activate();
     }
 
     pub(crate) fn handle_page_fault(
@@ -178,48 +108,6 @@ impl VmSpace {
     ) {
         self.page_fault_handler = Some(func);
     }
-
-    /// Creates a reader to read data from the user space of the current task.
-    ///
-    /// Returns `Err` if this `VmSpace` is not belonged to the user space of the current task
-    /// or the `vaddr` and `len` do not represent a user space memory range.
-    pub fn reader(&self, vaddr: Vaddr, len: usize) -> Result<VmReader<'_, Fallible>> {
-        if current_page_table_paddr() != unsafe { self.pt.root_paddr() } {
-            return Err(Error::AccessDenied);
-        }
-
-        if vaddr.checked_add(len).unwrap_or(usize::MAX) > MAX_USERSPACE_VADDR {
-            return Err(Error::AccessDenied);
-        }
-
-        // `VmReader` is neither `Sync` nor `Send`, so it will not live longer than the current
-        // task. This ensures that the correct page table is activated during the usage period of
-        // the `VmReader`.
-        //
-        // SAFETY: The memory range is in user space, as checked above.
-        Ok(unsafe { VmReader::<Fallible>::from_user_space(vaddr as *const u8, len) })
-    }
-
-    /// Creates a writer to write data into the user space.
-    ///
-    /// Returns `Err` if this `VmSpace` is not belonged to the user space of the current task
-    /// or the `vaddr` and `len` do not represent a user space memory range.
-    pub fn writer(&self, vaddr: Vaddr, len: usize) -> Result<VmWriter<'_, Fallible>> {
-        if current_page_table_paddr() != unsafe { self.pt.root_paddr() } {
-            return Err(Error::AccessDenied);
-        }
-
-        if vaddr.checked_add(len).unwrap_or(usize::MAX) > MAX_USERSPACE_VADDR {
-            return Err(Error::AccessDenied);
-        }
-
-        // `VmWriter` is neither `Sync` nor `Send`, so it will not live longer than the current
-        // task. This ensures that the correct page table is activated during the usage period of
-        // the `VmWriter`.
-        //
-        // SAFETY: The memory range is in user space, as checked above.
-        Ok(unsafe { VmWriter::<Fallible>::from_user_space(vaddr as *mut u8, len) })
-    }
 }
 
 impl Default for VmSpace {
@@ -228,15 +116,80 @@ impl Default for VmSpace {
     }
 }
 
-/// An error that may occur when doing [`VmSpace::clear`].
+/// A shared reference to the virtual memory space.
 #[derive(Debug)]
-pub enum VmSpaceClearError {
-    /// The page table is activated on other CPUs.
+pub struct SharedVmSpace(Arc<VmSpace>);
+
+impl SharedVmSpace {
+    /// Allow a virtual memory space to be shared.
+    pub fn new(vm_space: VmSpace) -> Self {
+        Self(Arc::new(vm_space))
+    }
+
+    /// Share a virtual memory space.
+    pub fn share(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+
+    /// Clears the user space mappings in the page table.
     ///
-    /// The activated CPUs detected are contained in the error.
-    PageTableActivated(CpuSet),
-    /// There are still cursors alive.
-    CursorsAlive,
+    /// # Panics
+    ///
+    /// This function panics if
+    ///  - the virtual memory space is activated on other CPUs currently.
+    ///  - this task do not hold the exclusive access to the shared VM space.
+    pub fn clear(&mut self) {
+        let preempt_guard = disable_preempt();
+        let cpus = self.cpus.load();
+        let cpu = preempt_guard.current_cpu();
+        let cpus_set_is_empty = cpus.is_empty();
+        let cpus_set_is_single_self = cpus.count() == 1 && cpus.contains(cpu);
+        assert!(cpus_set_is_empty || cpus_set_is_single_self);
+
+        let space =
+            Arc::get_mut(&mut self.0).expect("shared virtual memory space cannot be cleared");
+
+        // SAFETY: We checked that no other CPUs are activating the VM
+        // space currently. Other CPUs cannot activate after the check because
+        // we are exclusively accessed by the current task.
+        unsafe { space.pt.clear() };
+
+        tlb_flush_all_excluding_global();
+    }
+
+    /// Activates the page table on the current CPU.
+    pub(crate) fn activate(&self) {
+        let preempt_guard = disable_preempt();
+        let cpu = preempt_guard.current_cpu();
+
+        let last_ptr = ACTIVATED_VM_SPACE.load();
+
+        if last_ptr == Arc::as_ptr(&self.0) {
+            return;
+        }
+
+        // Record ourselves in the CPU set and the activated VM space pointer.
+        self.0.cpus.add(cpu, Ordering::Relaxed);
+        let self_ptr = Arc::into_raw(Arc::clone(&self.0)) as *mut VmSpace;
+        ACTIVATED_VM_SPACE.store(self_ptr);
+
+        if !last_ptr.is_null() {
+            // SAFETY: The pointer is cast from an `Arc` when it's activated
+            // the last time, so it can be restored and only restored once.
+            let last = unsafe { Arc::from_raw(last_ptr) };
+            last.cpus.remove(cpu, Ordering::Relaxed);
+        }
+
+        self.0.pt.activate();
+    }
+}
+
+impl Deref for SharedVmSpace {
+    type Target = VmSpace;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
 }
 
 /// The cursor for querying over the VM space without modifying it.
@@ -282,17 +235,15 @@ impl Cursor<'_> {
 ///
 /// It exclusively owns a sub-tree of the page table, preventing others from
 /// reading or modifying the same sub-tree.
-pub struct CursorMut<'a, 'b, 'c> {
+pub struct CursorMut<'a, 'b> {
     space: &'a VmSpace,
     pt_cursor: page_table::CursorMut<'b, UserMode, PageTableEntry, PagingConsts>,
-    #[allow(dead_code)]
-    activation_lock: RwLockReadGuard<'c, ()>,
     // We have a read lock so the CPU set in the flusher is always a superset
     // of actual activated CPUs.
     flusher: TlbFlusher<DisabledPreemptGuard>,
 }
 
-impl CursorMut<'_, '_, '_> {
+impl CursorMut<'_, '_> {
     /// Query about the current slot.
     ///
     /// This is the same as [`Cursor::query`].

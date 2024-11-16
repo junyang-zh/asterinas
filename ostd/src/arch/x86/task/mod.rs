@@ -27,11 +27,6 @@ impl TaskContext {
     pub fn set_tls_pointer(&mut self, tls: usize) {
         self.fsbase = tls;
     }
-
-    /// Gets thread-local storage pointer.
-    pub fn tls_pointer(&self) -> usize {
-        self.fsbase
-    }
 }
 
 /// Callee-saved registers.
