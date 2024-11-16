@@ -24,7 +24,7 @@ use crate::{
     },
     match_sock_option_mut, match_sock_option_ref,
     net::{
-        iface::poll_ifaces,
+        iface::{poll_ifaces, IfaceEx},
         socket::{
             options::{Error as SocketError, SocketOption},
             util::{
@@ -298,15 +298,16 @@ impl StreamSocket {
             }
         };
 
-        let received = connected_stream.try_recv(writer, flags).map(|recv_bytes| {
-            let remote_endpoint = connected_stream.remote_endpoint();
-            (recv_bytes, remote_endpoint.into())
-        });
+        let (recv_bytes, need_poll) = connected_stream.try_recv(writer, flags)?;
+        let poll_iface = need_poll.then(|| connected_stream.iface().clone());
+        let remote_endpoint = connected_stream.remote_endpoint();
 
         drop(state);
-        poll_ifaces();
+        if let Some(iface) = poll_iface {
+            iface.poll();
+        }
 
-        received
+        Ok((recv_bytes, remote_endpoint.into()))
     }
 
     fn recv(
@@ -337,12 +338,15 @@ impl StreamSocket {
             }
         };
 
-        let sent_bytes = connected_stream.try_send(reader, flags);
+        let (sent_bytes, need_poll) = connected_stream.try_send(reader, flags)?;
+        let poll_iface = need_poll.then(|| connected_stream.iface().clone());
 
         drop(state);
-        poll_ifaces();
+        if let Some(iface) = poll_iface {
+            iface.poll();
+        }
 
-        sent_bytes
+        Ok(sent_bytes)
     }
 
     fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
