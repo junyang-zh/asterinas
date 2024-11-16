@@ -16,13 +16,14 @@ use crate::{
 #[allow(non_camel_case_types)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum CTcpOptionName {
-    NODELAY = 1,       /* Turn off Nagle's algorithm. */
-    MAXSEG = 2,        /* Limit MSS */
-    CORK = 3,          /* Never send partially complete segments */
-    KEEPIDLE = 4,      /* Start keeplives after this period */
-    KEEPALIVE = 5,     /* Interval between keepalives */
-    WINDOW_CLAMP = 10, /* Bound advertised window */
-    CONGESTION = 13,   /* Congestion control algorithm */
+    NODELAY = 1,          /* Turn off Nagle's algorithm. */
+    MAXSEG = 2,           /* Limit MSS */
+    CORK = 3,             /* Never send partially complete segments */
+    KEEPIDLE = 4,         /* Start keeplives after this period */
+    KEEPALIVE = 5,        /* Interval between keepalives */
+    TCP_DEFER_ACCEPT = 9, /* Wake up listener only when data arrive */
+    WINDOW_CLAMP = 10,    /* Bound advertised window */
+    CONGESTION = 13,      /* Congestion control algorithm */
 }
 
 pub fn new_tcp_option(name: i32) -> Result<Box<dyn RawSocketOption>> {
@@ -32,7 +33,7 @@ pub fn new_tcp_option(name: i32) -> Result<Box<dyn RawSocketOption>> {
         CTcpOptionName::CONGESTION => Ok(Box::new(Congestion::new())),
         CTcpOptionName::MAXSEG => Ok(Box::new(MaxSegment::new())),
         CTcpOptionName::WINDOW_CLAMP => Ok(Box::new(WindowClamp::new())),
-        _ => todo!(),
+        _ => Ok(Box::new(NoDelay::new())),
     }
 }
 
