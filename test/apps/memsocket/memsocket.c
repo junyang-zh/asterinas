@@ -10,15 +10,29 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define MAX_DESCRIPTORS 1024
+#define MAX_DESCRIPTORS 256
+#define FD_OFFSET 100
+
 #define SHM_NAME "/benchshm"
-#define SHM_SIZE 1024 * 1024 * 1024 // 1GB
+#define SHM_SIZE_PER_DESC (16 * 1024 * 1024) // 16 MB per desc
+#define SHM_SIZE (MAX_DESCRIPTORS * SHM_SIZE_PER_DESC)
+
+// Shared memory pointer
+static void *shm_ptr = NULL;
+
+// Shared memory evenly divided for each descriptor
+#define SHM_PTR_FOR_FD(fd) (shm_ptr + (fd - FD_OFFSET) * SHM_SIZE_PER_DESC)
 
 // Descriptor types
-#define DESC_UNUSED 0
+#define DESC_TYPE_UNUSED 0
 #define DESC_SERVER_SOCKET 1
 #define DESC_CLIENT_SOCKET 2
 #define DESC_ACCEPTED_SOCKET 3
+
+// Descriptor states
+#define DESC_STATE_INIT 0
+#define DESC_STATE_LISTENING 1
+#define DESC_STATE_CONNECTED 2
 
 // Descriptor table entry
 typedef struct {
@@ -29,23 +43,15 @@ typedef struct {
 
 // Global descriptor table and lock
 static DescriptorEntry descriptor_table[MAX_DESCRIPTORS];
+int allocated_top = 0;
 static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
-
-// Shared memory pointer
-static void *shm_ptr = NULL;
-
-// Function pointers for original system calls
-static int (*original_socket)(int, int, int) = NULL;
-static int (*original_close)(int) = NULL;
 
 // Helper to initialize shared memory
 static void setup_shared_memory()
 {
-	shm_unlink(
-		SHM_NAME); // Ensure the shared memory object is unlinked before creating it
-	int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+	int fd = open(SHM_NAME, O_CREAT | O_RDWR, 0666);
 	if (fd == -1) {
-		perror("shm_open");
+		perror("open");
 		exit(EXIT_FAILURE);
 	}
 	if (ftruncate(fd, SHM_SIZE) == -1) {
@@ -66,12 +72,14 @@ static int allocate_descriptor(int type)
 {
 	pthread_mutex_lock(&table_lock);
 	for (int i = 0; i < MAX_DESCRIPTORS; i++) {
-		if (descriptor_table[i].type == DESC_UNUSED) {
-			descriptor_table[i].type = type;
-			descriptor_table[i].state = 0; // Initial state
-			descriptor_table[i].buffer = shm_ptr; // Example usage
+		peek = (allocated_top + i) % MAX_DESCRIPTORS;
+		if (descriptor_table[peek].type == DESC_TYPE_UNUSED) {
+			descriptor_table[peek].type = type;
+			descriptor_table[peek].state = DESC_STATE_INIT; // Initial state
+			descriptor_table[peek].buffer = SHM_PTR_FOR_FD(peek); // Example usage
+			allocated_top = peek;
 			pthread_mutex_unlock(&table_lock);
-			return i + 100; // Fake descriptor (start from 100)
+			return peek + FD_OFFSET; // Fake descriptor (start from 100)
 		}
 	}
 	pthread_mutex_unlock(&table_lock);
@@ -82,12 +90,12 @@ static int allocate_descriptor(int type)
 // Helper to free a fake descriptor
 static void free_descriptor(int fd)
 {
-	int idx = fd - 100;
+	int idx = fd - FD_OFFSET;
 	if (idx < 0 || idx >= MAX_DESCRIPTORS)
 		return;
 	pthread_mutex_lock(&table_lock);
-	descriptor_table[idx].type = DESC_UNUSED;
-	descriptor_table[idx].state = 0;
+	descriptor_table[idx].type = DESC_TYPE_UNUSED;
+	descriptor_table[idx].state = DESC_STATE_INIT;
 	descriptor_table[idx].buffer = NULL;
 	pthread_mutex_unlock(&table_lock);
 }
@@ -103,7 +111,7 @@ __attribute__((constructor)) void init_library()
 __attribute__((destructor)) void cleanup_library()
 {
 	munmap(shm_ptr, SHM_SIZE);
-	shm_unlink(SHM_NAME);
+	close(SHM_NAME);
 }
 
 /* Socket options */
@@ -111,21 +119,18 @@ __attribute__((destructor)) void cleanup_library()
 // Intercepted socket()
 int socket(int domain, int type, int protocol)
 {
-	if (!original_socket) {
-		original_socket = dlsym(RTLD_NEXT, "socket");
-	}
-
 	if (domain == AF_INET || domain == AF_INET6) {
 		return allocate_descriptor(DESC_CLIENT_SOCKET);
 	}
 
-	return original_socket(domain, type, protocol);
+	errno = EAFNOSUPPORT; // Address family not supported
+	return -1;
 }
 
 // Intercepted bind()
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
 	    descriptor_table[idx].type == DESC_CLIENT_SOCKET) {
 		descriptor_table[idx].type = DESC_SERVER_SOCKET;
@@ -138,10 +143,10 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 // Intercepted listen()
 int listen(int sockfd, int backlog)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
 	    descriptor_table[idx].type == DESC_SERVER_SOCKET) {
-		descriptor_table[idx].state = 1; // Listening state
+		descriptor_table[idx].state = DESC_STATE_LISTENING;
 		return 0;
 	}
 	errno = EBADF; // Invalid file descriptor
@@ -151,7 +156,7 @@ int listen(int sockfd, int backlog)
 // Intercepted accept()
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
 	    descriptor_table[idx].type == DESC_SERVER_SOCKET) {
 		return allocate_descriptor(DESC_ACCEPTED_SOCKET);
@@ -163,10 +168,10 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 // Intercepted connect()
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
 	    descriptor_table[idx].type == DESC_CLIENT_SOCKET) {
-		descriptor_table[idx].state = 1; // Connected state
+		descriptor_table[idx].state = DESC_STATE_CONNECTED; // Connected state
 		return 0;
 	}
 	errno = EBADF; // Invalid file descriptor
@@ -176,16 +181,14 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 // Intercepted close()
 int close(int fd)
 {
-	if (!original_close) {
-		original_close = dlsym(RTLD_NEXT, "close");
-	}
-
-	int idx = fd - 100;
+	int idx = fd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS) {
 		free_descriptor(fd);
 		return 0; // Success
 	}
-	return original_close(fd);
+
+	errno = EBADF; // Invalid file descriptor
+	return -1;
 }
 
 /* More socket states */
@@ -198,9 +201,9 @@ int close(int fd)
 int setsockopt(int sockfd, int level, int optname, const void *optval,
 	       socklen_t optlen)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Silently succeed for any option
 		return 0;
 	}
@@ -212,9 +215,9 @@ int setsockopt(int sockfd, int level, int optname, const void *optval,
 int getsockopt(int sockfd, int level, int optname, void *optval,
 	       socklen_t *optlen)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Silently succeed and return default values (e.g., 0)
 		if (optval && optlen) {
 			memset(optval, 0, *optlen); // Fill with zeroes
@@ -228,9 +231,9 @@ int getsockopt(int sockfd, int level, int optname, void *optval,
 // Intercepted getsockname()
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Provide a default dummy sockaddr structure
 		if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
 			struct sockaddr_in *dummy_addr =
@@ -251,9 +254,9 @@ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 // Intercepted getpeername()
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Provide a default dummy sockaddr structure
 		if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
 			struct sockaddr_in *dummy_addr =
@@ -274,9 +277,9 @@ int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 // Intercepted shutdown()
 int shutdown(int sockfd, int how)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Silently succeed
 		return 0;
 	}
@@ -287,9 +290,9 @@ int shutdown(int sockfd, int how)
 // Intercepted ioctl() (optional, often used in socket operations)
 int ioctl(int sockfd, unsigned long request, void *arg)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Silently succeed for any ioctl call
 		return 0;
 	}
@@ -308,9 +311,9 @@ int ioctl(int sockfd, unsigned long request, void *arg)
 // Intercepted send()
 ssize_t send(int sockfd, const void *buf, size_t len, int flags)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Write to shared memory buffer
 		if (len > BUFFER_SIZE)
 			len = BUFFER_SIZE; // Clamp to buffer size
@@ -331,9 +334,9 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
 // Intercepted sendmsg()
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		size_t total_len = 0;
 		for (size_t i = 0; i < msg->msg_iovlen; i++) {
 			size_t len = msg->msg_iov[i].iov_len;
@@ -355,9 +358,9 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)
 // Intercepted recv()
 ssize_t recv(int sockfd, void *buf, size_t len, int flags)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		// Read from shared memory buffer
 		if (len > BUFFER_SIZE)
 			len = BUFFER_SIZE; // Clamp to buffer size
@@ -378,9 +381,9 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 // Intercepted recvmsg()
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
 {
-	int idx = sockfd - 100;
+	int idx = sockfd - FD_OFFSET;
 	if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-	    descriptor_table[idx].type != DESC_UNUSED) {
+	    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 		size_t total_len = 0;
 		for (size_t i = 0; i < msg->msg_iovlen; i++) {
 			size_t len = msg->msg_iov[i].iov_len;
@@ -458,9 +461,9 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 	if (readfds) {
 		for (int i = 0; i < nfds; i++) {
 			if (FD_ISSET(i, readfds)) {
-				int idx = i - 100;
+				int idx = i - FD_OFFSET;
 				if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-				    descriptor_table[idx].type != DESC_UNUSED) {
+				    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 					// Simulate readiness for reading if in connected or accepted state
 					if (descriptor_table[idx].state > 0) {
 						FD_SET(i, readfds);
@@ -480,9 +483,9 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 	if (writefds) {
 		for (int i = 0; i < nfds; i++) {
 			if (FD_ISSET(i, writefds)) {
-				int idx = i - 100;
+				int idx = i - FD_OFFSET;
 				if (idx >= 0 && idx < MAX_DESCRIPTORS &&
-				    descriptor_table[idx].type != DESC_UNUSED) {
+				    descriptor_table[idx].type != DESC_TYPE_UNUSED) {
 					// Simulate readiness for writing
 					FD_SET(i, writefds);
 					ready_count++;
@@ -520,9 +523,9 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
 	int ready_count = 0;
 
 	for (nfds_t i = 0; i < nfds; i++) {
-		int fd = fds[i].fd - 100;
+		int fd = fds[i].fd - FD_OFFSET;
 		if (fd >= 0 && fd < MAX_DESCRIPTORS &&
-		    descriptor_table[fd].type != DESC_UNUSED) {
+		    descriptor_table[fd].type != DESC_TYPE_UNUSED) {
 			fds[i].revents = 0; // Reset events
 
 			// Simulate readiness for reading

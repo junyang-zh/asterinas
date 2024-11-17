@@ -17,7 +17,14 @@ impl UnboundTcpSocket {
         let raw_tcp_socket = {
             let rx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; TCP_RECV_BUF_LEN]);
             let tx_buffer = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; TCP_SEND_BUF_LEN]);
-            RawTcpSocket::new(rx_buffer, tx_buffer)
+            // RawTcpSocket::new(rx_buffer, tx_buffer)
+            let mut socket = RawTcpSocket::new(rx_buffer, tx_buffer);
+            // In current state of TCP implementation, we didn't exploit much on tuning TCP performance
+            // like what Linux did, where they dynamically enable QuickACK for several packets in runtime 
+            // even without turning on the quickACK mode.
+            // Here in Asterinas, if we still keep the DelayACK, it would introduce
+            socket.set_ack_delay(None);
+            socket
         };
         Self {
             socket: Box::new(raw_tcp_socket),
