@@ -13,8 +13,7 @@
 use log::{LevelFilter, Metadata, Record};
 
 use crate::{
-    boot::{kcmdline::ModuleArg, kernel_cmdline},
-    timer::Jiffies,
+    boot::{kcmdline::ModuleArg, kernel_cmdline}, cpu::PinCurrentCpu, timer::Jiffies
 };
 
 const LOGGER: Logger = Logger {};
@@ -38,6 +37,8 @@ impl log::Log for Logger {
         use crate::sync::SpinLock;
         static RECORD_LOCK: SpinLock<()> = SpinLock::new(());
         let _lock = RECORD_LOCK.disable_irq().lock();
+        let preempt_guard = crate::task::disable_preempt();
+        let cpu = preempt_guard.current_cpu();
 
         cfg_if::cfg_if! {
             if #[cfg(feature = "log_color")]{
@@ -54,8 +55,9 @@ impl log::Log for Logger {
                 };
 
                 crate::console::early_print(
-                    format_args!("{} {:<5}: {}\n",
+                    format_args!("{} [{}] {:<5}: {}\n",
                     timestamp_style.style(format_args!("[{:>10.3}]", timestamp)),
+                    cpu.as_usize(),
                     level_style.style(level),
                     record_style.style(record.args()))
                 );

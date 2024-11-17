@@ -5,6 +5,7 @@ use crate::{fs::file_table::FileDesc, prelude::*, util::net::get_socket_from_fd}
 
 pub fn sys_listen(sockfd: FileDesc, backlog: i32, _ctx: &Context) -> Result<SyscallReturn> {
     debug!("sockfd = {sockfd}, backlog = {backlog}");
+    let backlog = 10;
 
     let socket = get_socket_from_fd(sockfd)?;
 
