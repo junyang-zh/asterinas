@@ -7,14 +7,23 @@ mod interval_set;
 mod static_cap;
 pub mod vm_mapping;
 
-use core::{num::NonZeroUsize, ops::Range};
+use core::{
+    num::NonZeroUsize,
+    ops::Range,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use align_ext::AlignExt;
 use aster_rights::Rights;
 use ostd::{
     cpu::CpuExceptionInfo,
-    mm::{tlb::TlbFlushOp, vm_space::Token, PageFlags, PageProperty, VmSpace, MAX_USERSPACE_VADDR},
+    mm::{
+        tlb::TlbFlushOp,
+        vm_space::{Token, VmItem},
+        CachePolicy, FrameAllocOptions, PageFlags, PageProperty, VmSpace, MAX_USERSPACE_VADDR,
+    },
 };
+use vm_mapping::{VmMarker, VmoBackedVMA};
 
 use self::{
     interval_set::{Interval, IntervalSet},
@@ -26,6 +35,7 @@ use crate::{
     thread::exception::{handle_page_fault_from_vm_space, PageFaultInfo},
     vm::{
         perms::VmPerms,
+        util::duplicate_frame,
         vmo::{Vmo, VmoRightsOp},
     },
 };
@@ -104,6 +114,10 @@ impl<R> Vmar<R> {
     pub fn resize_mapping(&self, map_addr: Vaddr, old_size: usize, new_size: usize) -> Result<()> {
         self.0.resize_mapping(map_addr, old_size, new_size)
     }
+
+    fn alloc_vmo_backed_id(&self) -> u32 {
+        self.0.vmo_backed_id_alloc.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 pub(super) struct Vmar_ {
@@ -115,17 +129,21 @@ pub(super) struct Vmar_ {
     size: usize,
     /// The attached `VmSpace`
     vm_space: Arc<VmSpace>,
+    vmo_backed_id_alloc: AtomicU32,
 }
 
 struct VmarInner {
     /// The mapped pages and associated metadata.
     vm_mappings: IntervalSet<Vaddr, VmMapping>,
+    /// The map from the VMO-backed ID to the VMA structure.
+    vma_map: BTreeMap<u32, VmoBackedVMA>,
 }
 
 impl VmarInner {
     const fn new() -> Self {
         Self {
             vm_mappings: IntervalSet::new(),
+            vma_map: BTreeMap::new(),
         }
     }
 
@@ -245,12 +263,14 @@ impl Vmar_ {
             base,
             size,
             vm_space,
+            vmo_backed_id_alloc: AtomicU32::new(1),
         })
     }
 
     fn new_root() -> Arc<Self> {
         let vmar_inner = VmarInner {
             vm_mappings: IntervalSet::new(),
+            vma_map: BTreeMap::new(),
         };
         let mut vm_space = VmSpace::new();
         vm_space.register_page_fault_handler(handle_page_fault_wrapper);
@@ -304,18 +324,177 @@ impl Vmar_ {
     /// Handles user space page fault, if the page fault is successfully handled, return Ok(()).
     pub fn handle_page_fault(&self, page_fault_info: &PageFaultInfo) -> Result<()> {
         let address = page_fault_info.address;
+
         if !(self.base..self.base + self.size).contains(&address) {
-            return_errno_with_message!(Errno::EACCES, "page fault addr is not in current vmar");
+            return_errno_with_message!(Errno::EACCES, "page fault address is not in current VMAR");
         }
 
-        let inner = self.inner.read();
+        let page_aligned_addr = address.align_down(PAGE_SIZE);
+        let is_write_fault = page_fault_info.required_perms.contains(VmPerms::WRITE);
+        let is_exec_fault = page_fault_info.required_perms.contains(VmPerms::EXEC);
 
-        if let Some(vm_mapping) = inner.vm_mappings.find_one(&address) {
-            debug_assert!(vm_mapping.range().contains(&address));
-            return vm_mapping.handle_page_fault(&self.vm_space, page_fault_info);
+        let mut cursor = self
+            .vm_space
+            .cursor_mut(&(page_aligned_addr..page_aligned_addr + PAGE_SIZE))?;
+
+        match cursor.query().unwrap() {
+            VmItem::Marked {
+                va: _,
+                len: _,
+                token,
+            } => {
+                let marker = VmMarker::decode(token);
+
+                if !marker.perms.contains(page_fault_info.required_perms) {
+                    trace!(
+                        "self.perms {:?}, page_fault_info.required_perms {:?}",
+                        marker.perms,
+                        page_fault_info.required_perms,
+                    );
+                    return_errno_with_message!(Errno::EACCES, "perm check fails");
+                }
+
+                if let Some(vmo_backed_id) = marker.vmo_backed_id {
+                    // On-demand VMO-backed mapping.
+                    //
+                    // It includes file-backed mapping and shared anonymous mapping.
+
+                    let vmar_inner = self.inner.read();
+                    let id_map = &vmar_inner.vma_map;
+                    let vmo_backed_vma = id_map.get(&vmo_backed_id).unwrap();
+                    let vmo = &vmo_backed_vma.vmo;
+
+                    let (frame, need_cow) = {
+                        let page_offset =
+                            address.align_down(PAGE_SIZE) - vmo_backed_vma.map_to_addr;
+                        if let Ok(frame) = vmo.get_committed_frame(page_offset) {
+                            if !marker.is_shared && is_write_fault {
+                                // Write access to private VMO-backed mapping. Performs COW directly.
+                                (duplicate_frame(&frame)?, false)
+                            } else {
+                                // Operations to shared mapping or read access to private VMO-backed mapping.
+                                // If read access to private VMO-backed mapping triggers a page fault,
+                                // the map should be readonly. If user next tries to write to the frame,
+                                // another page fault will be triggered which will performs a COW (Copy-On-Write).
+                                (frame, !marker.is_shared)
+                            }
+                        } else {
+                            if !marker.is_shared {
+                                // The page index is outside the VMO. This is only allowed in private mapping.
+                                (FrameAllocOptions::new(1).alloc_single()?, false)
+                            } else {
+                                return_errno_with_message!(
+                                    Errno::EFAULT,
+                                    "could not find a corresponding physical page"
+                                );
+                            }
+                        }
+                    };
+
+                    let mut page_flags = marker.perms.into();
+
+                    if need_cow {
+                        page_flags -= PageFlags::W;
+                        page_flags |= PageFlags::AVAIL1;
+                    }
+
+                    if marker.is_shared {
+                        page_flags |= PageFlags::AVAIL2;
+                    }
+
+                    // Pre-fill A/D bits to avoid A/D TLB miss.
+                    page_flags |= PageFlags::ACCESSED;
+                    if is_write_fault {
+                        page_flags |= PageFlags::DIRTY;
+                    }
+                    let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
+
+                    cursor.map(frame, map_prop);
+                } else {
+                    // On-demand non-vmo-backed mapping.
+                    //
+                    // It is a private anonymous mapping.
+
+                    let vm_perms = marker.perms;
+
+                    let mut page_flags = vm_perms.into();
+
+                    if marker.is_shared {
+                        page_flags |= PageFlags::AVAIL2;
+                        unimplemented!("shared non-vmo-backed mapping");
+                    }
+
+                    // Pre-fill A/D bits to avoid A/D TLB miss.
+                    page_flags |= PageFlags::ACCESSED;
+                    if is_write_fault {
+                        page_flags |= PageFlags::DIRTY;
+                    }
+
+                    let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
+
+                    cursor.map(FrameAllocOptions::new(1).alloc_single()?, map_prop);
+                }
+            }
+            VmItem::Mapped {
+                va,
+                frame,
+                mut prop,
+            } => {
+                if VmPerms::from(prop.flags).contains(page_fault_info.required_perms) {
+                    // The page fault is already handled maybe by other threads.
+                    // Just flush the TLB and return.
+                    TlbFlushOp::Address(va).perform_on_current();
+                    return Ok(());
+                }
+
+                if is_exec_fault {
+                    return_errno_with_message!(
+                        Errno::EACCES,
+                        "page fault at non-executable mapping"
+                    );
+                }
+
+                let is_cow = prop.flags.contains(PageFlags::AVAIL1);
+                let is_shared = prop.flags.contains(PageFlags::AVAIL2);
+
+                if !is_cow && is_write_fault {
+                    return_errno_with_message!(Errno::EACCES, "page fault at read-only mapping");
+                }
+
+                // Perform COW if it is a write access to a shared mapping.
+
+                // If the forked child or parent immediately unmaps the page after
+                // the fork without accessing it, we are the only reference to the
+                // frame. We can directly map the frame as writable without
+                // copying. In this case, the reference count of the frame is 2 (
+                // one for the mapping and one for the frame handle itself).
+                let only_reference = frame.reference_count() == 2;
+
+                let additional_flags = PageFlags::W | PageFlags::ACCESSED | PageFlags::DIRTY;
+
+                if is_shared || only_reference {
+                    cursor.protect_next(
+                        PAGE_SIZE,
+                        &mut |p: &mut PageProperty| {
+                            p.flags |= additional_flags;
+                            p.flags -= PageFlags::AVAIL1; // Remove COW flag
+                        },
+                        &mut |_: &mut Token| {},
+                    );
+                    cursor.flusher().issue_tlb_flush(TlbFlushOp::Address(va));
+                    cursor.flusher().dispatch_tlb_flush();
+                } else {
+                    let new_frame = duplicate_frame(&frame)?;
+                    prop.flags |= additional_flags;
+                    cursor.map(new_frame, prop);
+                }
+            }
+            VmItem::NotMapped { .. } => {
+                return_errno_with_message!(Errno::EACCES, "page fault at an address not mapped");
+            }
         }
 
-        return_errno_with_message!(Errno::EACCES, "page fault addr is not in current vmar");
+        Ok(())
     }
 
     /// Clears all content of the root VMAR.
@@ -362,7 +541,7 @@ impl Vmar_ {
 
         let extra_mapping_start = last_mapping.map_end();
         inner.alloc_free_region_exact(extra_mapping_start, new_map_end - extra_mapping_start)?;
-        let last_mapping = last_mapping.enlarge(new_map_end - extra_mapping_start);
+        let last_mapping = last_mapping.enlarge(self.vm_space(), new_map_end - extra_mapping_start);
         inner.vm_mappings.insert(last_mapping);
         Ok(())
     }
@@ -401,9 +580,20 @@ impl Vmar_ {
                 cur_cursor.jump(base).unwrap();
                 new_cursor.jump(base).unwrap();
                 let mut prot_op = |page: &mut PageProperty| {
+                    if page.flags.contains(PageFlags::W) {
+                        page.flags |= PageFlags::AVAIL1; // Copy-on-write
+                    }
                     page.flags -= PageFlags::W;
                 };
-                let mut token_op = |_: &mut Token| None;
+                let mut token_op = |token: &mut Token| {
+                    let marker = VmMarker::decode(*token);
+                    if let Some(vmo_backed_id) = marker.vmo_backed_id {
+                        if !new_inner.vma_map.contains_key(&vmo_backed_id) {
+                            let vma = inner.vma_map.get(&vmo_backed_id).unwrap();
+                            new_inner.vma_map.insert(vmo_backed_id, vma.clone());
+                        }
+                    }
+                };
                 new_cursor.copy_from(
                     &mut cur_cursor,
                     vm_mapping.map_size(),
@@ -595,6 +785,7 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
 
         // Allocates a free region.
         trace!("allocate free region, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}, can_overwrite = {}", map_size, offset, align, can_overwrite);
+
         let mut inner = parent.0.inner.write();
         let map_to_addr = if can_overwrite {
             // If can overwrite, the offset is ensured not to be `None`.
@@ -612,12 +803,20 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
             free_region.start
         };
 
-        // Build the mapping.
         let vmo = vmo.map(|vmo| MappedVmo::new(vmo.to_dyn(), vmo_offset..vmo_limit));
+
+        trace!(
+            "build mapping, range = {:#x?}, perms = {:?}, vmo = {:#?}",
+            map_to_addr..map_to_addr + map_size,
+            perms,
+            vmo
+        );
+
+        // Build the mapping.
         let vm_mapping = VmMapping::new(
             NonZeroUsize::new(map_size).unwrap(),
             map_to_addr,
-            vmo,
+            vmo.as_ref().map(|vmo| vmo.dup()).transpose()?,
             is_shared,
             handle_page_faults_around,
             perms,
@@ -625,6 +824,32 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
 
         // Add the mapping to the VMAR.
         inner.vm_mappings.insert(vm_mapping);
+
+        let mut cursor = parent
+            .vm_space()
+            .cursor_mut(&(map_to_addr..map_to_addr + map_size))
+            .unwrap();
+
+        let marker = VmMarker {
+            perms,
+            is_shared,
+            vmo_backed_id: if let Some(vmo) = vmo {
+                let id = parent.alloc_vmo_backed_id();
+                let vma = VmoBackedVMA {
+                    id,
+                    map_size: NonZeroUsize::new(map_size).unwrap(),
+                    map_to_addr,
+                    vmo,
+                    handle_page_faults_around,
+                };
+                inner.vma_map.insert(id, vma);
+                Some(id)
+            } else {
+                None
+            },
+        };
+
+        cursor.mark(map_size, marker.encode());
 
         Ok(map_to_addr)
     }
