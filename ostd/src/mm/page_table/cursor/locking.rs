@@ -201,7 +201,8 @@ fn dfs_acquire_lock<E: PageTableEntryTrait, C: PagingConstsTrait>(
                 Child::None
                 | Child::Frame(_, _)
                 | Child::Untracked(_, _, _)
-                | Child::PageTable(_) => {}
+                | Child::PageTable(_)
+                | Child::Token(_) => {}
             }
         }
     }
@@ -233,7 +234,8 @@ fn dfs_release_lock<E: PageTableEntryTrait, C: PagingConstsTrait>(
                 Child::None
                 | Child::Frame(_, _)
                 | Child::Untracked(_, _, _)
-                | Child::PageTable(_) => {}
+                | Child::PageTable(_)
+                | Child::Token(_) => {}
             }
         }
     }
@@ -273,7 +275,8 @@ pub(super) unsafe fn dfs_mark_astray<E: PageTableEntryTrait, C: PagingConstsTrai
                 Child::None
                 | Child::Frame(_, _)
                 | Child::Untracked(_, _, _)
-                | Child::PageTable(_) => {}
+                | Child::PageTable(_)
+                | Child::Token(_) => {}
             }
         }
     }
