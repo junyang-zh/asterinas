@@ -212,6 +212,9 @@ impl VmMapping {
 
                 cursor.map(frame, map_prop);
             }
+            VmItem::Marked { .. } => {
+                panic!("We didn't mark any pages in the VM space.");
+            }
         }
         Ok(())
     }

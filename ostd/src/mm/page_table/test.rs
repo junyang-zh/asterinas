@@ -8,6 +8,7 @@ use crate::{
         kspace::LINEAR_MAPPING_BASE_VADDR,
         page::{allocator, meta::FrameMeta},
         page_prop::{CachePolicy, PageFlags},
+        vm_space::Token,
         MAX_USERSPACE_VADDR,
     },
     prelude::*,
@@ -84,6 +85,7 @@ fn test_user_copy_on_write() {
     fn prot_op(prop: &mut PageProperty) {
         prop.flags -= PageFlags::W;
     }
+    fn token_op(_token: &mut Token) {}
 
     let pt = PageTable::<UserMode>::empty();
     let from = PAGE_SIZE..PAGE_SIZE * 2;
@@ -105,7 +107,9 @@ fn test_user_copy_on_write() {
         let range = 0..MAX_USERSPACE_VADDR;
         let mut child_cursor = child_pt.cursor_mut(&range).unwrap();
         let mut parent_cursor = pt.cursor_mut(&range).unwrap();
-        unsafe { child_cursor.copy_from(&mut parent_cursor, range.len(), &mut prot_op) };
+        unsafe {
+            child_cursor.copy_from(&mut parent_cursor, range.len(), &mut prot_op, &mut token_op)
+        };
         child_pt
     };
     assert_eq!(pt.query(from.start + 10).unwrap().0, start_paddr + 10);
@@ -122,7 +126,9 @@ fn test_user_copy_on_write() {
         let range = 0..MAX_USERSPACE_VADDR;
         let mut sibling_cursor = sibling_pt.cursor_mut(&range).unwrap();
         let mut parent_cursor = pt.cursor_mut(&range).unwrap();
-        unsafe { sibling_cursor.copy_from(&mut parent_cursor, range.len(), &mut prot_op) };
+        unsafe {
+            sibling_cursor.copy_from(&mut parent_cursor, range.len(), &mut prot_op, &mut token_op)
+        };
         sibling_pt
     };
     assert!(sibling_pt.query(from.start + 10).is_none());
@@ -152,11 +158,12 @@ where
     [(); C::NR_LEVELS as usize]:,
 {
     fn protect(&self, range: &Range<Vaddr>, mut op: impl FnMut(&mut PageProperty)) {
+        fn token_op(_token: &mut Token) {}
         let mut cursor = self.cursor_mut(range).unwrap();
         loop {
             unsafe {
                 if cursor
-                    .protect_next(range.end - cursor.virt_addr(), &mut op)
+                    .protect_next(range.end - cursor.virt_addr(), &mut op, &mut token_op)
                     .is_none()
                 {
                     break;

@@ -13,7 +13,7 @@ use align_ext::AlignExt;
 use aster_rights::Rights;
 use ostd::{
     cpu::CpuExceptionInfo,
-    mm::{tlb::TlbFlushOp, PageFlags, PageProperty, VmSpace, MAX_USERSPACE_VADDR},
+    mm::{tlb::TlbFlushOp, vm_space::Token, PageFlags, PageProperty, VmSpace, MAX_USERSPACE_VADDR},
 };
 
 use self::{
@@ -400,10 +400,16 @@ impl Vmar_ {
                 // Protect the mapping and copy to the new page table for COW.
                 cur_cursor.jump(base).unwrap();
                 new_cursor.jump(base).unwrap();
-                let mut op = |page: &mut PageProperty| {
+                let mut prot_op = |page: &mut PageProperty| {
                     page.flags -= PageFlags::W;
                 };
-                new_cursor.copy_from(&mut cur_cursor, vm_mapping.map_size(), &mut op);
+                let mut token_op = |_: &mut Token| None;
+                new_cursor.copy_from(
+                    &mut cur_cursor,
+                    vm_mapping.map_size(),
+                    &mut prot_op,
+                    &mut token_op,
+                );
             }
             cur_cursor.flusher().issue_tlb_flush(TlbFlushOp::All);
             cur_cursor.flusher().dispatch_tlb_flush();

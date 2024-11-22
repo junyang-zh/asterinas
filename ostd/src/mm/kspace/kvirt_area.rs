@@ -349,6 +349,13 @@ impl<M: AllocatorSelector + 'static> Drop for KVirtArea<M> {
                 PageTableItem::NotMapped { .. } => {
                     break;
                 }
+                PageTableItem::Marked { va, len, token } => {
+                    // We currently don't support making with tokens. So panic here.
+                    panic!(
+                        "Found a token {:?} at {:x?} with length {:x?} in `KVirtArea`",
+                        token, va, len
+                    );
+                }
             }
         }
 
