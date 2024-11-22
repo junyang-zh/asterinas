@@ -64,6 +64,12 @@ bitflags::bitflags! {
         /// TDX shared bit.
         #[cfg(feature = "cvm_guest")]
         const SHARED =          1 << 51;
+
+        /// Ignored by the hardware. Free to use.
+        const HIGH_IGN1 =       1 << 52;
+        /// Ignored by the hardware. Free to use.
+        const HIGH_IGN2 =       1 << 53;
+
         /// Forbid execute codes on the page. The NXE bits in EFER msr must be set.
         const NO_EXECUTE =      1 << 63;
     }
@@ -183,6 +189,12 @@ impl PageTableEntryTrait for PageTableEntry {
         Self(paddr & Self::PHYS_ADDR_MASK | flags)
     }
 
+    fn new_token(token: crate::mm::vm_space::Token) -> Self {
+        let val = token.into_raw_inner();
+        debug_assert!(val & !Self::PHYS_ADDR_MASK == 0);
+        Self(val & Self::PHYS_ADDR_MASK)
+    }
+
     fn paddr(&self) -> Paddr {
         self.0 & Self::PHYS_ADDR_MASK
     }
@@ -192,7 +204,9 @@ impl PageTableEntryTrait for PageTableEntry {
             | parse_flags!(self.0, PageTableFlags::WRITABLE, PageFlags::W)
             | parse_flags!(!self.0, PageTableFlags::NO_EXECUTE, PageFlags::X)
             | parse_flags!(self.0, PageTableFlags::ACCESSED, PageFlags::ACCESSED)
-            | parse_flags!(self.0, PageTableFlags::DIRTY, PageFlags::DIRTY);
+            | parse_flags!(self.0, PageTableFlags::DIRTY, PageFlags::DIRTY)
+            | parse_flags!(self.0, PageTableFlags::HIGH_IGN1, PageFlags::AVAIL1)
+            | parse_flags!(self.0, PageTableFlags::HIGH_IGN2, PageFlags::AVAIL2);
         let priv_flags = parse_flags!(self.0, PageTableFlags::USER, PrivFlags::USER)
             | parse_flags!(self.0, PageTableFlags::GLOBAL, PrivFlags::GLOBAL);
         #[cfg(feature = "cvm_guest")]
@@ -227,6 +241,16 @@ impl PageTableEntryTrait for PageTableEntry {
             )
             | parse_flags!(prop.flags.bits(), PageFlags::DIRTY, PageTableFlags::DIRTY)
             | parse_flags!(
+                prop.flags.bits(),
+                PageFlags::AVAIL1,
+                PageTableFlags::HIGH_IGN1
+            )
+            | parse_flags!(
+                prop.flags.bits(),
+                PageFlags::AVAIL2,
+                PageTableFlags::HIGH_IGN2
+            )
+            | parse_flags!(
                 prop.priv_flags.bits(),
                 PrivFlags::USER,
                 PageTableFlags::USER
@@ -255,6 +279,10 @@ impl PageTableEntryTrait for PageTableEntry {
             _ => panic!("unsupported cache policy"),
         }
         self.0 = self.0 & !Self::PROP_MASK | flags;
+    }
+
+    fn set_paddr(&mut self, paddr: Paddr) {
+        self.0 = self.0 & !Self::PHYS_ADDR_MASK | (paddr & Self::PHYS_ADDR_MASK);
     }
 
     fn is_last(&self, _level: PagingLevel) -> bool {
