@@ -33,6 +33,7 @@ TEST_APPS := \
 	pipe \
 	pthread \
 	pty \
+	scale \
 	signal_c \
 	vsock \
 
