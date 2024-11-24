@@ -67,6 +67,7 @@ qemu.args = """\
     -device virtio-keyboard-device \
     -device virtio-serial-device \
     -device virtconsole,chardev=mux \
+    -qmp tcp:127.0.0.1:${QMP_PORT-9889},server,nowait \
 """
 
 [scheme."loongarch"]
