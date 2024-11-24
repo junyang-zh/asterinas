@@ -68,7 +68,8 @@ qemu.args = """\
     -display none \
     -serial chardev:mux \
     -monitor chardev:mux \
-    -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log
+    -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
+    -qmp tcp:127.0.0.1:${QMP_PORT-9889},server,nowait \
 """
 
 [scheme."loongarch"]

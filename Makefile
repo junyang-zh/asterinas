@@ -58,7 +58,7 @@ XFSTESTS_DISK_SIZE ?= 12G
 XFSTESTS_TEST_DEV ?= /dev/vdc
 XFSTESTS_SCRATCH_DEV ?= /dev/vdd
 # Specify whether to build regression tests under `test/initramfs/src/regression`.
-ENABLE_REGRESSION_TEST ?= false
+ENABLE_REGRESSION_TEST ?= true
 # End of auto test features.
 
 # Network settings

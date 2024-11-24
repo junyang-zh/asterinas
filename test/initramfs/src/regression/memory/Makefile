@@ -2,5 +2,7 @@
 
 SUBDIRS := \
 	mmap \
+	scale \
+	scale_old \
 
 include ../common/Makefile
