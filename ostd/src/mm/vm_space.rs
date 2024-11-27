@@ -323,6 +323,10 @@ impl<'a> CursorMut<'a, '_> {
                     self.flusher
                         .issue_tlb_flush_with(TlbFlushOp::Address(va), page);
                 }
+                PageTableItem::ChildPageTable { va, len, pt } => {
+                    self.flusher
+                        .issue_tlb_flush_with(TlbFlushOp::Range(va..va + len), pt);
+                }
                 PageTableItem::NotMapped { .. } => {
                     break;
                 }
@@ -507,6 +511,9 @@ impl TryFrom<PageTableItem> for VmItem {
                 Err("found untracked memory mapped into `VmSpace`")
             }
             PageTableItem::Marked { va, len, token } => Ok(VmItem::Marked { va, len, token }),
+            PageTableItem::ChildPageTable { .. } => {
+                panic!("Child page table shouldn't be a query result")
+            }
         }
     }
 }

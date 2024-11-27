@@ -15,6 +15,7 @@ use core::{
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
+    sync::atomic::AtomicBool,
 };
 
 use kernel_stack::KernelStack;

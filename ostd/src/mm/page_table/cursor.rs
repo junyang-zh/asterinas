@@ -77,7 +77,7 @@ use crate::{
     mm::{
         kspace::should_map_as_tracked,
         paddr_to_vaddr,
-        page::{meta::MapTrackingStatus, DynPage},
+        page::{meta::MapTrackingStatus, DynPage, Page},
         vm_space::Token,
         Paddr, PageProperty, Vaddr,
     },
@@ -94,6 +94,11 @@ pub enum PageTableItem {
         va: Vaddr,
         page: DynPage,
         prop: PageProperty,
+    },
+    ChildPageTable {
+        va: Vaddr,
+        len: usize,
+        pt: DynPage,
     },
     #[allow(dead_code)]
     MappedUntracked {
@@ -691,11 +696,8 @@ where
                 continue;
             }
 
-            // Go down if not applicable or if the entry points to a child page table.
-            if cur_entry.is_node()
-                || cur_va % page_size::<C>(cur_level) != 0
-                || cur_va + page_size::<C>(cur_level) > end
-            {
+            // Go down if not applicable.
+            if cur_va % page_size::<C>(cur_level) != 0 || cur_va + page_size::<C>(cur_level) > end {
                 let child = cur_entry.to_owned();
                 match child {
                     Child::PageTable(pt) => {
@@ -755,7 +757,12 @@ where
                     len: page_size::<C>(self.0.level),
                     token,
                 },
-                Child::PageTable(_) | Child::None => unreachable!(),
+                Child::PageTable(pt) => PageTableItem::ChildPageTable {
+                    va: self.0.va,
+                    len: page_size::<C>(self.0.level),
+                    pt: Page::from(pt).into(),
+                },
+                Child::None => unreachable!(),
             };
         }
 
