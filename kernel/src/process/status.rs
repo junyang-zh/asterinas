@@ -1,59 +1,76 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
+//! The process status.
 
-//! The process status
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use super::ExitCode;
 
-use super::{ExitCode, TermStatus};
-
-/// The status of process.
+/// The status of a process.
 ///
-/// The `ProcessStatus` can be viewed as two parts,
-/// the highest 32 bits is the value of `TermStatus`, if any,
-/// the lowest 32 bits is the value of status.
+/// This maintains:
+/// 1. Whether an `exit_group` has been initiated from a thread;
+/// 2. Whether the process is a zombie (i.e., all its threads have exited);
+/// 3. The exit code of the process.
 #[derive(Debug)]
-pub struct ProcessStatus(AtomicU64);
+pub struct ProcessStatus {
+    has_exited_group: AtomicBool,
+    is_zombie: AtomicBool,
+    exit_code: AtomicU32,
+}
 
-#[repr(u8)]
-enum Status {
-    Uninit = 0,
-    Runnable = 1,
-    Zombie = 2,
+impl Default for ProcessStatus {
+    fn default() -> Self {
+        Self {
+            has_exited_group: AtomicBool::new(false),
+            is_zombie: AtomicBool::new(false),
+            exit_code: AtomicU32::new(0),
+        }
+    }
 }
 
 impl ProcessStatus {
-    const LOW_MASK: u64 = 0xffff_ffff;
-
-    pub fn new_uninit() -> Self {
-        Self(AtomicU64::new(Status::Uninit as u64))
+    /// Returns whether an `exit_group` has been initiated.
+    pub(super) fn has_exited_group(&self) -> bool {
+        self.has_exited_group.load(Ordering::Relaxed)
     }
 
-    pub fn set_zombie(&self, term_status: TermStatus) {
-        let new_val = (term_status.as_u32() as u64) << 32 | Status::Zombie as u64;
-        self.0.store(new_val, Ordering::Relaxed);
-    }
-
-    pub fn is_zombie(&self) -> bool {
-        self.0.load(Ordering::Relaxed) & Self::LOW_MASK == Status::Zombie as u64
-    }
-
-    pub fn set_runnable(&self) {
-        let new_val = Status::Runnable as u64;
-        self.0.store(new_val, Ordering::Relaxed);
-    }
-
-    pub fn is_runnable(&self) -> bool {
-        self.0.load(Ordering::Relaxed) & Self::LOW_MASK == Status::Runnable as u64
-    }
-
-    /// Returns the exit code.
+    /// Sets a flag that denotes that an `exit_group` has been initiated.
     ///
-    /// If the process is not exited, the exit code is zero.
-    /// But if exit code is zero, the process may or may not exit.
+    /// The `exit_group` system call can occur multiple times if multiple threads trigger it at the
+    /// same time, or if the process is killed asynchronously. This method will only return true
+    /// for the first one.
+    pub(super) fn set_exited_group(&self) -> bool {
+        !self.has_exited_group.swap(true, Ordering::Relaxed)
+    }
+}
+
+impl ProcessStatus {
+    /// Returns whether the process is a zombie process.
+    pub fn is_zombie(&self) -> bool {
+        // Use the `Acquire` memory order to make the exit code visible.
+        self.is_zombie.load(Ordering::Acquire)
+    }
+
+    /// Sets the process to be a zombie process.
+    ///
+    /// This method should be called when the process completes its exit. The current thread must
+    /// be the last thread in the process, so that no threads belonging to the process can run
+    /// after it.
+    pub(super) fn set_zombie(&self) {
+        // Use the `Release` memory order to make the exit code visible.
+        self.is_zombie.store(true, Ordering::Release);
+    }
+}
+
+impl ProcessStatus {
+    /// Returns the exit code.
     pub fn exit_code(&self) -> ExitCode {
-        let val = self.0.load(Ordering::Relaxed);
-        (val >> 32 & Self::LOW_MASK) as ExitCode
+        self.exit_code.load(Ordering::Relaxed)
+    }
+
+    /// Sets the exit code.
+    pub(super) fn set_exit_code(&self, exit_code: ExitCode) {
+        self.exit_code.store(exit_code, Ordering::Relaxed);
     }
 }

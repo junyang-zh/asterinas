@@ -14,7 +14,7 @@ use super::{
         signals::Signal,
     },
     status::ProcessStatus,
-    Credentials, TermStatus,
+    Credentials,
 };
 use crate::{
     device::tty::open_ntty_as_controlling_terminal,
@@ -205,7 +205,7 @@ impl Process {
             executable_path: RwLock::new(executable_path),
             process_vm,
             children_wait_queue,
-            status: ProcessStatus::new_uninit(),
+            status: ProcessStatus::default(),
             parent: ParentProcess::new(parent),
             children: Mutex::new(BTreeMap::new()),
             process_group: Mutex::new(Weak::new()),
@@ -282,7 +282,7 @@ impl Process {
         let tasks = self.tasks.lock();
         // when run the process, the process should has only one thread
         debug_assert!(tasks.len() == 1);
-        debug_assert!(self.is_runnable());
+        debug_assert!(!self.status().is_zombie());
         let task = tasks[0].clone();
         // should not hold the lock when run thread
         drop(tasks);
@@ -649,7 +649,7 @@ impl Process {
     ///
     /// TODO: restrict these method with access control tool.
     pub fn enqueue_signal(&self, signal: impl Signal + Clone + 'static) {
-        if self.is_zombie() {
+        if self.status.is_zombie() {
             return;
         }
 
@@ -699,24 +699,9 @@ impl Process {
 
     // ******************* Status ********************
 
-    fn set_runnable(&self) {
-        self.status.set_runnable();
-    }
-
-    fn is_runnable(&self) -> bool {
-        self.status.is_runnable()
-    }
-
-    pub fn is_zombie(&self) -> bool {
-        self.status.is_zombie()
-    }
-
-    pub fn set_zombie(&self, term_status: TermStatus) {
-        self.status.set_zombie(term_status);
-    }
-
-    pub fn exit_code(&self) -> ExitCode {
-        self.status.exit_code()
+    /// Returns a reference to the process status.
+    pub fn status(&self) -> &ProcessStatus {
+        &self.status
     }
 }
 

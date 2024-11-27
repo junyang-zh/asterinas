@@ -1,70 +1,105 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{process_table, Pid, Process, TermStatus};
+use ostd::task::Task;
+
+use super::{process_table, signal::constants::SIGKILL, Pid, Process, TermStatus};
 use crate::{
     prelude::*,
     process::{
         posix_thread::{do_exit, AsPosixThread},
         signal::signals::kernel::KernelSignal,
     },
-    thread::AsThread,
 };
 
+/// Kills all threads and exits the current POSIX process.
+///
+/// # Panics
+///
+/// If the current thread is not a POSIX thread, this method will panic.
 pub fn do_exit_group(term_status: TermStatus) {
-    let current = current!();
-    debug!("exit group was called");
-    if current.is_zombie() {
+    let current_task = Task::current().unwrap();
+    let current_process = current_task.as_posix_thread().unwrap().process();
+
+    if !current_process.status().set_exited_group() {
+        // Another `exit_group` has been triggered and all the threads are being killed. Don't
+        // update the exit code in this scenario.
+        do_exit(None);
         return;
     }
-    current.set_zombie(term_status);
 
-    // Exit all threads
-    let tasks = current.tasks().lock().clone();
-    for task in tasks {
-        let thread = task.as_thread().unwrap();
-        let posix_thread = thread.as_posix_thread().unwrap();
-        if let Err(e) = do_exit(thread, posix_thread, term_status) {
-            debug!("Ignore error when call exit: {:?}", e);
+    // Send `SIGKILL` to all other threads in the current process.
+    for task in &*current_process.tasks().lock() {
+        if !core::ptr::addr_eq(current_task.as_ref(), task.as_ref()) {
+            task.as_posix_thread()
+                .unwrap()
+                .enqueue_signal(Box::new(KernelSignal::new(SIGKILL)));
         }
     }
 
-    // Sends parent-death signal
-    // FIXME: according to linux spec, the signal should be sent when a posix thread which
-    // creates child process exits, not when the whole process exits group.
-    for (_, child) in current.children().lock().iter() {
+    do_exit(Some(term_status));
+}
+
+/// Exits the current POSIX process.
+///
+/// This is for internal use. Do NOT call this directly. When the last thread in the process exits,
+/// [`do_exit`] will invoke this method automatically.
+pub(super) fn exit_process(current_process: &Process) {
+    current_process.status().set_zombie();
+
+    current_process.file_table().lock().close_all();
+
+    send_parent_death_signal(current_process);
+
+    move_children_to_init(current_process);
+
+    send_child_death_signal(current_process);
+}
+
+/// Sends parent-death signals to the children.
+//
+// FIXME: According to the Linux implementation, the signal should be sent when the POSIX thread
+// that created the child exits, not when the whole process exits. For more details, see the
+// "CAVEATS" section in <https://man7.org/linux/man-pages/man2/pr_set_pdeathsig.2const.html>.
+fn send_parent_death_signal(current_process: &Process) {
+    for (_, child) in current_process.children().lock().iter() {
         let Some(signum) = child.parent_death_signal() else {
             continue;
         };
 
-        // FIXME: set pid of the signal
+        // FIXME: Set `si_pid` in the `siginfo_t` argument.
         let signal = KernelSignal::new(signum);
         child.enqueue_signal(signal);
     }
+}
 
-    // Close all files then exit the process
-    let files = current.file_table().lock().close_all();
-    drop(files);
-
-    // Move children to the init process
-    if !is_init_process(&current) {
-        if let Some(init_process) = get_init_process() {
-            let mut init_children = init_process.children().lock();
-            for (_, child_process) in current.children().lock().extract_if(|_, _| true) {
-                let mut parent = child_process.parent.lock();
-                init_children.insert(child_process.pid(), child_process.clone());
-                parent.set_process(&init_process);
-            }
-        }
+/// Moves the children to the init process.
+fn move_children_to_init(current_process: &Process) {
+    if is_init_process(current_process) {
+        return;
     }
 
-    let parent = current.parent().lock().process();
-    if let Some(parent) = parent.upgrade() {
-        // Notify parent
-        if let Some(signal) = current.exit_signal().map(KernelSignal::new) {
-            parent.enqueue_signal(signal);
-        };
-        parent.children_wait_queue().wake_all();
+    let Some(init_process) = get_init_process() else {
+        return;
     };
+
+    let mut init_children = init_process.children().lock();
+    for (_, child_process) in current_process.children().lock().extract_if(|_, _| true) {
+        let mut parent = child_process.parent.lock();
+        init_children.insert(child_process.pid(), child_process.clone());
+        parent.set_process(&init_process);
+    }
+}
+
+/// Sends a child-death signal to the parent.
+fn send_child_death_signal(current_process: &Process) {
+    let Some(parent) = current_process.parent().lock().process().upgrade() else {
+        return;
+    };
+
+    if let Some(signal) = current_process.exit_signal().map(KernelSignal::new) {
+        parent.enqueue_signal(signal);
+    };
+    parent.children_wait_queue().wake_all();
 }
 
 const INIT_PROCESS_PID: Pid = 1;

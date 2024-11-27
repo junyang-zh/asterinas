@@ -207,8 +207,6 @@ impl<'a> ProcessBuilder<'a> {
 
         process.tasks().lock().push(task);
 
-        process.set_runnable();
-
         Ok(process)
     }
 }

@@ -244,7 +244,12 @@ fn clone_child_task(
         thread_builder.build()
     };
 
-    process.tasks().lock().push(child_task.clone());
+    let mut tasks = process.tasks().lock();
+    if process.status().has_exited_group() {
+        return_errno_with_message!(Errno::EINTR, "the process has exited");
+    }
+    tasks.push(child_task.clone());
+    drop(tasks);
 
     let child_posix_thread = child_task.as_posix_thread().unwrap();
     clone_parent_settid(child_tid, clone_args.parent_tid, clone_flags)?;
