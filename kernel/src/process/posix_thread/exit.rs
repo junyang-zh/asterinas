@@ -29,7 +29,7 @@ pub fn do_exit(term_status: Option<TermStatus>) {
     current_thread.exit();
 
     let current_thread = current_thread.as_posix_thread().unwrap();
-    let current_process = current_thread.process();
+    let current_process = current_thread.process().unwrap();
 
     // According to Linux's behavior, the last thread's exit code will become the process's exit
     // code, so here we should just overwrite the old value (if any).

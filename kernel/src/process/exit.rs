@@ -18,7 +18,7 @@ use crate::{
 /// If the current thread is not a POSIX thread, this method will panic.
 pub fn do_exit_group(term_status: TermStatus) {
     let current_task = Task::current().unwrap();
-    let current_process = current_task.as_posix_thread().unwrap().process();
+    let current_process = current_task.as_posix_thread().unwrap().process().unwrap();
 
     if !current_process.status().set_exited_group() {
         // Another `exit_group` has been triggered and all the threads are being killed. Don't
