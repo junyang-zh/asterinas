@@ -41,5 +41,6 @@ int main(int argc, char *argv[])
 	return entry_point(argc, argv, worker_thread,
 			   (test_config_t){ .num_prealloc_pages_per_thread =
 						    NUM_PAGES,
-					    .trigger_fault_before_spawn = 1 });
+					    .trigger_fault_before_spawn = 1,
+					    .rand_assign_pages = 0 });
 }

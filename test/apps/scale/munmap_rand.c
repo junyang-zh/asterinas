@@ -16,12 +16,9 @@ void *worker_thread(void *arg)
 	tsc_start = rdtsc();
 
 	// unmap them one by one randomly
-	unsigned int rand = 0xdeadbeef - data->thread_id;
+	int *page_idx = data->page_idx + data->thread_id * NUM_PAGES;
 	for (size_t i = 0; i < NUM_PAGES; i++) {
-		rand = simple_get_rand(rand);
-		size_t idx = (rand / PAGE_SIZE) %
-			     (data->region_size / PAGE_SIZE) * PAGE_SIZE;
-		munmap(data->region + idx, PAGE_SIZE);
+		munmap(data->region + page_idx[i] * PAGE_SIZE, PAGE_SIZE);
 	}
 
 	tsc_end = rdtsc();
@@ -37,5 +34,6 @@ int main(int argc, char *argv[])
 	return entry_point(argc, argv, worker_thread,
 			   (test_config_t){ .num_prealloc_pages_per_thread =
 						    NUM_PAGES,
-					    .trigger_fault_before_spawn = 1 });
+					    .trigger_fault_before_spawn = 1,
+					    .rand_assign_pages = 1 });
 }
