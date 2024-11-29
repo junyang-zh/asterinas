@@ -59,10 +59,6 @@ typedef struct {
 	int rand_assign_pages;
 } test_config_t;
 
-pthread_t threads[TOT_THREAD_RUNS];
-thread_data_t thread_data[TOT_THREAD_RUNS];
-long thread_lat[TOT_THREAD_RUNS];
-
 // Decls
 
 int entry_point(int argc, char *argv[], void *(*worker_thread)(void *),
@@ -99,7 +95,7 @@ int entry_point(int argc, char *argv[], void *(*worker_thread)(void *),
 void run_test_specify_threads(int num_threads, void *(*worker_thread)(void *),
 			      test_config_t config)
 {
-	printf("Threads, Min lat (ns), Avg lat (ns), Max lat (ns), Pos err lat (ns2), Neg err lat (ns2)\n");
+	printf("Threads, p5 lat (ns), Avg lat (ns), p95 lat (ns), Pos err lat (ns2), Neg err lat (ns2)\n");
 
 	if (num_threads == -1) {
 		int threads[] = { 1, 16, 32, 48, 64, 80, 96, 112 };
@@ -111,6 +107,10 @@ void run_test_specify_threads(int num_threads, void *(*worker_thread)(void *),
 		run_test_specify_rounds(num_threads, worker_thread, config);
 	}
 }
+
+pthread_t threads[TOT_THREAD_RUNS];
+thread_data_t thread_data[TOT_THREAD_RUNS];
+long thread_lat[TOT_THREAD_RUNS];
 
 void run_test_specify_rounds(int num_threads, void *(*worker_thread)(void *),
 			     test_config_t config)
@@ -139,17 +139,9 @@ void run_test_specify_rounds(int num_threads, void *(*worker_thread)(void *),
 		exit(EXIT_FAILURE);
 	}
 
-	// Calculate the maximum, minimum, average, and variance of the latencies
-	long max = 0;
-	long min = 0x7FFFFFFFFFFFFFFF;
+	// Calculate the p5, average, p95, and variance of the latencies
 	long avg = 0;
 	for (int i = 0; i < tot_runs; i++) {
-		if (thread_lat[i] > max) {
-			max = thread_lat[i];
-		}
-		if (thread_lat[i] < min) {
-			min = thread_lat[i];
-		}
 		avg += thread_lat[i];
 	}
 	avg /= tot_runs;
@@ -170,7 +162,21 @@ void run_test_specify_rounds(int num_threads, void *(*worker_thread)(void *),
 	posvar2 /= numpos;
 	negvar2 /= numneg;
 
-	printf("%d, %ld, %ld, %ld, %ld, %ld\n", num_threads, min, avg, max,
+	// Calculate the p5 and p95 latencies
+	// bubble sort
+	for (int i = 0; i < tot_runs; i++) {
+		for (int j = i + 1; j < tot_runs; j++) {
+			if (thread_lat[i] > thread_lat[j]) {
+				long temp = thread_lat[i];
+				thread_lat[i] = thread_lat[j];
+				thread_lat[j] = temp;
+			}
+		}
+	}
+	long p5 = thread_lat[tot_runs / 20];
+	long p95 = thread_lat[tot_runs * 19 / 20];
+
+	printf("%d, %ld, %ld, %ld, %ld, %ld\n", num_threads, p5, avg, p95,
 	       posvar2, negvar2);
 }
 
