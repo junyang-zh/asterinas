@@ -12,6 +12,7 @@ INITRAMFS_FILELIST := $(BUILD_DIR)/initramfs.filelist
 INITRAMFS_IMAGE := $(BUILD_DIR)/initramfs.cpio.gz
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
+METIS_IMAGE := $(BUILD_DIR)/metis.img
 INITRAMFS_EMPTY_DIRS := \
 	$(INITRAMFS)/root \
 	$(INITRAMFS)/tmp \
@@ -50,6 +51,7 @@ $(INITRAMFS)/lib/x86_64-linux-gnu: | $(VDSO_LIB)
 	@cp -L /lib/x86_64-linux-gnu/libuuid.so.1 $@
 	@# required for VDSO
 	@cp -L $(VDSO_LIB) $@
+	@cp -L /lib/x86_64-linux-gnu/libdb-5.3.so $@
 
 $(VDSO_LIB): | $(VDSO_DIR) $(BINARY_CACHE_DIR)/vdso64.so
 	@# TODO: use a custom compiled vdso.so file in the future.
@@ -99,7 +101,18 @@ $(INITRAMFS)/benchmark: | $(INITRAMFS)/benchmark/bin
 $(INITRAMFS)/benchmark/bin:
 	@mkdir -p $@
 	@mkdir -p $@/../apache/logs
-
+	@cp -r /root/mosbench/metis/obj/app $@/metis
+	@cp -r /root/mosbench/metis/run_in_vm.sh $@/metis
+	@mkdir -p $@/metis/data
+	@mkdir -p $@/psearchy
+	@cp /root/mosbench/psearchy/mkdb/pedsort $@/psearchy
+	@cp /root/mosbench/psearchy/create_dirs.sh $@/psearchy
+	@cp /root/mosbench/psearchy/run_in_vm.sh $@/psearchy
+	@mkdir -p $@/dedup/data
+	@cp /root/parsec-3.0/pkgs/kernels/dedup/inst/amd64-linux.gcc/bin/dedup $@/dedup
+	@cp /root/parsec-3.0/pkgs/kernels/dedup/run_in_vm.sh $@/dedup
+	@cp /root/parsec-3.0/pkgs/kernels/dedup/inputs/*.dat $@/dedup/data
+	
 # Make necessary directories.
 $(INITRAMFS_EMPTY_DIRS):
 	@mkdir -p $@
@@ -142,8 +155,17 @@ $(EXFAT_IMAGE):
 	@fallocate -l 64M $(EXFAT_IMAGE)
 	@mkfs.exfat $(EXFAT_IMAGE)
 
+$(METIS_IMAGE):
+	@dd if=/dev/zero of=$(METIS_IMAGE) bs=2G count=15 iflag=fullblock
+	@mkfs.ext2 $(METIS_IMAGE)
+	@mkdir -p /mnt/metis_mount
+	@mount -t ext2 $(METIS_IMAGE) /mnt/metis_mount
+	@cp -r /root/mosbench/metis/data/* /mnt/metis_mount/
+	@umount /mnt/metis_mount
+	@rm -rf /mnt/metis_mount/
+
 .PHONY: build
-build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE)
+build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(METIS_IMAGE)
 
 .PHONY: format
 format:

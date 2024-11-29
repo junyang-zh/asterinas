@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// The max allowed size of user heap
-pub const USER_HEAP_SIZE_LIMIT: usize = 16 * 1024 * PAGE_SIZE; // 16 * 4MB
+pub const USER_HEAP_SIZE_LIMIT: usize = 16 * 1026 * 1024 * PAGE_SIZE; // 64 GB
 
 #[derive(Debug)]
 pub struct Heap {
