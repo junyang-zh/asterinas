@@ -211,7 +211,36 @@ where
                     cur_pt_addr = cur_pte.paddr();
                 }
             } else {
-                break;
+                // In either marked case or not mapped case, we should lock
+                // and allocate a new page table node.
+                // SAFETY: The address and level corresponds to a child converted into
+                // a PTE and we clone it to get a new handle to the node.
+                let raw =
+                    unsafe { RawPageTableNode::<E, C>::from_raw_parts(cur_pt_addr, cursor.level) };
+                let _inc_ref = ManuallyDrop::new(raw.clone_shallow());
+                let mut node = raw.lock();
+                let cur_entry = node.entry(start_idx);
+                if cur_entry.is_none() {
+                    let is_tracked = if should_map_as_tracked(va.start) {
+                        MapTrackingStatus::Tracked
+                    } else {
+                        MapTrackingStatus::Untracked
+                    };
+                    let pt = PageTableNode::<E, C>::alloc(cursor.level - 1, is_tracked);
+                    let pt = pt.into_raw();
+                    cur_pt_addr = pt.paddr();
+                    let _ = cur_entry.replace(Child::PageTable(pt));
+                } else if cur_entry.is_node() {
+                    let Child::PageTable(pt) = cur_entry.to_owned() else {
+                        unreachable!();
+                    };
+                    cur_pt_addr = pt.paddr();
+                } else if let Some(split_child) = cur_entry.split_if_huge_token() {
+                    let pt = split_child.into_raw();
+                    cur_pt_addr = pt.paddr();
+                } else {
+                    break;
+                }
             }
             cursor.level -= 1;
         }
