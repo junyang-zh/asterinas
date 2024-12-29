@@ -5,7 +5,13 @@
 use core::{mem::ManuallyDrop, ops::Range};
 
 use super::{inc_frame_ref_count, meta::AnyFrameMeta, Frame};
-use crate::mm::{AnyUFrameMeta, Paddr, PAGE_SIZE};
+use crate::{
+    arch::mm::PagingConsts,
+    mm::{
+        frame::{mapping, MetaSlot},
+        AnyUFrameMeta, Paddr, PAGE_SIZE,
+    },
+};
 
 /// A contiguous range of homogeneous physical memory frames.
 ///
@@ -83,6 +89,22 @@ impl<M: AnyFrameMeta> Segment<M> {
             range,
             _marker: core::marker::PhantomData,
         }
+    }
+
+    /// Returns the metadata of the frame at the given index.
+    ///
+    /// # Panics
+    ///
+    /// The function panics if the frame index is out of bounds.
+    pub fn meta(&self, frame_index: usize) -> &M {
+        assert!(frame_index < self.size() / PAGE_SIZE);
+        let paddr = self.range.start + frame_index * PAGE_SIZE;
+        let slot = mapping::frame_to_meta::<PagingConsts>(paddr) as *const MetaSlot;
+        // SAFETY: `slot` points to the metadata storage which is valid to
+        // be immutably borrowed as `M` because the type is correct, it lives
+        // under the given lifetime, and no one will mutably borrow the page
+        // metadata after initialization.
+        unsafe { &*slot.cast() }
     }
 }
 
