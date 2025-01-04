@@ -32,6 +32,7 @@
 //! can create custom metadata types by implementing the [`AnyFrameMeta`] trait.
 
 pub mod allocator;
+pub mod linked_list;
 pub mod meta;
 pub mod segment;
 pub mod unique;

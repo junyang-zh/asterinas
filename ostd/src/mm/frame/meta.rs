@@ -63,8 +63,10 @@ use crate::{
 };
 
 /// The maximum number of bytes of the metadata of a frame.
-pub const FRAME_METADATA_MAX_SIZE: usize =
-    META_SLOT_SIZE - size_of::<AtomicU64>() - size_of::<FrameMetaVtablePtr>();
+pub const FRAME_METADATA_MAX_SIZE: usize = META_SLOT_SIZE
+    - size_of::<AtomicU64>()
+    - size_of::<FrameMetaVtablePtr>()
+    - size_of::<AtomicU64>();
 /// The maximum alignment in bytes of the metadata of a frame.
 pub const FRAME_METADATA_MAX_ALIGN: usize = META_SLOT_SIZE;
 
@@ -105,6 +107,10 @@ pub(in crate::mm) struct MetaSlot {
     pub(super) ref_count: AtomicU64,
     /// The virtual table that indicates the type of the metadata.
     pub(super) vtable_ptr: UnsafeCell<MaybeUninit<FrameMetaVtablePtr>>,
+    /// This is only accessed by [`crate::mm::frame::linked_list`].
+    /// It stores 0 if the frame is not in any list, otherwise it stores the
+    /// ID of the list.
+    pub(super) in_list: AtomicU64,
 }
 
 pub(super) const REF_COUNT_UNUSED: u64 = u64::MAX;
@@ -187,7 +193,7 @@ pub enum GetFrameError {
 }
 
 /// Get the reference to a metadata slot.
-fn get_slot(paddr: Paddr) -> Result<&'static MetaSlot, GetFrameError> {
+pub(super) fn get_slot(paddr: Paddr) -> Result<&'static MetaSlot, GetFrameError> {
     if paddr % PAGE_SIZE != 0 {
         return Err(GetFrameError::NotAligned);
     }
@@ -217,8 +223,10 @@ impl MetaSlot {
         as_unique_ptr: bool,
     ) -> Result<*const Self, GetFrameError> {
         // Checking unsafe preconditions of the `AnyFrameMeta` trait.
-        debug_assert!(size_of::<M>() <= FRAME_METADATA_MAX_SIZE);
-        debug_assert!(align_of::<M>() <= FRAME_METADATA_MAX_ALIGN);
+        // We can't debug assert until we fix the constant generic bonds in
+        // the linked list meta.
+        assert!(size_of::<M>() <= FRAME_METADATA_MAX_SIZE);
+        assert!(align_of::<M>() <= FRAME_METADATA_MAX_ALIGN);
 
         let slot = get_slot(paddr)?;
 
@@ -499,18 +507,18 @@ fn alloc_meta_frames(tot_nr_frames: usize) -> (usize, Paddr) {
 
     let slots = paddr_to_vaddr(start_paddr) as *mut MetaSlot;
 
-    // Fill the metadata frames with a byte pattern of `REF_COUNT_UNUSED`.
-    debug_assert_eq!(REF_COUNT_UNUSED.to_ne_bytes(), [0xff; 8]);
-    // SAFETY: `slots` and the length is a valid region for the metadata frames
-    // that are going to be treated as metadata slots. The byte pattern is
-    // valid as the initial value of the reference count (other fields are
-    // either not accessed or `MaybeUninit`).
-    unsafe {
-        core::ptr::write_bytes(
-            slots as *mut u8,
-            0xff,
-            tot_nr_frames * size_of::<MetaSlot>(),
-        );
+    // Initialize the metadata slots.
+    for i in 0..tot_nr_frames {
+        let slot = unsafe { slots.add(i) };
+        // SAFETY: The slot is valid and not in use.
+        unsafe {
+            slot.write(MetaSlot {
+                storage: UnsafeCell::new([0; FRAME_METADATA_MAX_SIZE]),
+                ref_count: AtomicU64::new(REF_COUNT_UNUSED),
+                vtable_ptr: UnsafeCell::new(MaybeUninit::uninit()),
+                in_list: AtomicU64::new(0),
+            })
+        };
     }
 
     (nr_meta_pages, start_paddr)

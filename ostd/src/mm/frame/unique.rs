@@ -2,13 +2,18 @@
 
 //! The unique frame pointer that is not shared with others.
 
-use core::{marker::PhantomData, sync::atomic::Ordering};
+use core::{
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+    sync::atomic::Ordering,
+};
 
 use super::{
     meta::{GetFrameError, REF_COUNT_UNIQUE},
     AnyFrameMeta, Frame, MetaSlot,
 };
-use crate::mm::{Paddr, PagingLevel, PAGE_SIZE};
+use crate::mm::{frame::mapping, Paddr, PagingConsts, PagingLevel, PAGE_SIZE};
 
 /// An owning frame pointer.
 ///
@@ -99,7 +104,50 @@ impl<M: AnyFrameMeta + ?Sized> UniqueFrame<M> {
         unsafe { &mut *self.slot().dyn_meta_ptr() }
     }
 
-    fn slot(&self) -> &MetaSlot {
+    /// Converts this frame into a raw physical address.
+    pub(crate) fn into_raw(self) -> Paddr {
+        let paddr = self.start_paddr();
+        let _ = ManuallyDrop::new(self);
+        paddr
+    }
+
+    /// Restores a raw physical address back into a unique frame.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the physical address is valid and points to
+    /// a forgotten frame that was previously casted by [`Self::into_raw`].
+    pub(crate) unsafe fn from_raw(paddr: Paddr) -> Self {
+        let vaddr = mapping::frame_to_meta::<PagingConsts>(paddr);
+        let ptr = vaddr as *const MetaSlot;
+
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Resets the frame to unused without up-calling the allocator.
+    ///
+    /// This is solely useful for the allocator implementation and highly
+    /// experimental. Usage of this function is discouraged.
+    ///
+    /// Usage of this function other than the allocator would actually leak
+    /// the frame since the allocator would not be aware of the frame.
+    //
+    // FIXME: We may have a better `Segment` and `UniqueSegment` design to
+    // allow the allocator hold the ownership of all the frames in a chunk
+    // instead of the head. Then this weird public API can be removed.
+    pub fn reset_as_unused(self) {
+        self.slot().ref_count.store(0, Ordering::Release);
+        // SAFETY: We are the sole owner and the reference count is 0.
+        // The slot is initialized.
+        unsafe { self.slot().drop_last_in_place() };
+
+        let _ = ManuallyDrop::new(self);
+    }
+
+    pub(super) fn slot(&self) -> &MetaSlot {
         // SAFETY: `ptr` points to a valid `MetaSlot` that will never be
         // mutably borrowed, so taking an immutable reference to it is safe.
         unsafe { &*self.ptr }
@@ -144,6 +192,44 @@ impl<M: AnyFrameMeta + ?Sized> TryFrom<Frame<M>> for UniqueFrame<M> {
                 Ok(unsafe { core::mem::transmute::<Frame<M>, UniqueFrame<M>>(frame) })
             }
             Err(_) => Err(frame),
+        }
+    }
+}
+
+/// A mutable reference to a unique frame.
+///
+/// This works like `&'a mut UniqueFrame<M>`.
+pub struct UniqueFrameRefMut<'a, M: AnyFrameMeta + ?Sized> {
+    inner: ManuallyDrop<UniqueFrame<M>>,
+    phantom: PhantomData<&'a mut UniqueFrame<M>>,
+}
+
+impl<M: AnyFrameMeta + ?Sized> Deref for UniqueFrameRefMut<'_, M> {
+    type Target = UniqueFrame<M>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<M: AnyFrameMeta + ?Sized> DerefMut for UniqueFrameRefMut<'_, M> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<M: AnyFrameMeta + ?Sized> UniqueFrameRefMut<'_, M> {
+    /// Gets a mutable reference from a raw physical address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the physical address is valid and points to
+    /// a unique frame forgotten by [`UniqueFrame::into_raw`]. The caller must
+    /// not do it when another reference to the frame exists.
+    pub(crate) unsafe fn from_raw(paddr: Paddr) -> Self {
+        Self {
+            inner: ManuallyDrop::new(UniqueFrame::from_raw(paddr)),
+            phantom: PhantomData,
         }
     }
 }
