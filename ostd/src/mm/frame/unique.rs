@@ -160,6 +160,8 @@ impl<M: AnyFrameMeta + ?Sized> Drop for UniqueFrame<M> {
         // SAFETY: We are the sole owner and the reference count is 0.
         // The slot is initialized.
         unsafe { self.slot().drop_last_in_place() };
+
+        super::allocator::dealloc_upcall(self.start_paddr(), PAGE_SIZE);
     }
 }
 

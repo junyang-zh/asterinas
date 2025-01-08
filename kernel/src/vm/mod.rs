@@ -16,8 +16,30 @@
 //! In Asterinas, VMARs and VMOs, as well as other capabilities, are implemented
 //! as zero-cost capabilities.
 
+use ostd::mm::frame::GlobalFrameAllocator;
+
 pub mod page_fault_handler;
 pub mod perms;
 pub mod util;
 pub mod vmar;
 pub mod vmo;
+
+#[ostd::global_frame_allocator]
+static FRAME_ALLOCATOR: GlobalFrameAllocator = GlobalFrameAllocator {
+    alloc: osdk_frame_allocator::alloc,
+    dealloc: osdk_frame_allocator::dealloc,
+};
+
+/// Total physical memory in the entire system in bytes.
+pub fn mem_total() -> usize {
+    use ostd::boot::{boot_info, memory_region::MemoryRegionType};
+
+    let regions = &boot_info().memory_regions;
+    let total = regions
+        .iter()
+        .filter(|region| region.typ() == MemoryRegionType::Usable)
+        .map(|region| region.len())
+        .sum::<usize>();
+
+    total
+}

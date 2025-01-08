@@ -65,6 +65,36 @@ pub fn test_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// A macro attribute for the global frame allocator.
+///
+/// The attributed static variable will be used to provide frame allocation
+/// for the kernel. The variable should have type `ostd::mm::GlobalFrameAllocator`.
+///
+/// # Example
+///
+/// ```ignore
+/// use ostd::{mm::{frame::GlobalFrameAllocator, Paddr}, global_frame_allocator};
+///
+/// // Of course it won't work and all allocations will fail.
+/// // It's just an example.
+/// #[global_frame_allocator]
+/// static ALLOCATOR: GlobalFrameAllocator = GlobalFrameAllocator {
+///     alloc: |_: core::alloc::Layout| None,
+///     dealloc: |_: Paddr, _: usize| {},
+/// };
+/// ```
+#[proc_macro_attribute]
+pub fn global_frame_allocator(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Rename the static variable to `__GLOBAL_FRAME_ALLOCATOR`.
+    let item = parse_macro_input!(item as syn::ItemStatic);
+
+    quote!(
+        #[export_name = "__GLOBAL_FRAME_ALLOCATOR"]
+        #item
+    )
+    .into()
+}
+
 /// A macro attribute for the panic handler.
 ///
 /// The attributed function will be used to override OSTD's default
