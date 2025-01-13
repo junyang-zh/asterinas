@@ -62,7 +62,6 @@ static MAX_PADDR: AtomicUsize = AtomicUsize::new(0);
 /// Frames are associated with metadata. The type of the metadata `M` is
 /// determines the kind of the frame. If `M` implements [`AnyUFrameMeta`], the
 /// frame is a untyped frame. Otherwise, it is a typed frame.
-#[derive(Debug)]
 #[repr(transparent)]
 pub struct Frame<M: AnyFrameMeta + ?Sized> {
     ptr: *const MetaSlot,
@@ -301,4 +300,10 @@ pub(in crate::mm) unsafe fn inc_frame_ref_count(paddr: Paddr) {
 
     // SAFETY: We have already held a reference to the frame.
     unsafe { slot.inc_ref_count() };
+}
+
+impl<M: AnyFrameMeta + ?Sized> core::fmt::Debug for Frame<M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Frame({:#x})", self.start_paddr())
+    }
 }

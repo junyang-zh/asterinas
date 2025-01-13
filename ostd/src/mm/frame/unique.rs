@@ -19,7 +19,6 @@ use crate::mm::{frame::mapping, Paddr, PagingConsts, PagingLevel, PAGE_SIZE};
 ///
 /// Unlike [`Frame`], the frame pointed to by this pointer is not shared with
 /// others. So a mutable reference to the metadata is available for the frame.
-#[derive(Debug)]
 #[repr(transparent)]
 pub struct UniqueFrame<M: AnyFrameMeta + ?Sized> {
     ptr: *const MetaSlot,
@@ -233,5 +232,11 @@ impl<M: AnyFrameMeta + ?Sized> UniqueFrameRefMut<'_, M> {
             inner: ManuallyDrop::new(UniqueFrame::from_raw(paddr)),
             phantom: PhantomData,
         }
+    }
+}
+
+impl<M: AnyFrameMeta + ?Sized> core::fmt::Debug for UniqueFrame<M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "UniqueFrame({:#x})", self.start_paddr())
     }
 }
