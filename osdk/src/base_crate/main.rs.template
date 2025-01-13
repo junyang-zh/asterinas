@@ -13,11 +13,18 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe { __ostd_panic_handler(info); }
 }
 
-use ostd::mm::frame::GlobalFrameAllocator;
+use ostd::mm::{frame::GlobalFrameAllocator, heap::GlobalHeapAllocator};
 
 #[export_name = "__GLOBAL_FRAME_ALLOCATOR"]
 #[linkage = "weak"]
-static ALLOCATOR: GlobalFrameAllocator = GlobalFrameAllocator {
+static FRAME_ALLOCATOR: GlobalFrameAllocator = GlobalFrameAllocator {
     alloc: osdk_frame_allocator::alloc,
     dealloc: osdk_frame_allocator::dealloc,
+};
+
+#[export_name = "__GLOBAL_HEAP_ALLOCATOR"]
+#[linkage = "weak"]
+static HEAP_ALLOCATOR: GlobalHeapAllocator = GlobalHeapAllocator {
+    alloc: osdk_heap_allocator::alloc,
+    dealloc: osdk_heap_allocator::dealloc,
 };

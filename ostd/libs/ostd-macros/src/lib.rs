@@ -95,6 +95,37 @@ pub fn global_frame_allocator(_attr: TokenStream, item: TokenStream) -> TokenStr
     .into()
 }
 
+/// A macro attribute for the global heap allocator.
+///
+/// The attributed static variable will be used to provide heap allocation
+/// for the kernel. The variable should have type `ostd::mm::GlobalHeapAllocator`.
+///
+/// # Example
+///
+/// ```ignore
+/// use core::alloc::{AllocError, Layout};
+/// use ostd::{mm::heap::{GlobalHeapAllocator, HeapSlot}, global_heap_allocator};
+///
+/// // Of course it won't work and all allocations will fail.
+/// // It's just an example.
+/// #[global_heap_allocator]
+/// static ALLOCATOR: GlobalHeapAllocator = GlobalHeapAllocator {
+///     alloc: |_: Layout| Err(AllocError),
+///     dealloc: |_: HeapSlot| {},
+/// };
+/// ```
+#[proc_macro_attribute]
+pub fn global_heap_allocator(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Rename the static variable to `__GLOBAL_HEAP_ALLOCATOR`.
+    let item = parse_macro_input!(item as syn::ItemStatic);
+
+    quote!(
+        #[export_name = "__GLOBAL_HEAP_ALLOCATOR"]
+        #item
+    )
+    .into()
+}
+
 /// A macro attribute for the panic handler.
 ///
 /// The attributed function will be used to override OSTD's default
