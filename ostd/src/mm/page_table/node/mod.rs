@@ -37,10 +37,10 @@ pub(in crate::mm) use self::{
 use super::{PageTableConfig, PteTrait, nr_subpage_per_huge};
 use crate::{
     mm::{
-        FrameAllocOptions, HasPaddr, Infallible, PagingConstsTrait, PagingLevel, VmReader,
+        HasPaddr, Infallible, PagingConstsTrait, PagingLevel, VmReader,
         frame::{Frame, FrameRef, meta::AnyFrameMeta},
         paddr_to_vaddr,
-        page_table::{PteScalar, load_pte, store_pte},
+        page_table::{PteScalar, load_pte, store_pte, zeroed_pt_pool},
     },
     sync::spin::queued,
     task::atomic_mode::InAtomicMode,
@@ -64,11 +64,9 @@ impl<C: PageTableConfig> PageTableNode<C> {
 
     /// Allocates a new empty page table node.
     pub(super) fn alloc(level: PagingLevel) -> Self {
-        let meta = PageTablePageMeta::new(level);
-        FrameAllocOptions::new()
-            .zeroed(true)
-            .alloc_frame_with(meta)
-            .expect("Failed to allocate a page table node")
+        let meta = PageTablePageMeta::<C>::new(level);
+
+        zeroed_pt_pool::alloc(meta)
     }
 
     /// Activates the page table assuming it is a root page table.

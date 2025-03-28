@@ -116,6 +116,8 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
 
         const { assert!(C::NR_LEVELS as usize <= MAX_NR_LEVELS) };
 
+        crate::mm::page_table::zeroed_pt_pool::prefill();
+
         Ok(locking::lock_range(pt, guard, va))
     }
 

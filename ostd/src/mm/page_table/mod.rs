@@ -26,6 +26,7 @@ use crate::{
 
 mod cursor;
 mod node;
+mod zeroed_pt_pool;
 
 pub(in crate::mm) use cursor::PageTableFrag;
 pub(crate) use cursor::{Cursor, CursorMut};
