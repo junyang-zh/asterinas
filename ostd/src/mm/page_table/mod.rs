@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{
-    fmt::Debug,
-    intrinsics::transmute_unchecked,
-    marker::PhantomData,
-    ops::Range,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::{fmt::Debug, intrinsics::transmute_unchecked, marker::PhantomData, ops::Range};
 
 use super::{
     nr_subpage_per_huge, page_prop::PageProperty, page_size, vm_space::Token, Paddr,
@@ -110,7 +104,7 @@ impl PageTable<KernelMode> {
     pub fn create_user_page_table(&self) -> PageTable<UserMode> {
         let preempt_guard = disable_preempt();
         zeroed_pt_pool::prefill(&preempt_guard);
-        let mut root_node = self.root.clone().lock();
+        let mut root_node = self.root.clone().lock_write();
         let mut new_node = zeroed_pt_pool::alloc(
             &preempt_guard,
             PagingConsts::NR_LEVELS,
@@ -151,7 +145,7 @@ impl PageTable<KernelMode> {
         debug_assert!(end <= NR_PTES_PER_NODE);
 
         let guard = disable_preempt();
-        let mut root_node = self.root.clone().lock();
+        let mut root_node = self.root.clone().lock_write();
         for i in start..end {
             let root_entry = root_node.entry(i);
             if root_entry.is_none() {
@@ -404,28 +398,4 @@ pub trait PageTableEntryTrait:
         // SAFETY: `Self` is `Pod` and has the same memory representation as `usize`.
         unsafe { transmute_unchecked(pte_raw) }
     }
-}
-
-/// Loads a page table entry with an atomic instruction.
-///
-/// # Safety
-///
-/// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
-pub unsafe fn load_pte<E: PageTableEntryTrait>(ptr: *mut E, ordering: Ordering) -> E {
-    // SAFETY: The safety is upheld by the caller.
-    let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
-    let pte_raw = atomic.load(ordering);
-    E::from_usize(pte_raw)
-}
-
-/// Stores a page table entry with an atomic instruction.
-///
-/// # Safety
-///
-/// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
-pub unsafe fn store_pte<E: PageTableEntryTrait>(ptr: *mut E, new_val: E, ordering: Ordering) {
-    let new_raw = new_val.as_usize();
-    // SAFETY: The safety is upheld by the caller.
-    let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
-    atomic.store(new_raw, ordering)
 }
