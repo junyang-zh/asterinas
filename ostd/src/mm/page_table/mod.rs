@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{
-    fmt::Debug,
-    intrinsics::transmute_unchecked,
-    marker::PhantomData,
-    ops::Range,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::{fmt::Debug, intrinsics::transmute_unchecked, marker::PhantomData, ops::Range};
 
 use super::{
     nr_subpage_per_huge, page_prop::PageProperty, page_size, vm_space::Status, Paddr,
@@ -110,12 +104,13 @@ impl PageTable<KernelMode> {
     pub fn create_user_page_table(&self) -> PageTable<UserMode> {
         let preempt_guard = disable_preempt();
         zeroed_pt_pool::prefill(&preempt_guard);
-        let mut root_node = self.root.clone().lock();
-        let mut new_node = zeroed_pt_pool::alloc(
+        let mut root_node = self.root.clone().lock_write();
+        let new_node = zeroed_pt_pool::alloc(
             &preempt_guard,
             PagingConsts::NR_LEVELS,
             MapTrackingStatus::NotApplicable,
         );
+        let mut new_node = new_node.lock_write();
 
         // Make a shallow copy of the root node in the kernel space range.
         // The user space range is not copied.
@@ -151,7 +146,7 @@ impl PageTable<KernelMode> {
         debug_assert!(end <= NR_PTES_PER_NODE);
 
         let guard = disable_preempt();
-        let mut root_node = self.root.clone().lock();
+        let mut root_node = self.root.clone().lock_write();
         for i in start..end {
             let root_entry = root_node.entry(i);
             if root_entry.is_none() {
@@ -164,7 +159,7 @@ impl PageTable<KernelMode> {
                     MapTrackingStatus::Untracked
                 };
                 let node = zeroed_pt_pool::alloc(&guard, nxt_level, is_tracked);
-                let _ = root_entry.replace(Child::PageTable(node.unlock()));
+                let _ = root_entry.replace(Child::PageTable(node));
             }
         }
         let _ = root_node.unlock();
@@ -203,8 +198,7 @@ impl<'a, M: PageTableMode, E: PageTableEntryTrait, C: PagingConstsTrait> PageTab
                 &preempt_guard,
                 C::NR_LEVELS,
                 MapTrackingStatus::NotApplicable,
-            )
-            .unlock(),
+            ),
             _phantom: PhantomData,
         }
     }
@@ -404,28 +398,4 @@ pub trait PageTableEntryTrait:
         // SAFETY: `Self` is `Pod` and has the same memory representation as `usize`.
         unsafe { transmute_unchecked(pte_raw) }
     }
-}
-
-/// Loads a page table entry with an atomic instruction.
-///
-/// # Safety
-///
-/// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
-pub unsafe fn load_pte<E: PageTableEntryTrait>(ptr: *mut E, ordering: Ordering) -> E {
-    // SAFETY: The safety is upheld by the caller.
-    let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
-    let pte_raw = atomic.load(ordering);
-    E::from_usize(pte_raw)
-}
-
-/// Stores a page table entry with an atomic instruction.
-///
-/// # Safety
-///
-/// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
-pub unsafe fn store_pte<E: PageTableEntryTrait>(ptr: *mut E, new_val: E, ordering: Ordering) {
-    let new_raw = new_val.as_usize();
-    // SAFETY: The safety is upheld by the caller.
-    let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
-    atomic.store(new_raw, ordering)
 }

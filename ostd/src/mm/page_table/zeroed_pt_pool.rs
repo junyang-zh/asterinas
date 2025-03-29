@@ -11,7 +11,7 @@ use core::{
 
 use super::{
     node::{MapTrackingStatus, PageTablePageMeta},
-    PageTableEntryTrait, PageTableLock, PageTableNode,
+    PageTableEntryTrait, PageTableNode,
 };
 use crate::{
     cpu::PinCurrentCpu,
@@ -53,14 +53,14 @@ pub(super) fn alloc<E: PageTableEntryTrait, C: PagingConstsTrait>(
     preempt_guard: &DisabledPreemptGuard,
     level: PagingLevel,
     is_tracked: MapTrackingStatus,
-) -> PageTableLock<E, C> {
+) -> PageTableNode<E, C> {
     let cpu = preempt_guard.current_cpu();
     let pool_size = POOL_SIZE.get_on_cpu(cpu);
 
     let size = pool_size.load(Ordering::Relaxed);
 
     if size == 0 {
-        return PageTableNode::alloc(level, is_tracked).lock();
+        return PageTableNode::alloc(level, is_tracked);
     }
 
     let irq_guard = crate::trap::disable_local();
@@ -69,10 +69,7 @@ pub(super) fn alloc<E: PageTableEntryTrait, C: PagingConstsTrait>(
     let frame = pool[size - 1].take().unwrap();
     pool_size.store(size - 1, Ordering::Relaxed);
 
-    let frame: PageTableNode<E, C> = frame
+    frame
         .repurpose(PageTablePageMeta::<E, C>::new(level, is_tracked))
-        .into();
-
-    // SAFETY: The metadata must match the locked frame.
-    frame.lock()
+        .into()
 }
