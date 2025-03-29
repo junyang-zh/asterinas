@@ -11,10 +11,7 @@ mod rwmutex;
 pub(crate) mod spin;
 mod wait;
 
-pub(crate) use self::{
-    guard::GuardTransfer,
-    rcu::{after_grace_period, finish_grace_period},
-};
+pub(crate) use self::{guard::GuardTransfer, rcu::finish_grace_period};
 pub use self::{
     guard::{LocalIrqDisabled, PreemptDisabled, WriteIrqDisabled},
     mutex::{Mutex, MutexGuard},

@@ -27,12 +27,14 @@
 
 mod child;
 mod entry;
-
 mod mcs;
+mod rwlock;
 
-use alloc::boxed::Box;
 use core::{
-    cell::SyncUnsafeCell, marker::PhantomData, mem::ManuallyDrop, pin::Pin, sync::atomic::Ordering,
+    cell::SyncUnsafeCell,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
 };
 
 pub(in crate::mm) use self::{child::Child, entry::Entry};
@@ -42,7 +44,6 @@ use crate::{
     mm::{
         frame::{meta::AnyFrameMeta, Frame},
         paddr_to_vaddr,
-        page_table::{load_pte, store_pte},
         vm_space::Status,
         FrameAllocOptions, Infallible, Paddr, PagingConstsTrait, PagingLevel, VmReader,
     },
@@ -56,21 +57,19 @@ use crate::{
 /// children will be freed.
 ///
 /// [`PageTableNode`] is read-only. To modify the page table node, lock and use
-/// [`PageTableLock`].
+/// [`PageTableWriteLock`].
 pub(super) type PageTableNode<E, C> = Frame<PageTablePageMeta<E, C>>;
 
 impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableNode<E, C> {
     /// Allocates a new empty page table node.
     ///
-    /// This function returns a locked owning guard.
+    /// This function returns an unlocked owning guard.
     pub(super) fn alloc(level: PagingLevel, is_tracked: MapTrackingStatus) -> Self {
         let meta = PageTablePageMeta::new(level, is_tracked);
-
         let frame = FrameAllocOptions::new()
             .zeroed(true)
             .alloc_frame_with(meta)
             .expect("Failed to allocate a page table node");
-
         // The allocated frame is zeroed. Make sure zero is absent PTE.
         debug_assert!(E::new_absent().as_bytes().iter().all(|&b| b == 0));
 
@@ -107,18 +106,19 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableNode<E, C> {
     /// This should be an unsafe function that requires the caller to ensure
     /// that preemption is disabled while the lock is held, or if the page is
     /// not shared with other CPUs.
-    pub(super) fn lock(self) -> PageTableLock<E, C> {
-        let node = Box::pin(mcs::Node::new());
+    pub(super) fn lock_write(self) -> PageTableWriteLock<E, C> {
+        self.meta().lock.lock_write();
 
-        // SAFETY: The node is new. Preemption is disabled.
-        unsafe { node.as_ref().lock(&self.meta().lock) };
+        PageTableWriteLock::<E, C> { frame: Some(self) }
+    }
 
-        // SAFETY: Lock is held. So it is exclusive.
-        unsafe {
-            self.meta().node.get().write(Some(node));
+    pub(super) fn lock_read(self) -> PageTableReadLock<E, C> {
+        let g = self.meta().lock.lock_read();
+
+        PageTableReadLock::<E, C> {
+            frame: Some(self),
+            bravo_guard: Some(g),
         }
-
-        PageTableLock::<E, C> { frame: Some(self) }
     }
 
     /// Activates the page table assuming it is a root page table.
@@ -168,12 +168,77 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableNode<E, C> {
     }
 }
 
-/// A owned mutable guard that holds the lock of a page table node.
+/// A owned mutable guard that holds the read lock of a page table node.
 ///
 /// This should be used as a linear type, i.e, it shouldn't be dropped. The
-/// only way to destruct the type must be [`PageTableLock::unlock`].
+/// only way to destruct the type must be [`PageTableReadLock::unlock`].
 #[derive(Debug)]
-pub(super) struct PageTableLock<
+pub(super) struct PageTableReadLock<
+    E: PageTableEntryTrait = PageTableEntry,
+    C: PagingConstsTrait = PagingConsts,
+> {
+    // We need to wrap it in `Option` to perform the linear type check.
+    frame: Option<Frame<PageTablePageMeta<E, C>>>,
+    bravo_guard: Option<rwlock::bravo::BravoReadGuard>,
+}
+
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableReadLock<E, C> {
+    /// Gets the physical address of the page table node.
+    pub(super) fn paddr(&self) -> Paddr {
+        self.frame.as_ref().unwrap().start_paddr()
+    }
+
+    /// Gets the level of the page table node.
+    pub(super) fn level(&self) -> PagingLevel {
+        self.meta().level
+    }
+
+    /// Gets the tracking status of the page table node.
+    pub(super) fn is_tracked(&self) -> MapTrackingStatus {
+        self.meta().is_tracked
+    }
+
+    pub(super) fn read_child_ref(&self, idx: usize) -> Child<E, C> {
+        let pte = self.read_pte(idx);
+        // SAFETY: The provided `level` and `is_tracked` are the same as
+        // the node containing the PTE.
+        unsafe { Child::ref_from_pte(&pte, self.level(), self.is_tracked(), false) }
+    }
+
+    pub(super) fn unlock(mut self) -> PageTableNode<E, C> {
+        let guard = self.bravo_guard.take().unwrap();
+        self.meta().lock.unlock_read(guard);
+
+        self.frame.take().unwrap()
+    }
+
+    fn read_pte(&self, idx: usize) -> E {
+        assert!(idx < nr_subpage_per_huge::<C>());
+        let ptr = paddr_to_vaddr(self.paddr()) as *mut E;
+        // SAFETY:
+        // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
+        unsafe { ptr.add(idx).read() }
+    }
+
+    fn meta(&self) -> &PageTablePageMeta<E, C> {
+        self.frame.as_ref().unwrap().meta()
+    }
+}
+
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> Drop for PageTableReadLock<E, C> {
+    fn drop(&mut self) {
+        if self.frame.is_some() {
+            panic!("Dropping `PageTableReadLock` instead of `unlock` it")
+        }
+    }
+}
+
+/// A owned mutable guard that holds the write lock of a page table node.
+///
+/// This should be used as a linear type, i.e, it shouldn't be dropped. The
+/// only way to destruct the type must be [`PageTableWriteLock::unlock`].
+#[derive(Debug)]
+pub(super) struct PageTableWriteLock<
     E: PageTableEntryTrait = PageTableEntry,
     C: PagingConstsTrait = PagingConsts,
 > {
@@ -181,7 +246,7 @@ pub(super) struct PageTableLock<
     frame: Option<Frame<PageTablePageMeta<E, C>>>,
 }
 
-impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableWriteLock<E, C> {
     /// Borrows an entry in the node at a given index.
     ///
     /// # Panics
@@ -211,25 +276,13 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
 
     /// Unlocks the page table node.
     pub(super) fn unlock(mut self) -> PageTableNode<E, C> {
-        // SAFETY: Lock is held. So it is exclusive.
-        let node = unsafe { self.meta().node.get().replace(None) }.unwrap();
-
-        // Release the lock.
-        // SAFETY:
-        //  - The lock stays at the metadata slot so it's pinned.
-        //  - The acquire method ensures that the node matches the lock.
-        unsafe { node.as_ref().unlock(&self.meta().lock) };
+        self.meta().lock.unlock_write();
 
         self.frame.take().unwrap()
     }
 
-    /// Converts the guard into a raw physical address.
-    ///
-    /// It will not release the lock. It may be paired with [`Self::from_raw_paddr`]
-    /// to manually manage pointers.
-    pub(super) fn into_raw_paddr(self) -> Paddr {
-        let this = ManuallyDrop::new(self);
-        this.paddr()
+    pub(super) fn start_paddr(&self) -> Paddr {
+        self.frame.as_ref().unwrap().start_paddr()
     }
 
     /// Converts a raw physical address to a guard.
@@ -250,12 +303,6 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
         unsafe { *self.meta().nr_children.get() }
     }
 
-    /// If the page table node is detached from its parent.
-    pub(super) fn astray_mut(&mut self) -> &mut bool {
-        // SAFETY: The lock is held so we have an exclusive access.
-        unsafe { &mut *self.meta().astray.get() }
-    }
-
     /// Reads a non-owning PTE at the given index.
     ///
     /// A non-owning PTE means that it does not account for a reference count
@@ -270,8 +317,7 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
         let ptr = paddr_to_vaddr(self.paddr()) as *mut E;
         // SAFETY:
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
-        // - All page table entries are aligned and accessed with atomic operations only.
-        unsafe { load_pte(ptr.add(idx), Ordering::Relaxed) }
+        unsafe { ptr.add(idx).read() }
     }
 
     /// Writes a page table entry at a given index.
@@ -292,8 +338,7 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
         let ptr = paddr_to_vaddr(self.paddr()) as *mut E;
         // SAFETY:
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
-        // - All page table entries are aligned and accessed with atomic operations only.
-        unsafe { store_pte(ptr.add(idx), pte, Ordering::Release) }
+        unsafe { ptr.add(idx).write(pte) }
     }
 
     /// Gets the mutable reference to the number of valid PTEs in the node.
@@ -307,11 +352,47 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
     }
 }
 
-impl<E: PageTableEntryTrait, C: PagingConstsTrait> Drop for PageTableLock<E, C> {
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> Drop for PageTableWriteLock<E, C> {
     fn drop(&mut self) {
         if self.frame.is_some() {
-            panic!("Dropping `PageTableLock` instead of `unlock` it")
+            panic!("Dropping `PageTableWriteLock` instead of `unlock` it")
         }
+    }
+}
+
+/// An implicit access to the page table node.
+///
+/// Our lock protocol ensures that if write locking the covering node the node
+/// can be mutably accessed.
+///
+/// This handle points to an actually unlocked page table node but you can
+/// manipulate it.
+#[derive(Debug)]
+pub(super) struct PageTableImplicitWriteLock<E: PageTableEntryTrait, C: PagingConstsTrait>(
+    ManuallyDrop<PageTableWriteLock<E, C>>,
+);
+
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableImplicitWriteLock<E, C> {
+    /// # Safety
+    ///
+    /// The `paddr` must point to a implicitly locked page table node.
+    pub(super) unsafe fn from_raw_paddr(paddr: Paddr) -> Self {
+        let write_lock = PageTableWriteLock::from_raw_paddr(paddr);
+        Self(ManuallyDrop::new(write_lock))
+    }
+}
+
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> Deref for PageTableImplicitWriteLock<E, C> {
+    type Target = PageTableWriteLock<E, C>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> DerefMut for PageTableImplicitWriteLock<E, C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -322,23 +403,15 @@ pub(in crate::mm) struct PageTablePageMeta<
     E: PageTableEntryTrait = PageTableEntry,
     C: PagingConstsTrait = PagingConsts,
 > {
+    /// The readers-writer lock for the page table page.
+    lock: rwlock::bravo::BravoSimpRwLock,
     /// The number of valid PTEs. It is mutable if the lock is held.
     pub nr_children: SyncUnsafeCell<u16>,
-    /// If the page table is detached from its parent.
-    ///
-    /// A page table can be detached from its parent while still being accessed,
-    /// since we use a RCU scheme to recycle page tables. If this flag is set,
-    /// it means that the parent is recycling the page table.
-    pub astray: SyncUnsafeCell<bool>,
     /// The level of the page table page. A page table page cannot be
     /// referenced by page tables of different levels.
     pub level: PagingLevel,
     /// Whether the pages mapped by the node is tracked.
     pub is_tracked: MapTrackingStatus,
-    /// The MCS lock.
-    lock: mcs::LockBody,
-    /// The MCS node holding the lock.
-    node: SyncUnsafeCell<Option<Pin<Box<mcs::Node>>>>,
     _phantom: core::marker::PhantomData<(E, C)>,
 }
 
@@ -362,11 +435,9 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTablePageMeta<E, C> {
     pub fn new(level: PagingLevel, is_tracked: MapTrackingStatus) -> Self {
         Self {
             nr_children: SyncUnsafeCell::new(0),
-            astray: SyncUnsafeCell::new(false),
             level,
+            lock: rwlock::bravo::BravoSimpRwLock::new(),
             is_tracked,
-            lock: mcs::LockBody::new(),
-            node: SyncUnsafeCell::new(None),
             _phantom: PhantomData,
         }
     }
