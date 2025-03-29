@@ -2,7 +2,7 @@
 
 //! This module provides accessors to the page table entries in a node.
 
-use super::{Child, MapTrackingStatus, PageTableEntryTrait, PageTableLock, PageTableNode};
+use super::{Child, MapTrackingStatus, PageTableEntryTrait, PageTableNode, PageTableWriteLock};
 use crate::mm::{
     nr_subpage_per_huge, page_prop::PageProperty, page_size, page_table::zeroed_pt_pool,
     vm_space::Token, PagingConstsTrait,
@@ -10,7 +10,7 @@ use crate::mm::{
 
 /// A view of an entry in a page table node.
 ///
-/// It can be borrowed from a node using the [`PageTableLock::entry`] method.
+/// It can be borrowed from a node using the [`PageTableWriteLock::entry`] method.
 ///
 /// This is a static reference to an entry in a node that does not account for
 /// a dynamic reference count to the child. It can be used to create a owned
@@ -27,7 +27,7 @@ pub(in crate::mm) struct Entry<'a, E: PageTableEntryTrait, C: PagingConstsTrait>
     /// The index of the entry in the node.
     idx: usize,
     /// The node that contains the entry.
-    node: &'a mut PageTableLock<E, C>,
+    node: &'a mut PageTableWriteLock<E, C>,
 }
 
 impl<'a, E: PageTableEntryTrait, C: PagingConstsTrait> Entry<'a, E, C> {
@@ -141,7 +141,7 @@ impl<'a, E: PageTableEntryTrait, C: PagingConstsTrait> Entry<'a, E, C> {
     ///
     /// If the entry does not map to a untracked huge page, the method returns
     /// `None`.
-    pub(in crate::mm) fn split_if_untracked_huge(self) -> Option<PageTableLock<E, C>> {
+    pub(in crate::mm) fn split_if_untracked_huge(self) -> Option<PageTableWriteLock<E, C>> {
         let level = self.node.level();
 
         if !(self.pte.is_last(level)
@@ -170,14 +170,14 @@ impl<'a, E: PageTableEntryTrait, C: PagingConstsTrait> Entry<'a, E, C> {
         }));
         // SAFETY: `pt_paddr` points to a PT that is attached to the node,
         // so that it is locked and alive.
-        Some(unsafe { PageTableLock::from_raw_paddr(pt_paddr) })
+        Some(unsafe { PageTableWriteLock::from_raw_paddr(pt_paddr) })
     }
 
     /// Splits the entry into a child that is marked with a same token.
     ///
     /// This method returns [`None`] if the entry is not marked with a token or
     /// it is in the last level.
-    pub(in crate::mm) fn split_if_huge_token(self) -> Option<PageTableLock<E, C>> {
+    pub(in crate::mm) fn split_if_huge_token(self) -> Option<PageTableWriteLock<E, C>> {
         let level = self.node.level();
 
         if !(!self.pte.is_present() && level > 1 && self.pte.paddr() != 0) {
@@ -198,7 +198,7 @@ impl<'a, E: PageTableEntryTrait, C: PagingConstsTrait> Entry<'a, E, C> {
             PageTableNode::from_raw(pt_paddr)
         }));
 
-        Some(unsafe { PageTableLock::from_raw_paddr(pt_paddr) })
+        Some(unsafe { PageTableWriteLock::from_raw_paddr(pt_paddr) })
     }
 
     /// Create a new entry at the node.
@@ -206,7 +206,7 @@ impl<'a, E: PageTableEntryTrait, C: PagingConstsTrait> Entry<'a, E, C> {
     /// # Safety
     ///
     /// The caller must ensure that the index is within the bounds of the node.
-    pub(super) unsafe fn new_at(node: &'a mut PageTableLock<E, C>, idx: usize) -> Self {
+    pub(super) unsafe fn new_at(node: &'a mut PageTableWriteLock<E, C>, idx: usize) -> Self {
         // SAFETY: The index is within the bound.
         let pte = unsafe { node.read_pte(idx) };
         Self { pte, idx, node }
