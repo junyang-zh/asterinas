@@ -28,7 +28,10 @@
 mod child;
 mod entry;
 
-use core::{cell::SyncUnsafeCell, marker::PhantomData, mem::ManuallyDrop, sync::atomic::Ordering};
+use core::{
+    cell::SyncUnsafeCell, fmt::Arguments, marker::PhantomData, mem::ManuallyDrop,
+    sync::atomic::Ordering,
+};
 
 pub(in crate::mm) use self::{child::Child, entry::Entry};
 use super::{nr_subpage_per_huge, PageTableEntryTrait};
@@ -64,8 +67,8 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableNode<E, C> {
     /// This should be an unsafe function that requires the caller to ensure
     /// that preemption is disabled while the lock is held, or if the page is
     /// not shared with other CPUs.
-    pub(super) fn lock(self) -> PageTableLock<E, C> {
-        unsafe { self.meta().lock.lock() }
+    pub(super) fn lock(self, msg: Arguments<'_>) -> PageTableLock<E, C> {
+        unsafe { self.meta().lock.lock(&msg) }
         PageTableLock::<E, C> { frame: Some(self) }
     }
 

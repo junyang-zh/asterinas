@@ -97,7 +97,7 @@ pub(super) fn lock_range<'a, M: PageTableMode, E: PageTableEntryTrait, C: Paging
                 let guard = path[level as usize - 1].get_or_insert_with(|| {
                     let ptn = cur_pt_from_addr(&cur_pt_addr);
                     debug_assert_eq!(ptn.level(), level);
-                    ptn.lock()
+                    ptn.lock(format_args!("lock_range None node lvl {}", level))
                 });
                 if *guard.astray_mut() {
                     continue 'retry;
@@ -130,7 +130,7 @@ pub(super) fn lock_range<'a, M: PageTableMode, E: PageTableEntryTrait, C: Paging
         let sub_tree = path[level as usize - 1].get_or_insert_with(|| {
             let ptn = cur_pt_from_addr(&cur_pt_addr);
             debug_assert_eq!(ptn.level(), level);
-            ptn.lock()
+            ptn.lock(format_args!("lock_range tree root lvl {}", level))
         });
         if *sub_tree.astray_mut() {
             continue 'retry;
@@ -197,7 +197,7 @@ fn dfs_acquire_lock<E: PageTableEntryTrait, C: PagingConstsTrait>(
                     // SAFETY: This must be alive since we have a reference
                     // to the parent node that is still alive.
                     let pt = unsafe { PageTableNode::<E, C>::from_raw(pt) };
-                    let mut pt = pt.lock();
+                    let mut pt = pt.lock(format_args!("lock_range dfs acquire lvl {}", cur_level));
                     let child_node_va = cur_node_va + i * page_size::<C>(cur_level);
                     let child_node_va_end = child_node_va + page_size::<C>(cur_level);
                     let va_start = va_range.start.max(child_node_va);

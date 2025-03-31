@@ -76,7 +76,7 @@ impl<T: ?Sized, G: SpinGuardian> SpinLock<T, G> {
         // SAFETY: `G::guard()` ensures that the current task is pinned to the
         // current CPU.
         unsafe {
-            self.inner.lock.lock();
+            self.inner.lock.lock(&format_args!("other"));
         }
 
         SpinLockGuard { lock: self, guard }

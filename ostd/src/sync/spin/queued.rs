@@ -31,7 +31,7 @@
 
 use core::{
     cell::UnsafeCell,
-    fmt::Debug,
+    fmt::{Arguments, Debug},
     intrinsics,
     mem::{offset_of, ManuallyDrop},
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
@@ -221,7 +221,7 @@ impl LockBody {
     ///
     /// The caller must ensure that the current task is pinned to the current
     /// CPU.
-    pub(crate) unsafe fn lock(&self) {
+    pub(crate) unsafe fn lock(&self, msg: &Arguments<'_>) {
         // (queue tail, pending bit, lock value)
         //
         //              fast     :    slow                                  :    unlock
@@ -242,13 +242,13 @@ impl LockBody {
             Ok(()) => {}
             Err(val) => {
                 // Slow path. There are pending spinners or queued spinners.
-                self.lock_slow(val);
+                self.lock_slow(val, msg);
             }
         }
     }
 
     /// Acquire the spinlock in a slow path.
-    fn lock_slow(&self, mut lock_val: u32) {
+    fn lock_slow(&self, mut lock_val: u32, msg: &Arguments<'_>) {
         // Wait for in-progress pending->locked hand-overs with a bounded
         // number of spins so that we guarantee forward progress.
         // 0,1,0 -> 0,0,1
@@ -267,7 +267,7 @@ impl LockBody {
 
         // If we observe any contention, we enqueue ourselves.
         if lock_val & !Self::LOCKED_MASK != 0 {
-            self.lock_enqueue();
+            self.lock_enqueue(msg);
             return;
         }
 
@@ -282,7 +282,7 @@ impl LockBody {
                     self.pending_ptr().write_volatile(0);
                 };
             }
-            self.lock_enqueue();
+            self.lock_enqueue(msg);
             return;
         }
 
@@ -323,7 +323,7 @@ impl LockBody {
     ///
     /// If we cannot lock optimistically (likely due to contention), we enqueue
     /// ourselves and spin on local MCS nodes.
-    fn lock_enqueue(&self) {
+    fn lock_enqueue(&self, msg: &Arguments<'_>) {
         // The caller of `lock` ensures that the current task is pinned to the
         // current CPU.
         let cur_cpu = current_cpu_racy();
@@ -393,8 +393,21 @@ impl LockBody {
                 .store((node as *const QueueNode).cast_mut(), Ordering::Relaxed);
 
             // Spin on the locked bit.
+            let mut spin_cnt = 0;
             while !node.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
+                spin_cnt += 1;
+                if spin_cnt == 10000 {
+                    static SIMP_PRINT_LOCK: AtomicBool = AtomicBool::new(false);
+                    while SIMP_PRINT_LOCK
+                        .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        core::hint::spin_loop();
+                    }
+                    crate::early_println!("{}", msg);
+                    SIMP_PRINT_LOCK.store(false, Ordering::Release);
+                }
             }
 
             // While waiting for the MCS lock, the next pointer may have been

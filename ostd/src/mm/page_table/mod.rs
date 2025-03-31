@@ -110,7 +110,10 @@ impl PageTable<KernelMode> {
     pub fn create_user_page_table(&self) -> PageTable<UserMode> {
         let preempt_guard = disable_preempt();
         zeroed_pt_pool::prefill(&preempt_guard);
-        let mut root_node = self.root.clone().lock();
+        let mut root_node = self
+            .root
+            .clone()
+            .lock(format_args!("create_user_page_table"));
         let mut new_node = zeroed_pt_pool::alloc(
             &preempt_guard,
             PagingConsts::NR_LEVELS,
@@ -151,7 +154,7 @@ impl PageTable<KernelMode> {
         debug_assert!(end <= NR_PTES_PER_NODE);
 
         let guard = disable_preempt();
-        let mut root_node = self.root.clone().lock();
+        let mut root_node = self.root.clone().lock(format_args!("make_shared_tables"));
         for i in start..end {
             let root_entry = root_node.entry(i);
             if root_entry.is_none() {
