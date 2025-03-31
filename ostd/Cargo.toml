@@ -33,7 +33,6 @@ ostd-macros = { version = "0.16.0", path = "libs/ostd-macros" }
 ostd-test = { version = "0.16.0", path = "libs/ostd-test" }
 ostd-pod = { git = "https://github.com/asterinas/ostd-pod", rev = "c4644be", version = "0.1.1" }
 spin = "0.9.4"
-smallvec = "1.13.2"
 volatile = "0.6.1"
 bitvec = { version = "1.0", default-features = false, features = ["alloc"] }
 
