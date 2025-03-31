@@ -4,8 +4,6 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use smallvec::SmallVec;
-
 use super::{num_cpus, CpuId};
 use crate::const_assert;
 
@@ -13,13 +11,13 @@ use crate::const_assert;
 #[derive(Clone, Debug, Default)]
 pub struct CpuSet {
     // A bitset representing the CPUs in the system.
-    bits: SmallVec<[InnerPart; NR_PARTS_NO_ALLOC]>,
+    bits: [InnerPart; NR_PARTS_NO_ALLOC],
 }
 
 type InnerPart = u64;
 
 const BITS_PER_PART: usize = core::mem::size_of::<InnerPart>() * 8;
-const NR_PARTS_NO_ALLOC: usize = 2;
+const NR_PARTS_NO_ALLOC: usize = 6;
 
 const fn part_idx(cpu_id: CpuId) -> usize {
     cpu_id.as_usize() / BITS_PER_PART
@@ -42,17 +40,16 @@ impl CpuSet {
     }
 
     /// Creates a new `CpuSet` with no CPUs in the system.
-    pub fn new_empty() -> Self {
-        Self::with_capacity_val(num_cpus(), 0)
+    pub const fn new_empty() -> Self {
+        Self {
+            bits: [0; NR_PARTS_NO_ALLOC],
+        }
     }
 
     /// Adds a CPU to the set.
     pub fn add(&mut self, cpu_id: CpuId) {
         let part_idx = part_idx(cpu_id);
         let bit_idx = bit_idx(cpu_id);
-        if part_idx >= self.bits.len() {
-            self.bits.resize(part_idx + 1, 0);
-        }
         self.bits[part_idx] |= 1 << bit_idx;
     }
 
@@ -127,9 +124,9 @@ impl CpuSet {
     /// Only for internal use. The set cannot contain non-existent CPUs.
     fn with_capacity_val(num_cpus: usize, val: InnerPart) -> Self {
         let num_parts = parts_for_cpus(num_cpus);
-        let mut bits = SmallVec::with_capacity(num_parts);
-        bits.resize(num_parts, val);
-        Self { bits }
+        Self {
+            bits: core::array::from_fn(|i| if i < num_parts { val } else { 0 }),
+        }
     }
 
     fn clear_nonexistent_cpu_bits(&mut self) {
@@ -155,7 +152,7 @@ impl From<CpuId> for CpuSet {
 /// operation contains multiple CPUs, the ordering is not guaranteed.
 #[derive(Debug)]
 pub struct AtomicCpuSet {
-    bits: SmallVec<[AtomicInnerPart; NR_PARTS_NO_ALLOC]>,
+    bits: [AtomicInnerPart; NR_PARTS_NO_ALLOC],
 }
 
 type AtomicInnerPart = AtomicU64;
@@ -164,8 +161,9 @@ const_assert!(core::mem::size_of::<AtomicInnerPart>() * 8 == BITS_PER_PART);
 impl AtomicCpuSet {
     /// Creates a new `AtomicCpuSet` with an initial value.
     pub fn new(value: CpuSet) -> Self {
-        let bits = value.bits.into_iter().map(AtomicU64::new).collect();
-        Self { bits }
+        Self {
+            bits: core::array::from_fn(|i| AtomicU64::new(value.bits[i])),
+        }
     }
 
     /// Loads the value of the set with the given ordering.
@@ -179,14 +177,10 @@ impl AtomicCpuSet {
     /// is different from the normal atomic operations. When coupled with
     /// [`Ordering::Release`], it actually performs `fetch_or(0, Release)`.
     pub fn load(&self, ordering: Ordering) -> CpuSet {
-        let bits = self
-            .bits
-            .iter()
-            .map(|part| match ordering {
-                Ordering::Release => part.fetch_or(0, ordering),
-                _ => part.load(ordering),
-            })
-            .collect();
+        let bits = core::array::from_fn(|i| match ordering {
+            Ordering::Release => self.bits[i].fetch_or(0, ordering),
+            _ => self.bits[i].load(ordering),
+        });
         CpuSet { bits }
     }
 
