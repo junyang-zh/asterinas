@@ -2,6 +2,9 @@
 
 //! TLB flush operations.
 
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+pub(crate) mod latr;
+
 use alloc::vec::Vec;
 use core::{
     cell::RefCell,
@@ -71,6 +74,25 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
             .push(op, Some(drop_after_flush));
     }
 
+    /// Do an LATR operation.
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    pub fn latr_with(&self, op: TlbFlushOp, drop_after_flush: Frame<dyn AnyFrameMeta>) {
+        match latr::add_lazy_frame(
+            &self
+                .target_cpus
+                .map(|s| s.load())
+                .unwrap_or_else(CpuSet::new_full),
+            op.clone(),
+            drop_after_flush,
+        ) {
+            Ok(()) => {}
+            Err(frame) => {
+                // If we cannot add the frame to the lazy TLB flush, fallback.
+                self.issue_tlb_flush_with(op, frame);
+            }
+        }
+    }
+
     /// Dispatches all the pending TLB flush requests.
     ///
     /// All previous pending requests issued by [`Self::issue_tlb_flush`] or
@@ -114,6 +136,9 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
 
         crate::smp::inter_processor_call(&target_cpus, do_remote_flush);
 
+        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+        latr::flush_local_gather(&irq_guard);
+
         // Flush ourselves after sending all IPIs to save some time.
         if need_flush_on_self {
             local_flush_ops.flush_all();
@@ -150,6 +175,16 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
         }
 
         self.have_unsynced_flush = CpuSet::new_empty();
+    }
+}
+
+impl<G: PinCurrentCpu> Drop for TlbFlusher<'_, G> {
+    fn drop(&mut self) {
+        let irq_guard = crate::trap::disable_local();
+        let local_flush_ops = LOCAL_FLUSH_OPS.get_with(&irq_guard);
+        local_flush_ops.borrow_mut().flush_all();
+        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+        latr::flush_local_gather(&irq_guard);
     }
 }
 
