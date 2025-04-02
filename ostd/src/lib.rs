@@ -116,6 +116,9 @@ unsafe fn init() {
 
     mm::dma::init();
 
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    mm::tlb::latr::init_bsp();
+
     // SAFETY: This function is called only once here, after heap and frame
     // allocators are initialized, on the BSP.
     unsafe { arch::init_on_bsp_after_heap() };

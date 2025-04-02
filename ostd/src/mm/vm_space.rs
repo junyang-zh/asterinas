@@ -311,9 +311,12 @@ impl<'a> CursorMut<'a> {
                 let VmItem::Frame(old_frame, _) = item else {
                     return;
                 };
+                #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
                 self.flusher
                     .issue_tlb_flush_with(TlbFlushOp::for_single(start_va), old_frame.into());
-                self.flusher.dispatch_tlb_flush();
+                #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+                self.flusher
+                    .latr_with(TlbFlushOp::for_single(va), old_frame.into());
             }
             PageTableFrag::StrayPageTable {
                 pt,
@@ -321,8 +324,12 @@ impl<'a> CursorMut<'a> {
                 len,
                 num_frames: _,
             } => {
+                #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
                 self.flusher
                     .issue_tlb_flush_with(TlbFlushOp::for_range(va..va + len), pt);
+                #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+                self.flusher
+                    .latr_with(TlbFlushOp::for_range(va..va + len), pt);
             }
         }
     }
@@ -361,8 +368,12 @@ impl<'a> CursorMut<'a> {
                         continue;
                     };
                     num_unmapped += 1;
+                    #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
                     self.flusher
                         .issue_tlb_flush_with(TlbFlushOp::for_single(va), frame.into());
+                    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+                    self.flusher
+                        .latr_with(TlbFlushOp::for_single(va), frame.into());
                 }
                 PageTableFrag::StrayPageTable {
                     pt,
@@ -371,12 +382,17 @@ impl<'a> CursorMut<'a> {
                     num_frames,
                 } => {
                     num_unmapped += num_frames;
+                    #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
                     self.flusher
                         .issue_tlb_flush_with(TlbFlushOp::for_range(va..va + len), pt);
+                    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+                    self.flusher
+                        .latr_with(TlbFlushOp::for_range(va..va + len), pt);
                 }
             }
         }
 
+        #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
         self.flusher.dispatch_tlb_flush();
 
         num_unmapped
