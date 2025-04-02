@@ -491,8 +491,13 @@ impl<'a> CursorMut<'a> {
                             let rcu_frame = RcuDrop::new(old_frame);
                             panic_guard.forget();
                             let rcu_frame = Frame::rcu_from_unsized(rcu_frame);
+
+                            #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
                             self.flusher
                                 .issue_tlb_flush_with(TlbFlushOp::for_single(va), rcu_frame);
+                            #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+                            self.flusher
+                                .latr_with(TlbFlushOp::for_single(va), rcu_frame);
                         }
                         VmItem {
                             mapped_item: MappedItem::UntrackedIoMem { .. },
@@ -517,14 +522,19 @@ impl<'a> CursorMut<'a> {
                 } => {
                     num_unmapped += num_frames;
 
-                    self.flusher.issue_tlb_flush_with(
-                        TlbFlushOp::for_range(va..va + len),
-                        Frame::rcu_from_unsized(pt),
-                    );
+                    let pt = Frame::rcu_from_unsized(pt);
+
+                    #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
+                    self.flusher
+                        .issue_tlb_flush_with(TlbFlushOp::for_range(va..va + len), pt);
+                    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+                    self.flusher
+                        .latr_with(TlbFlushOp::for_range(va..va + len), pt);
                 }
             }
         }
 
+        #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
         self.flusher.dispatch_tlb_flush();
 
         num_unmapped

@@ -117,6 +117,9 @@ unsafe fn init() {
     // SAFETY: This function is called only once on the BSP.
     unsafe { arch::late_init_on_bsp() };
 
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    mm::tlb::latr::init_bsp();
+
     #[cfg(target_arch = "x86_64")]
     arch::if_tdx_enabled!({
         arch::serial::init();
