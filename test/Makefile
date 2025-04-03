@@ -34,6 +34,7 @@ INITRAMFS_ALL_DIRS := \
 	$(INITRAMFS)/sbin \
 	$(INITRAMFS)/usr/bin \
 	$(INITRAMFS)/usr/local \
+	$(INITRAMFS)/usr/lib \
 	$(INITRAMFS)/test \
 	$(INITRAMFS)/benchmark \
 	$(INITRAMFS_EMPTY_DIRS)
@@ -79,6 +80,10 @@ $(INITRAMFS)/lib/x86_64-linux-gnu: | $(VDSO_LIB)
 	@cp -L /usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0 $@/libgomp.so.1
 	@# TC malloc
 	@cp -L /lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 $@
+	@# required for python
+	@cp -L /lib/x86_64-linux-gnu/libexpat.so.1 $@
+	@# required for bash
+	@cp -L /lib/x86_64-linux-gnu/libtinfo.so.6 $@
 
 $(VDSO_LIB): | $(VDSO_DIR) $(BINARY_CACHE_DIR)/vdso64.so
 	@# TODO: use a custom compiled vdso.so file in the future.
@@ -103,6 +108,9 @@ $(INITRAMFS)/etc:
 $(INITRAMFS)/bin:
 	@mkdir -p $@
 	@/bin/busybox --install -s $@
+	@cp /bin/python $@
+	@cp /bin/python3 $@
+	@cp /bin/python3.10 $@
 
 $(INITRAMFS)/sbin:
 	@mkdir -p $@
@@ -121,6 +129,18 @@ $(INITRAMFS)/usr/local:
 	@cp -r /usr/local/nginx $@
 	@cp -r /usr/local/redis $@
 	@cp -r /usr/local/memcached $@
+
+$(INITRAMFS)/usr/lib:
+	@mkdir -p $@
+	@cp -r /usr/lib/python3.10 $@
+	@if [ -f "/usr/lib/jvm/java-21-openjdk-amd64/bin/java" ]; then \
+		mkdir -p $@/jvm; \
+		cp -r /usr/lib/jvm/java-21-openjdk-amd64/ $@/jvm; \
+		mkdir -p $(INITRAMFS)/usr/bin; \
+		ln -sf /usr/lib/jvm/java-21-openjdk-amd64/bin/java $(INITRAMFS)/usr/bin/java; \
+		mkdir -p $(INITRAMFS)/etc/java-21-openjdk; \
+		cp -r /etc/java-21-openjdk/* $(INITRAMFS)/etc/java-21-openjdk/; \
+	fi
 
 .PHONY: $(INITRAMFS)/test
 $(INITRAMFS)/test:
@@ -151,7 +171,7 @@ $(INITRAMFS)/benchmark/bin:
 		cp /root/mm-scalability-benchmark/dedup-tc $@/dedup; \
 		mkdir -p $@/vm_scale_bench_data; \
 	fi
-	
+
 # Make necessary directories.
 $(INITRAMFS_EMPTY_DIRS):
 	@mkdir -p $@
