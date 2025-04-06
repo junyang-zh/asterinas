@@ -18,7 +18,7 @@ use aster_rights::Rights;
 use ostd::mm::{
     tlb::TlbFlushOp,
     vm_space::{Status, VmItem, VmSpace},
-    CachePolicy, FrameAllocOptions, PageFlags, PageProperty, MAX_USERSPACE_VADDR,
+    CachePolicy, FrameAllocOptions, PageFlags, PageProperty, UntypedMem, MAX_USERSPACE_VADDR,
 };
 #[cfg(feature = "dist_vmar_alloc")]
 use vm_allocator::PerCpuAllocator;
@@ -34,7 +34,6 @@ use crate::{
     thread::exception::PageFaultInfo,
     vm::{
         perms::VmPerms,
-        util::duplicate_frame,
         vmo::{Vmo, VmoRightsOp},
     },
 };
@@ -220,6 +219,8 @@ impl Vmar_ {
         let is_write_fault = page_fault_info.required_perms.contains(VmPerms::WRITE);
         let is_exec_fault = page_fault_info.required_perms.contains(VmPerms::EXEC);
 
+        let zeroed_frame = FrameAllocOptions::new().alloc_frame()?;
+
         let mut cursor = self
             .vm_space
             .cursor_mut(&(page_aligned_addr..page_aligned_addr + PAGE_SIZE))?;
@@ -256,7 +257,8 @@ impl Vmar_ {
                         if let Ok(frame) = vmo.get_committed_frame(page_offset) {
                             if !marker.is_shared && is_write_fault {
                                 // Write access to private VMO-backed mapping. Performs COW directly.
-                                (duplicate_frame(&frame)?.into(), false)
+                                zeroed_frame.writer().write(&mut frame.reader());
+                                (zeroed_frame.into(), false)
                             } else {
                                 // Operations to shared mapping or read access to private VMO-backed mapping.
                                 // If read access to private VMO-backed mapping triggers a page fault,
@@ -266,7 +268,7 @@ impl Vmar_ {
                             }
                         } else if !marker.is_shared {
                             // The page index is outside the VMO. This is only allowed in private mapping.
-                            (FrameAllocOptions::new().alloc_frame()?.into(), false)
+                            (zeroed_frame.into(), false)
                         } else {
                             return_errno_with_message!(
                                 Errno::EFAULT,
@@ -316,7 +318,7 @@ impl Vmar_ {
 
                     let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
 
-                    cursor.map(FrameAllocOptions::new().alloc_frame()?.into(), map_prop);
+                    cursor.map(zeroed_frame.into(), map_prop);
                 }
             }
             VmItem::Mapped {
@@ -367,10 +369,10 @@ impl Vmar_ {
                     );
                     cursor.flusher().issue_tlb_flush(TlbFlushOp::Address(va));
                 } else {
-                    let new_frame = duplicate_frame(&frame)?;
+                    zeroed_frame.writer().write(&mut frame.reader());
                     prop.flags |= additional_flags;
                     prop.flags -= PageFlags::AVAIL1; // Remove COW flag
-                    cursor.map(new_frame.into(), prop);
+                    cursor.map(zeroed_frame.into(), prop);
                     cursor.flusher().issue_tlb_flush(TlbFlushOp::Address(va));
                 }
                 cursor.flusher().dispatch_tlb_flush();
