@@ -18,6 +18,7 @@ use aster_rights::Rights;
 use ostd::{
     cpu::CpuId,
     mm::{
+        io_util::HasVmReaderWriter,
         tlb::TlbFlushOp,
         vm_space::{largest_pages, CursorMut, Status, VmItem, VmSpace},
         CachePolicy, FrameAllocOptions, PageFlags, PageProperty, MAX_USERSPACE_VADDR,
@@ -38,7 +39,6 @@ use crate::{
     util::per_cpu_counter::PerCpuCounter,
     vm::{
         perms::VmPerms,
-        util::duplicate_frame,
         vmo::{CommitFlags, Vmo, VmoCommitError, VmoRightsOp},
     },
 };
@@ -261,6 +261,7 @@ impl Vmar_ {
         let is_write_fault = page_fault_info.required_perms.contains(VmPerms::WRITE);
         let is_exec_fault = page_fault_info.required_perms.contains(VmPerms::EXEC);
 
+        let zeroed_frame = FrameAllocOptions::new().alloc_frame()?;
         let mut rss_delta = RssDelta::new(self);
 
         'retry: loop {
@@ -300,7 +301,8 @@ impl Vmar_ {
                                 Ok(frame) => {
                                     if !marker.is_shared && is_write_fault {
                                         // Write access to private VMO-backed mapping. Performs COW directly.
-                                        (duplicate_frame(&frame)?.into(), false)
+                                        zeroed_frame.writer().write(&mut frame.reader());
+                                        (zeroed_frame.into(), false)
                                     } else {
                                         // Operations to shared mapping or read access to private VMO-backed mapping.
                                         // If read access to private VMO-backed mapping triggers a page fault,
@@ -318,7 +320,7 @@ impl Vmar_ {
                                 Err(_) => {
                                     if !marker.is_shared {
                                         // The page index is outside the VMO. This is only allowed in private mapping.
-                                        (FrameAllocOptions::new().alloc_frame()?.into(), false)
+                                        (zeroed_frame.into(), false)
                                     } else {
                                         return_errno_with_message!(
                                             Errno::EFAULT,
@@ -374,10 +376,7 @@ impl Vmar_ {
 
                         rss_delta.add(RssType::RSS_ANONPAGES, 1);
 
-                        cursor.map(VmItem::Frame(
-                            FrameAllocOptions::new().alloc_frame()?.into(),
-                            map_prop,
-                        ));
+                        cursor.map(VmItem::Frame(zeroed_frame.into(), map_prop));
                     }
                 }
                 (va, Some(VmItem::Frame(frame, mut prop))) => {
@@ -427,10 +426,10 @@ impl Vmar_ {
                         );
                         cursor.flusher().issue_tlb_flush(TlbFlushOp::for_range(va));
                     } else {
-                        let new_frame = duplicate_frame(&frame)?;
+                        zeroed_frame.writer().write(&mut frame.reader());
                         prop.flags |= additional_flags;
                         prop.flags -= PageFlags::AVAIL1; // Remove COW flag
-                        cursor.map(VmItem::Frame(new_frame.into(), prop));
+                        cursor.map(VmItem::Frame(zeroed_frame.into(), prop));
                         cursor.flusher().issue_tlb_flush(TlbFlushOp::for_range(va));
                     }
                     cursor.flusher().dispatch_tlb_flush();
