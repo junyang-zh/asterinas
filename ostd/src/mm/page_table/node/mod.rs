@@ -38,6 +38,7 @@ use crate::{
         frame::{meta::AnyFrameMeta, Frame},
         paddr_to_vaddr,
         page_table::{load_pte, store_pte},
+        vm_space::Status,
         FrameAllocOptions, Infallible, Paddr, PagingConstsTrait, PagingLevel, VmReader,
     },
     sync::spin,
@@ -168,6 +169,25 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
             .expect("Failed to allocate a page table node");
         // The allocated frame is zeroed. Make sure zero is absent PTE.
         debug_assert!(E::new_absent().as_bytes().iter().all(|&b| b == 0));
+
+        Self { frame: Some(frame) }
+    }
+
+    pub(super) fn alloc_marked(level: PagingLevel, status: Status) -> Self {
+        let mut meta = PageTablePageMeta::new_locked(level, MapTrackingStatus::Tracked);
+        *meta.nr_children.get_mut() = nr_subpage_per_huge::<C>() as u16;
+        let frame = FrameAllocOptions::new()
+            .zeroed(false)
+            .alloc_frame_with(meta)
+            .expect("Failed to allocate a page table node");
+        let frame_ptr = paddr_to_vaddr(frame.start_paddr()) as *mut E;
+        let pte = E::new_status(status);
+        // Fill it with status.
+        for i in 0..nr_subpage_per_huge::<C>() {
+            unsafe {
+                frame_ptr.add(i).write(pte);
+            };
+        }
 
         Self { frame: Some(frame) }
     }
