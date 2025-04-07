@@ -149,6 +149,11 @@ impl PageTableEntryTrait for PageTableEntry {
         ppn << 12
     }
 
+    fn set_paddr(&mut self, paddr: Paddr) {
+        let ppn = paddr >> 12;
+        self.0 = (self.0 & !Self::PHYS_ADDR_MASK) | (ppn << 10);
+    }
+
     fn prop(&self) -> PageProperty {
         let flags = (parse_flags!(self.0, PageTableFlags::READABLE, PageFlags::R))
             | (parse_flags!(self.0, PageTableFlags::WRITABLE, PageFlags::W))
@@ -167,6 +172,7 @@ impl PageTableEntryTrait for PageTableEntry {
         };
 
         PageProperty {
+            has_map: self.is_present(),
             flags: PageFlags::from_bits(flags as u8).unwrap(),
             cache,
             priv_flags: PrivFlags::from_bits(priv_flags as u8).unwrap(),
@@ -175,8 +181,11 @@ impl PageTableEntryTrait for PageTableEntry {
 
     #[expect(clippy::precedence)]
     fn set_prop(&mut self, prop: PageProperty) {
-        let mut flags = PageTableFlags::VALID.bits()
-            | parse_flags!(prop.flags.bits(), PageFlags::R, PageTableFlags::READABLE)
+        let mut flags = if prop.has_map {
+            PageTableFlags::VALID.bits()
+        } else {
+            PageTableFlags::empty().bits()
+        } | parse_flags!(prop.flags.bits(), PageFlags::R, PageTableFlags::READABLE)
             | parse_flags!(prop.flags.bits(), PageFlags::W, PageTableFlags::WRITABLE)
             | parse_flags!(prop.flags.bits(), PageFlags::X, PageTableFlags::EXECUTABLE)
             | parse_flags!(
