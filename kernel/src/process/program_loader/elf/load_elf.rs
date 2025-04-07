@@ -52,7 +52,13 @@ pub fn load_elf_to_vm(
             not(any(target_arch = "x86_64", target_arch = "riscv64")),
             expect(unused_mut)
         )]
-        Ok((_range, entry_point, mut aux_vec)) => {
+        Ok((range, ldso_info, entry_point, mut aux_vec)) => {
+            let mut program_break = range.relocated_range().end;
+            if let Some(ref ldso_info) = ldso_info {
+                program_break = program_break.max(ldso_info.range.relocated_range().end);
+            }
+            process_vm.init_heap_and_map_clearance(program_break)?;
+
             // Map the vDSO and set the entry.
             // Since the vDSO does not require being mapped to any specific address,
             // the vDSO is mapped after the ELF file, heap, and stack.
@@ -145,7 +151,7 @@ fn init_and_map_vmos(
     ldso: Option<(Path, ElfHeaders)>,
     parsed_elf: &ElfHeaders,
     elf_file: &Path,
-) -> Result<(RelocatedRange, Vaddr, AuxVec)> {
+) -> Result<(RelocatedRange, Option<LdsoLoadInfo>, Vaddr, AuxVec)> {
     let process_vmar = process_vm.lock_root_vmar();
     let root_vmar = process_vmar.unwrap();
 
@@ -165,7 +171,7 @@ fn init_and_map_vmos(
         init_aux_vec(parsed_elf, elf_map_range.relocated_start, ldso_base)?
     };
 
-    let entry_point = if let Some(ldso_load_info) = ldso_load_info {
+    let entry_point = if let Some(ref ldso_load_info) = ldso_load_info {
         // Normal shared object
         ldso_load_info.entry_point
     } else {
@@ -177,7 +183,7 @@ fn init_and_map_vmos(
             ))?
     };
 
-    Ok((elf_map_range, entry_point, aux_vec))
+    Ok((elf_map_range, ldso_load_info, entry_point, aux_vec))
 }
 
 pub struct LdsoLoadInfo {
@@ -274,6 +280,17 @@ impl RelocatedRange {
             original_range,
             relocated_start,
         })
+    }
+
+    /// Gets the original range.
+    #[expect(dead_code)]
+    pub fn original_range(&self) -> Range<Vaddr> {
+        self.original_range.clone()
+    }
+
+    /// Gets the relocated range.
+    pub fn relocated_range(&self) -> Range<Vaddr> {
+        self.relocated_start..self.relocated_start + self.original_range.len()
     }
 
     /// Gets the relocated address of an address in the original range.

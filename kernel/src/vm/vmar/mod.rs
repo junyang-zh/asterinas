@@ -329,7 +329,9 @@ impl VmarInner {
             .vm_mappings
             .iter()
             .next_back()
-            .map_or(ROOT_VMAR_LOWEST_ADDR, |vm_mapping| vm_mapping.range().end);
+            .map_or(ROOT_VMAR_LOWEST_ADDR << 8, |vm_mapping| {
+                vm_mapping.range().end
+            });
         // FIXME: The up-align may overflow.
         let last_occupied_aligned = highest_occupied.align_up(align);
         if let Some(last) = last_occupied_aligned.checked_add(size) {
@@ -415,8 +417,10 @@ impl VmarInner {
     }
 }
 
-pub const ROOT_VMAR_LOWEST_ADDR: Vaddr = 0x001_0000; // 64 KiB is the Linux configurable default
-const ROOT_VMAR_CAP_ADDR: Vaddr = MAX_USERSPACE_VADDR;
+/// 64 KiB is the Linux configurable default
+pub const ROOT_VMAR_LOWEST_ADDR: Vaddr = 0x001_0000;
+
+pub const ROOT_VMAR_CAP_ADDR: Vaddr = MAX_USERSPACE_VADDR;
 
 /// Returns whether the input `vaddr` is a legal user space virtual address.
 pub fn is_userspace_vaddr(vaddr: Vaddr) -> bool {
