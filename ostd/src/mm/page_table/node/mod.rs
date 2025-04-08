@@ -28,7 +28,12 @@
 mod child;
 mod entry;
 
-use core::{cell::SyncUnsafeCell, marker::PhantomData, mem::ManuallyDrop, sync::atomic::Ordering};
+mod mcs;
+
+use alloc::boxed::Box;
+use core::{
+    cell::SyncUnsafeCell, marker::PhantomData, mem::ManuallyDrop, pin::Pin, sync::atomic::Ordering,
+};
 
 pub(in crate::mm) use self::{child::Child, entry::Entry};
 use super::{nr_subpage_per_huge, PageTableEntryTrait};
@@ -41,7 +46,6 @@ use crate::{
         vm_space::Status,
         FrameAllocOptions, Infallible, Paddr, PagingConstsTrait, PagingLevel, VmReader,
     },
-    sync::spin,
 };
 
 /// A smart pointer to a page table node.
@@ -56,6 +60,44 @@ use crate::{
 pub(super) type PageTableNode<E, C> = Frame<PageTablePageMeta<E, C>>;
 
 impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableNode<E, C> {
+    /// Allocates a new empty page table node.
+    ///
+    /// This function returns a locked owning guard.
+    pub(super) fn alloc(level: PagingLevel, is_tracked: MapTrackingStatus) -> Self {
+        let meta = PageTablePageMeta::new(level, is_tracked);
+
+        let frame = FrameAllocOptions::new()
+            .zeroed(true)
+            .alloc_frame_with(meta)
+            .expect("Failed to allocate a page table node");
+
+        // The allocated frame is zeroed. Make sure zero is absent PTE.
+        debug_assert!(E::new_absent().as_bytes().iter().all(|&b| b == 0));
+
+        frame
+    }
+
+    pub(super) fn alloc_marked(level: PagingLevel, status: Status) -> Self {
+        let mut meta = PageTablePageMeta::new(level, MapTrackingStatus::Tracked);
+        *meta.nr_children.get_mut() = nr_subpage_per_huge::<C>() as u16;
+
+        let frame = FrameAllocOptions::new()
+            .zeroed(false)
+            .alloc_frame_with(meta)
+            .expect("Failed to allocate a page table node");
+
+        // Fill it with status.
+        let frame_ptr = paddr_to_vaddr(frame.start_paddr()) as *mut E;
+        let pte = E::new_status(status);
+        for i in 0..nr_subpage_per_huge::<C>() {
+            unsafe {
+                frame_ptr.add(i).write(pte);
+            };
+        }
+
+        frame
+    }
+
     pub(super) fn level(&self) -> PagingLevel {
         self.meta().level
     }
@@ -66,7 +108,16 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableNode<E, C> {
     /// that preemption is disabled while the lock is held, or if the page is
     /// not shared with other CPUs.
     pub(super) fn lock(self) -> PageTableLock<E, C> {
-        unsafe { self.meta().lock.lock() }
+        let node = Box::pin(mcs::Node::new());
+
+        // SAFETY: The node is new. Preemption is disabled.
+        unsafe { node.as_ref().lock(&self.meta().lock) };
+
+        // SAFETY: Lock is held. So it is exclusive.
+        unsafe {
+            self.meta().node.get().write(Some(node));
+        }
+
         PageTableLock::<E, C> { frame: Some(self) }
     }
 
@@ -158,48 +209,16 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTableLock<E, C> {
         self.meta().is_tracked
     }
 
-    /// Allocates a new empty page table node.
-    ///
-    /// This function returns a locked owning guard.
-    pub(super) fn alloc(level: PagingLevel, is_tracked: MapTrackingStatus) -> Self {
-        let meta = PageTablePageMeta::new_locked(level, is_tracked);
-        let frame = FrameAllocOptions::new()
-            .zeroed(true)
-            .alloc_frame_with(meta)
-            .expect("Failed to allocate a page table node");
-        // The allocated frame is zeroed. Make sure zero is absent PTE.
-        debug_assert!(E::new_absent().as_bytes().iter().all(|&b| b == 0));
-
-        Self { frame: Some(frame) }
-    }
-
-    pub(super) fn alloc_marked(level: PagingLevel, status: Status) -> Self {
-        let mut meta = PageTablePageMeta::new_locked(level, MapTrackingStatus::Tracked);
-        *meta.nr_children.get_mut() = nr_subpage_per_huge::<C>() as u16;
-        let frame = FrameAllocOptions::new()
-            .zeroed(false)
-            .alloc_frame_with(meta)
-            .expect("Failed to allocate a page table node");
-        let frame_ptr = paddr_to_vaddr(frame.start_paddr()) as *mut E;
-        let pte = E::new_status(status);
-        // Fill it with status.
-        for i in 0..nr_subpage_per_huge::<C>() {
-            unsafe {
-                frame_ptr.add(i).write(pte);
-            };
-        }
-
-        Self { frame: Some(frame) }
-    }
-
     /// Unlocks the page table node.
     pub(super) fn unlock(mut self) -> PageTableNode<E, C> {
+        // SAFETY: Lock is held. So it is exclusive.
+        let node = unsafe { self.meta().node.get().replace(None) }.unwrap();
+
         // Release the lock.
         // SAFETY:
         //  - The lock stays at the metadata slot so it's pinned.
-        //  - The constructor of the node guard ensures that the lock is held,
-        //    and no preemption is allowed.
-        unsafe { self.meta().lock.unlock() };
+        //  - The acquire method ensures that the node matches the lock.
+        unsafe { node.as_ref().unlock(&self.meta().lock) };
 
         self.frame.take().unwrap()
     }
@@ -303,8 +322,6 @@ pub(in crate::mm) struct PageTablePageMeta<
     E: PageTableEntryTrait = PageTableEntry,
     C: PagingConstsTrait = PagingConsts,
 > {
-    /// The lock for the page table page.
-    pub lock: spin::queued::LockBody,
     /// The number of valid PTEs. It is mutable if the lock is held.
     pub nr_children: SyncUnsafeCell<u16>,
     /// If the page table is detached from its parent.
@@ -318,6 +335,10 @@ pub(in crate::mm) struct PageTablePageMeta<
     pub level: PagingLevel,
     /// Whether the pages mapped by the node is tracked.
     pub is_tracked: MapTrackingStatus,
+    /// The MCS lock.
+    lock: mcs::LockBody,
+    /// The MCS node holding the lock.
+    node: SyncUnsafeCell<Option<Pin<Box<mcs::Node>>>>,
     _phantom: core::marker::PhantomData<(E, C)>,
 }
 
@@ -338,13 +359,14 @@ pub(in crate::mm) enum MapTrackingStatus {
 }
 
 impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTablePageMeta<E, C> {
-    pub fn new_locked(level: PagingLevel, is_tracked: MapTrackingStatus) -> Self {
+    pub fn new(level: PagingLevel, is_tracked: MapTrackingStatus) -> Self {
         Self {
             nr_children: SyncUnsafeCell::new(0),
             astray: SyncUnsafeCell::new(false),
             level,
-            lock: spin::queued::LockBody::new_locked(),
             is_tracked,
+            lock: mcs::LockBody::new(),
+            node: SyncUnsafeCell::new(None),
             _phantom: PhantomData,
         }
     }
