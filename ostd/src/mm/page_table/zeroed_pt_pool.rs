@@ -60,7 +60,7 @@ pub(super) fn alloc<E: PageTableEntryTrait, C: PagingConstsTrait>(
     let size = pool_size.load(Ordering::Relaxed);
 
     if size == 0 {
-        return PageTableLock::alloc(level, is_tracked);
+        return PageTableNode::alloc(level, is_tracked).lock();
     }
 
     let irq_guard = crate::trap::disable_local();
@@ -70,9 +70,9 @@ pub(super) fn alloc<E: PageTableEntryTrait, C: PagingConstsTrait>(
     pool_size.store(size - 1, Ordering::Relaxed);
 
     let frame: PageTableNode<E, C> = frame
-        .repurpose(PageTablePageMeta::<E, C>::new_locked(level, is_tracked))
+        .repurpose(PageTablePageMeta::<E, C>::new(level, is_tracked))
         .into();
 
     // SAFETY: The metadata must match the locked frame.
-    unsafe { PageTableLock::from_raw_paddr(frame.into_raw()) }
+    frame.lock()
 }

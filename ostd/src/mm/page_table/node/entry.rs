@@ -187,14 +187,13 @@ impl<'a, E: PageTableEntryTrait, C: PagingConstsTrait> Entry<'a, E, C> {
         // SAFETY: The physical address was written as a valid status.
         let status = unsafe { Status::from_raw_inner(self.pte.paddr()) };
 
-        let new_page = PageTableLock::<E, C>::alloc_marked(level - 1, status);
+        let new_page = PageTableNode::<E, C>::alloc_marked(level - 1, status).lock();
 
-        let pt_paddr = new_page.into_raw_paddr();
         let _ = self.replace(Child::PageTable(unsafe {
-            PageTableNode::from_raw(pt_paddr)
+            PageTableNode::from_raw(new_page.paddr())
         }));
 
-        Some(unsafe { PageTableLock::from_raw_paddr(pt_paddr) })
+        Some(new_page)
     }
 
     /// Create a new entry at the node.
