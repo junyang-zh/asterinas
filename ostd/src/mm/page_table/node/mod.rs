@@ -26,9 +26,13 @@
 //!
 
 mod entry;
+mod mcs;
 mod pte_state;
 
-use core::{cell::SyncUnsafeCell, marker::PhantomData, ops::Deref, sync::atomic::Ordering};
+use alloc::boxed::Box;
+use core::{
+    cell::SyncUnsafeCell, marker::PhantomData, ops::Deref, pin::Pin, sync::atomic::Ordering,
+};
 
 pub(in crate::mm) use self::{
     entry::Entry,
@@ -42,7 +46,6 @@ use crate::{
         paddr_to_vaddr,
         page_table::{PteScalar, load_pte, store_pte, zeroed_pt_pool},
     },
-    sync::spin::queued,
     task::atomic_mode::InAtomicMode,
 };
 
@@ -131,7 +134,17 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     where
         'a: 'rcu,
     {
-        self.meta().lock.lock(guard);
+        let _ = guard;
+
+        let node = Box::pin(mcs::Node::new());
+
+        // SAFETY: The node is new.
+        unsafe { node.as_ref().lock(&self.meta().lock) };
+
+        // SAFETY: Lock is held. So it is exclusive.
+        unsafe {
+            self.meta().node.get().write(Some(node));
+        }
 
         PageTableGuard::<'rcu, C> { inner: self }
     }
@@ -242,8 +255,14 @@ impl<'rcu, C: PageTableConfig> Deref for PageTableGuard<'rcu, C> {
 
 impl<C: PageTableConfig> Drop for PageTableGuard<'_, C> {
     fn drop(&mut self) {
-        // SAFETY: The guard ensures that the lock is held.
-        unsafe { self.inner.meta().lock.unlock() };
+        // SAFETY: Lock is held. So it is exclusive.
+        let node = unsafe { self.meta().node.get().replace(None) }.unwrap();
+
+        // Release the lock.
+        // SAFETY:
+        //  - The lock stays at the metadata slot so it's pinned.
+        //  - The acquire method ensures that the node matches the lock.
+        unsafe { node.as_ref().unlock(&self.meta().lock) };
     }
 }
 
@@ -263,7 +282,8 @@ pub(crate) struct PageTablePageMeta<C: PageTableConfig> {
     /// referenced by page tables of different levels.
     level: PagingLevel,
     /// The lock for the page table page.
-    lock: queued::LockBody,
+    lock: mcs::LockBody,
+    node: SyncUnsafeCell<Option<Pin<Box<mcs::Node>>>>,
     _phantom: PhantomData<C>,
 }
 
@@ -273,7 +293,8 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
             nr_children: SyncUnsafeCell::new(0),
             stray: SyncUnsafeCell::new(false),
             level,
-            lock: queued::LockBody::new(),
+            lock: mcs::LockBody::new(),
+            node: SyncUnsafeCell::new(None),
             _phantom: PhantomData,
         }
     }
