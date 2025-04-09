@@ -18,6 +18,10 @@ BENCH_OUTPUT_FILE="$CORTEN_OUTPUT_DIR/macrometis_${SYS_NAME}_$(date +%Y%m%d_%H%M
 
 THREAD_COUNTS=(1 2 4 8 16 32 64 128 192 256 320 384)
 for THREAD_COUNT in "${THREAD_COUNTS[@]}"; do
-    export NR_CPUS=$THREAD_COUNT
+    if [ $THREAD_COUNT -gt 192 ]; then
+        export NR_CPUS=384
+    else
+        export NR_CPUS=$THREAD_COUNT
+    fi
     $BENCH_SCRIPT $SYS_NAME $BENCH_OUTPUT_FILE "/test/corten_benchmetis.sh $THREAD_COUNT"
 done

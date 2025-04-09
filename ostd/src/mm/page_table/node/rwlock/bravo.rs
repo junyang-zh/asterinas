@@ -4,13 +4,14 @@
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use super::simp::SimpRwLock;
+use super::pfq::PfqRwLock;
 use crate::cpu::current_cpu_racy;
 
 #[derive(Debug)]
-pub struct BravoSimpRwLock {
-    underlying: SimpRwLock,
+#[repr(C)]
+pub struct BravoPfqRwLock {
     inhibit_until_and_rbias: AtomicU32,
+    underlying: PfqRwLock,
 }
 
 #[derive(Debug)]
@@ -19,15 +20,15 @@ pub struct BravoReadGuard {
 }
 
 const BRAVO_HASH_TABLE_SIZE: usize = 1021;
-static VISIBLE_READERS: [AtomicPtr<BravoSimpRwLock>; BRAVO_HASH_TABLE_SIZE] =
+static VISIBLE_READERS: [AtomicPtr<BravoPfqRwLock>; BRAVO_HASH_TABLE_SIZE] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; BRAVO_HASH_TABLE_SIZE];
 
-impl BravoSimpRwLock {
+impl BravoPfqRwLock {
     const INHIBIT_MULTIPLIER: u32 = 9;
 
     pub const fn new() -> Self {
         Self {
-            underlying: SimpRwLock::new(),
+            underlying: PfqRwLock::new(),
             inhibit_until_and_rbias: AtomicU32::new(0),
         }
     }

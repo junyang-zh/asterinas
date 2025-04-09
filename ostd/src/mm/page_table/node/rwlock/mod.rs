@@ -3,4 +3,4 @@
 //! BRAVO readers-writer lock.
 
 pub mod bravo;
-pub mod simp;
+pub mod pfq;

@@ -399,19 +399,20 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> DerefMut for PageTableImplici
 /// The metadata of any kinds of page table pages.
 /// Make sure the the generic parameters don't effect the memory layout.
 #[derive(Debug)]
+#[repr(C)]
 pub(in crate::mm) struct PageTablePageMeta<
     E: PageTableEntryTrait = PageTableEntry,
     C: PagingConstsTrait = PagingConsts,
 > {
     /// The readers-writer lock for the page table page.
-    lock: rwlock::bravo::BravoSimpRwLock,
-    /// The number of valid PTEs. It is mutable if the lock is held.
-    pub nr_children: SyncUnsafeCell<u16>,
+    lock: rwlock::bravo::BravoPfqRwLock,
     /// The level of the page table page. A page table page cannot be
     /// referenced by page tables of different levels.
     pub level: PagingLevel,
     /// Whether the pages mapped by the node is tracked.
     pub is_tracked: MapTrackingStatus,
+    /// The number of valid PTEs. It is mutable if the lock is held.
+    pub nr_children: SyncUnsafeCell<u16>,
     _phantom: core::marker::PhantomData<(E, C)>,
 }
 
@@ -436,7 +437,7 @@ impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTablePageMeta<E, C> {
         Self {
             nr_children: SyncUnsafeCell::new(0),
             level,
-            lock: rwlock::bravo::BravoSimpRwLock::new(),
+            lock: rwlock::bravo::BravoPfqRwLock::new(),
             is_tracked,
             _phantom: PhantomData,
         }
