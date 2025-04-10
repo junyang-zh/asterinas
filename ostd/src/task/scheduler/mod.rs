@@ -240,6 +240,13 @@ fn reschedule<F>(mut f: F)
 where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
+    let preempt_count = super::preempt::cpu_local::get_guard_count();
+    let is_local_irq_enabled = crate::arch::irq::is_local_enabled();
+    if preempt_count > 0 || !is_local_irq_enabled {
+        core::hint::spin_loop();
+        return;
+    }
+
     let next_task = loop {
         let mut action = ReschedAction::DoNothing;
         SCHEDULER.get().unwrap().local_mut_rq_with(&mut |rq| {
