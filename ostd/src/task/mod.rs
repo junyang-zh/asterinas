@@ -15,7 +15,7 @@ use core::{
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, AtomicU32},
 };
 
 use kernel_stack::KernelStack;
@@ -35,7 +35,7 @@ use crate::{
 
 static PRE_SCHEDULE_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
-static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
+static POST_SCHEDULE_HANDLER: Once<fn() -> bool> = Once::new();
 
 static PRE_USER_RUN_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
@@ -45,7 +45,7 @@ pub fn inject_pre_schedule_handler(handler: fn(&DisabledLocalIrqGuard)) {
 }
 
 /// Injects a handler to be executed after scheduling.
-pub fn inject_post_schedule_handler(handler: fn()) {
+pub fn inject_post_schedule_handler(handler: fn() -> bool) {
     POST_SCHEDULE_HANDLER.call_once(|| handler);
 }
 
@@ -86,6 +86,10 @@ pub struct Task {
     /// This is to enforce not context switching to an already running task.
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
+
+    /// To check if we migrates.
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    prev_cpu: AtomicU32,
 
     schedule_info: TaskScheduleInfo,
 }
@@ -241,6 +245,8 @@ impl TaskOptions {
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
+            #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+            prev_cpu: AtomicU32::new(u32::MAX),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },
