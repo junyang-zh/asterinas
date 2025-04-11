@@ -122,7 +122,14 @@ fn ap_init() {
         );
 
         loop {
+            crate::thread::Thread::yield_now();
+            #[cfg(feature = "breakdown_counters")]
+            crate::fs::procfs::breakdown_counters::idle_start();
+
             ostd::task::halt_cpu();
+
+            #[cfg(feature = "breakdown_counters")]
+            crate::fs::procfs::breakdown_counters::idle_end();
         }
     }
 
@@ -162,7 +169,14 @@ fn init_thread() {
 
     // Wait till initproc become zombie.
     while !initproc.status().is_zombie() {
+        crate::thread::Thread::yield_now();
+        #[cfg(feature = "breakdown_counters")]
+        crate::fs::procfs::breakdown_counters::idle_start();
+
         ostd::task::halt_cpu();
+
+        #[cfg(feature = "breakdown_counters")]
+        crate::fs::procfs::breakdown_counters::idle_end();
     }
 
     // TODO: exit via qemu isa debug device should not be the only way.
