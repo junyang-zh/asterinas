@@ -72,7 +72,14 @@ pub fn create_new_user_task(
         };
 
         loop {
+            #[cfg(feature = "breakdown_counters")]
+            crate::fs::procfs::breakdown_counters::user_start();
+
             let return_reason = user_mode.execute(has_kernel_event_fn);
+
+            #[cfg(feature = "breakdown_counters")]
+            crate::fs::procfs::breakdown_counters::user_end();
+
             let user_ctx = user_mode.context_mut();
             let mut syscall_number = None;
             // handle user event:

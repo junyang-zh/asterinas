@@ -4,6 +4,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use filesystems::{FileSystemType, FILESYSTEM_TYPES};
 
+#[cfg(feature = "breakdown_counters")]
+use self::breakdown_counters::BreakdownCountersFileOps;
 use self::{
     cpuinfo::CpuInfoFileOps,
     loadavg::LoadAvgFileOps,
@@ -27,6 +29,8 @@ use crate::{
     },
 };
 
+#[cfg(feature = "breakdown_counters")]
+pub mod breakdown_counters;
 mod cpuinfo;
 mod filesystems;
 mod loadavg;
@@ -121,6 +125,11 @@ impl Observer<PidEvent> for ProcDir<RootDirOps> {
 
 impl DirOps for RootDirOps {
     fn lookup_child(&self, this_ptr: Weak<dyn Inode>, name: &str) -> Result<Arc<dyn Inode>> {
+        #[cfg(feature = "breakdown_counters")]
+        if name == "breakdown-counters" {
+            return Ok(BreakdownCountersFileOps::new_inode(this_ptr.clone()));
+        }
+
         let child = if name == "self" {
             SelfSymOps::new_inode(this_ptr.clone())
         } else if name == "sys" {
@@ -151,6 +160,12 @@ impl DirOps for RootDirOps {
             this.downcast_ref::<ProcDir<RootDirOps>>().unwrap().this()
         };
         let mut cached_children = this.cached_children().write();
+
+        #[cfg(feature = "breakdown_counters")]
+        cached_children.put_entry_if_not_found("breakdown-counters", || {
+            BreakdownCountersFileOps::new_inode(this_ptr.clone())
+        });
+
         cached_children.put_entry_if_not_found("self", || SelfSymOps::new_inode(this_ptr.clone()));
         cached_children.put_entry_if_not_found("thread-self", || {
             ThreadSelfSymOps::new_inode(this_ptr.clone())
