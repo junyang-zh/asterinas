@@ -38,6 +38,7 @@ mod template;
 mod thread_self;
 
 pub(super) fn init() {
+    cpuinfo::init();
     FILESYSTEM_TYPES.call_once(|| {
         vec![
             FileSystemType::new("proc", true),
