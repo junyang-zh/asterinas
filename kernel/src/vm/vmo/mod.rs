@@ -377,7 +377,10 @@ impl Vmo_ {
 
     /// Returns the size of current VMO.
     pub fn size(&self) -> usize {
-        self.pages.with(|_, size| size)
+        match &self.pages {
+            Pages::Nonresizable(_, size) => *size,
+            Pages::Resizable(pages) => pages.lock().1,
+        }
     }
 
     /// Resizes current VMO to target size.

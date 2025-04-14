@@ -37,7 +37,6 @@ pub(super) struct VmoBackedVMA {
     pub(super) vmo: MappedVmo,
     /// Whether the mapping needs to handle surrounding pages when handling
     /// page fault.
-    #[allow(dead_code)]
     pub(super) handle_page_faults_around: bool,
 }
 
@@ -142,11 +141,14 @@ impl MappedVmo {
         self.vmo.commit_page(self.range.start + page_offset)
     }
 
+    pub(super) fn inner_vmo_end(&self) -> usize {
+        core::cmp::min(self.vmo.size() - self.range.start, self.range.len())
+    }
+
     /// Traverses the indices within a specified range of a VMO sequentially.
     ///
     /// For each index position, you have the option to commit the page as well as
     /// perform other operations.
-    #[allow(dead_code)]
     pub(super) fn operate_on_range<F>(&self, range: &Range<usize>, operate: F) -> Result<()>
     where
         F: FnMut(&mut dyn FnMut() -> Result<UFrame>) -> Result<()>,

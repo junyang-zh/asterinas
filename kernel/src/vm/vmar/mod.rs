@@ -8,6 +8,7 @@ mod vm_allocator;
 pub mod vm_mapping;
 
 use core::{
+    cmp::min,
     num::NonZeroUsize,
     ops::Range,
     sync::atomic::{AtomicU32, Ordering},
@@ -17,8 +18,9 @@ use align_ext::AlignExt;
 use aster_rights::Rights;
 use ostd::mm::{
     tlb::TlbFlushOp,
-    vm_space::{Status, VmItem, VmSpace},
-    CachePolicy, FrameAllocOptions, PageFlags, PageProperty, UntypedMem, MAX_USERSPACE_VADDR,
+    vm_space::{CursorMut, Status, VmItem, VmSpace},
+    CachePolicy, Frame, FrameAllocOptions, PageFlags, PageProperty, UFrame, UntypedMem,
+    MAX_USERSPACE_VADDR,
 };
 #[cfg(feature = "dist_vmar_alloc")]
 use vm_allocator::PerCpuAllocator;
@@ -219,11 +221,14 @@ impl Vmar_ {
         let is_write_fault = page_fault_info.required_perms.contains(VmPerms::WRITE);
         let is_exec_fault = page_fault_info.required_perms.contains(VmPerms::EXEC);
 
-        let zeroed_frame = FrameAllocOptions::new().alloc_frame()?;
+        let mut zeroed_frame = Some(alloc_frame(true)?);
 
-        let mut cursor = self
-            .vm_space
-            .cursor_mut(&(page_aligned_addr..page_aligned_addr + PAGE_SIZE))?;
+        let locked_2m_range = {
+            let locked_2m_start = page_aligned_addr.align_down(PAGE_SIZE * 512);
+            locked_2m_start..min(locked_2m_start + PAGE_SIZE * 512, MAX_USERSPACE_VADDR)
+        };
+        let mut cursor = self.vm_space.cursor_mut(&locked_2m_range).unwrap();
+        cursor.jump(page_aligned_addr).unwrap();
 
         match cursor.query().unwrap() {
             VmItem::Marked {
@@ -242,60 +247,13 @@ impl Vmar_ {
                     return_errno_with_message!(Errno::EACCES, "perm check fails");
                 }
 
-                if let Some(vmo_backed_id) = marker.vmo_backed_id {
-                    // On-demand VMO-backed mapping.
-                    //
-                    // It includes file-backed mapping and shared anonymous mapping.
-
-                    let id_map = self.vma_map.read();
-                    let vmo_backed_vma = id_map.get(&vmo_backed_id).unwrap();
-                    let vmo = &vmo_backed_vma.vmo;
-
-                    let (frame, need_cow) = {
-                        let page_offset =
-                            address.align_down(PAGE_SIZE) - vmo_backed_vma.map_to_addr;
-                        if let Ok(frame) = vmo.get_committed_frame(page_offset) {
-                            if !marker.is_shared && is_write_fault {
-                                // Write access to private VMO-backed mapping. Performs COW directly.
-                                zeroed_frame.writer().write(&mut frame.reader());
-                                (zeroed_frame.into(), false)
-                            } else {
-                                // Operations to shared mapping or read access to private VMO-backed mapping.
-                                // If read access to private VMO-backed mapping triggers a page fault,
-                                // the map should be readonly. If user next tries to write to the frame,
-                                // another page fault will be triggered which will performs a COW (Copy-On-Write).
-                                (frame, !marker.is_shared)
-                            }
-                        } else if !marker.is_shared {
-                            // The page index is outside the VMO. This is only allowed in private mapping.
-                            (zeroed_frame.into(), false)
-                        } else {
-                            return_errno_with_message!(
-                                Errno::EFAULT,
-                                "could not find a corresponding physical page"
-                            );
-                        }
-                    };
-
-                    let mut page_flags = marker.perms.into();
-
-                    if need_cow {
-                        page_flags -= PageFlags::W;
-                        page_flags |= PageFlags::AVAIL1;
-                    }
-
-                    if marker.is_shared {
-                        page_flags |= PageFlags::AVAIL2;
-                    }
-
-                    // Pre-fill A/D bits to avoid A/D TLB miss.
-                    page_flags |= PageFlags::ACCESSED;
-                    if is_write_fault {
-                        page_flags |= PageFlags::DIRTY;
-                    }
-                    let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
-
-                    cursor.map(frame, map_prop);
+                if marker.vmo_backed_id.is_some() {
+                    self.handle_file_backed_pf_under_cursor(
+                        &mut zeroed_frame,
+                        &mut cursor,
+                        marker,
+                        page_fault_info,
+                    )?;
                 } else {
                     // On-demand non-vmo-backed mapping.
                     //
@@ -318,7 +276,7 @@ impl Vmar_ {
 
                     let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
 
-                    cursor.map(zeroed_frame.into(), map_prop);
+                    cursor.map(zeroed_frame.take().unwrap().into(), map_prop);
                 }
             }
             VmItem::Mapped {
@@ -369,6 +327,7 @@ impl Vmar_ {
                     );
                     cursor.flusher().issue_tlb_flush(TlbFlushOp::Address(va));
                 } else {
+                    let zeroed_frame = zeroed_frame.take().unwrap();
                     zeroed_frame.writer().write(&mut frame.reader());
                     prop.flags |= additional_flags;
                     prop.flags -= PageFlags::AVAIL1; // Remove COW flag
@@ -382,6 +341,191 @@ impl Vmar_ {
                 return_errno_with_message!(Errno::EACCES, "page fault at an address not mapped");
             }
         }
+
+        Ok(())
+    }
+
+    fn handle_file_backed_pf_under_cursor(
+        &self,
+        zeroed_frame: &mut Option<Frame<()>>,
+        cursor: &mut CursorMut<'_, '_>,
+        marker: VmMarker,
+        page_fault_info: &PageFaultInfo,
+    ) -> Result<()> {
+        // On-demand VMO-backed mapping.
+        //
+        // It includes file-backed mapping and shared anonymous mapping.
+
+        let id_map = self.vma_map.read();
+        let pf_fault_vmo_id = marker.vmo_backed_id.unwrap();
+        let vmo_backed_vma = id_map.get(&pf_fault_vmo_id).unwrap();
+        let vmo = &vmo_backed_vma.vmo;
+
+        let page_aligned_addr = page_fault_info.address.align_down(PAGE_SIZE);
+        let is_write_fault = page_fault_info.required_perms.contains(VmPerms::WRITE);
+
+        let vmo_map_to_addr = vmo_backed_vma.map_to_addr;
+        let fault_vmo_offset = page_aligned_addr - vmo_map_to_addr;
+
+        if !vmo_backed_vma.handle_page_faults_around {
+            cursor.jump(page_aligned_addr).unwrap();
+            let mut commit_fn = || vmo.get_committed_frame(fault_vmo_offset);
+            return self.handle_one_file_backed_pf_under_cursor(
+                cursor,
+                marker,
+                &mut commit_fn,
+                zeroed_frame,
+                is_write_fault,
+            );
+        }
+
+        let fault_around_range = {
+            let fault_around_start = page_aligned_addr.align_down(PAGE_SIZE * 16);
+            fault_around_start..min(fault_around_start + PAGE_SIZE * 16, MAX_USERSPACE_VADDR)
+        };
+
+        let vmo_offset_end = vmo.inner_vmo_end();
+        let (vmo_range, va_range) =
+            if !marker.is_shared && (is_write_fault || vmo_offset_end <= fault_vmo_offset) {
+                // Private out-range mapping. Perform only single page.
+                (
+                    fault_vmo_offset..fault_vmo_offset + PAGE_SIZE,
+                    page_aligned_addr..page_aligned_addr + PAGE_SIZE,
+                )
+            } else {
+                let (vmo_start, va_start) = if fault_around_range.start > vmo_map_to_addr {
+                    (
+                        fault_around_range.start - vmo_map_to_addr,
+                        fault_around_range.start,
+                    )
+                } else {
+                    (0, vmo_map_to_addr)
+                };
+                let vmo_end = min(vmo_offset_end, fault_around_range.end - vmo_map_to_addr);
+                let va_end = min(fault_around_range.end, vmo_offset_end + vmo_map_to_addr);
+                (vmo_start..vmo_end, va_start..va_end)
+            };
+
+        log::trace!(
+            "Handle fb pf range under cursor, vmo_range = {:#x?}, va_range = {:#x?}",
+            vmo_range,
+            va_range
+        );
+
+        let mut cur_offset = vmo_range.start;
+        let mut cur_va = va_range.start;
+
+        vmo.operate_on_range(
+            &vmo_range,
+            move |commit_fn: &mut dyn FnMut() -> Result<UFrame>| {
+                'out: loop {
+                    cursor.jump(cur_va).unwrap();
+
+                    log::trace!(
+                        "Handling page fault at vaddr 0x{:x}, vmo_offset = 0x{:x}",
+                        cur_va,
+                        cur_offset
+                    );
+
+                    if let VmItem::Marked {
+                        va: _,
+                        len: _,
+                        status,
+                    } = cursor.query().unwrap()
+                    {
+                        let marker = VmMarker::decode(status);
+                        if !marker.perms.contains(page_fault_info.required_perms) {
+                            break 'out;
+                        }
+                        let Some(marked_vmo_backed_id) = marker.vmo_backed_id else {
+                            break 'out;
+                        };
+                        if marked_vmo_backed_id != pf_fault_vmo_id {
+                            break 'out;
+                        }
+
+                        // Ignore error and proceed to the next page.
+                        let _ = self.handle_one_file_backed_pf_under_cursor(
+                            cursor,
+                            marker,
+                            commit_fn,
+                            zeroed_frame,
+                            is_write_fault,
+                        );
+                    }
+
+                    break 'out;
+                } // 'out
+
+                cur_offset += PAGE_SIZE;
+                cur_va += PAGE_SIZE;
+
+                Ok(())
+            },
+        )
+    }
+
+    fn handle_one_file_backed_pf_under_cursor(
+        &self,
+        cursor: &mut CursorMut<'_, '_>,
+        marker: VmMarker,
+        commit_fn: &mut dyn FnMut() -> Result<UFrame>,
+        zeroed_frame: &mut Option<Frame<()>>,
+        is_write_fault: bool,
+    ) -> Result<()> {
+        let (frame, need_cow) = {
+            if let Ok(frame) = commit_fn() {
+                if !marker.is_shared && is_write_fault {
+                    // Write access to private VMO-backed mapping. Performs COW directly.
+                    let allocated = if let Some(frame) = zeroed_frame.take() {
+                        frame
+                    } else {
+                        alloc_frame(false)?
+                    };
+                    allocated.writer().write(&mut frame.reader());
+                    (allocated.into(), false)
+                } else {
+                    // Operations to shared mapping or read access to private VMO-backed mapping.
+                    // If read access to private VMO-backed mapping triggers a page fault,
+                    // the map should be readonly. If user next tries to write to the frame,
+                    // another page fault will be triggered which will performs a COW (Copy-On-Write).
+                    (frame, !marker.is_shared)
+                }
+            } else if !marker.is_shared {
+                // The page index is outside the VMO. This is only allowed in private mapping.
+                let frame = if let Some(frame) = zeroed_frame.take() {
+                    frame
+                } else {
+                    alloc_frame(true)?
+                };
+                (frame.into(), false)
+            } else {
+                return_errno_with_message!(
+                    Errno::EFAULT,
+                    "could not find a corresponding physical page"
+                );
+            }
+        };
+
+        let mut page_flags = marker.perms.into();
+
+        if need_cow {
+            page_flags -= PageFlags::W;
+            page_flags |= PageFlags::AVAIL1;
+        }
+
+        if marker.is_shared {
+            page_flags |= PageFlags::AVAIL2;
+        }
+
+        // Pre-fill A/D bits to avoid A/D TLB miss.
+        page_flags |= PageFlags::ACCESSED;
+        if is_write_fault {
+            page_flags |= PageFlags::DIRTY;
+        }
+        let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
+
+        cursor.map(frame, map_prop);
 
         Ok(())
     }
@@ -753,4 +897,11 @@ pub fn is_intersected(range1: &Range<usize>, range2: &Range<usize>) -> bool {
 pub fn get_intersected_range(range1: &Range<usize>, range2: &Range<usize>) -> Range<usize> {
     debug_assert!(is_intersected(range1, range2));
     range1.start.max(range2.start)..range1.end.min(range2.end)
+}
+
+fn alloc_frame(zeroed: bool) -> Result<Frame<()>> {
+    FrameAllocOptions::new()
+        .zeroed(zeroed)
+        .alloc_frame()
+        .map_err(|_| Error::with_message(Errno::ENOMEM, "failed to allocate frame"))
 }
