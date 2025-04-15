@@ -72,7 +72,7 @@ use spin::Once;
 
 use super::{Task, preempt::cpu_local, processor};
 use crate::{
-    cpu::{CpuId, CpuSet, PinCurrentCpu},
+    cpu::{CpuId, PinCurrentCpu},
     prelude::*,
     task::disable_preempt,
     timer,
@@ -512,9 +512,10 @@ fn set_need_preempt(cpu_id: CpuId) {
     if preempt_guard.current_cpu() == cpu_id {
         cpu_local::set_need_preempt();
     } else {
-        crate::smp::inter_processor_call(&CpuSet::from(cpu_id), || {
-            cpu_local::set_need_preempt();
-        });
+        // No idling now, let it go.
+        // crate::smp::inter_processor_call(&CpuSet::from(cpu_id), || {
+        //     cpu_local::set_need_preempt();
+        // });
     }
 }
 
