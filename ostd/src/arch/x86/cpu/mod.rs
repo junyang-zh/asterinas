@@ -15,5 +15,5 @@ pub mod local;
 #[track_caller]
 pub fn sleep_for_interrupt() {
     crate::task::atomic_mode::might_sleep();
-    x86_64::instructions::hlt();
+    // x86_64::instructions::hlt();
 }
