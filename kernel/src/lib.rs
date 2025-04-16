@@ -122,7 +122,8 @@ fn ap_init() {
         );
 
         loop {
-            crate::thread::Thread::yield_now();
+            crate::sched::steal_a_task();
+
             #[cfg(feature = "breakdown_counters")]
             crate::fs::procfs::breakdown_counters::idle_start();
 
@@ -169,7 +170,8 @@ fn init_thread() {
 
     // Wait till initproc become zombie.
     while !initproc.status().is_zombie() {
-        crate::thread::Thread::yield_now();
+        crate::sched::steal_a_task();
+
         #[cfg(feature = "breakdown_counters")]
         crate::fs::procfs::breakdown_counters::idle_start();
 
