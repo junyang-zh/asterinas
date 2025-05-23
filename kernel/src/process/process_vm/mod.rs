@@ -10,20 +10,12 @@
 //! like init stack and heap.
 
 mod heap;
-mod init_stack;
 
 use aster_rights::Full;
 pub use heap::Heap;
 use ostd::{sync::MutexGuard, task::disable_preempt};
 
-pub use self::{
-    heap::USER_HEAP_SIZE_LIMIT,
-    init_stack::{
-        aux_vec::{AuxKey, AuxVec},
-        InitStack, InitStackReader, INIT_STACK_SIZE, MAX_ARGV_NUMBER, MAX_ARG_LEN, MAX_ENVP_NUMBER,
-        MAX_ENV_LEN,
-    },
-};
+pub use self::heap::USER_HEAP_SIZE_LIMIT;
 use crate::{prelude::*, vm::vmar::Vmar};
 
 /*
@@ -65,7 +57,6 @@ use crate::{prelude::*, vm::vmar::Vmar};
 /// The process user space virtual memory
 pub struct ProcessVm {
     root_vmar: Mutex<Option<Vmar<Full>>>,
-    init_stack: InitStack,
     heap: Heap,
 }
 
@@ -101,7 +92,6 @@ impl Clone for ProcessVm {
         let root_vmar = self.lock_root_vmar();
         Self {
             root_vmar: Mutex::new(Some(root_vmar.unwrap().dup().unwrap())),
-            init_stack: self.init_stack.clone(),
             heap: self.heap.clone(),
         }
     }
@@ -111,13 +101,11 @@ impl ProcessVm {
     /// Allocates a new `ProcessVm`
     pub fn alloc() -> Self {
         let root_vmar = Vmar::<Full>::new_root();
-        let init_stack = InitStack::new();
         let heap = Heap::new();
         heap.alloc_and_map_vm(&root_vmar).unwrap();
         Self {
             root_vmar: Mutex::new(Some(root_vmar)),
             heap,
-            init_stack,
         }
     }
 
@@ -130,7 +118,6 @@ impl ProcessVm {
         Ok(Self {
             root_vmar,
             heap: other.heap.clone(),
-            init_stack: other.init_stack.clone(),
         })
     }
 
@@ -139,28 +126,6 @@ impl ProcessVm {
         ProcessVmarGuard {
             inner: self.root_vmar.lock(),
         }
-    }
-
-    /// Returns a reader for reading contents from
-    /// the `InitStack`.
-    pub fn init_stack_reader(&self) -> InitStackReader {
-        self.init_stack.reader(self.lock_root_vmar())
-    }
-
-    /// Returns the top address of the user stack.
-    pub fn user_stack_top(&self) -> Vaddr {
-        self.init_stack.user_stack_top()
-    }
-
-    pub(super) fn map_and_write_init_stack(
-        &self,
-        argv: Vec<CString>,
-        envp: Vec<CString>,
-        aux_vec: AuxVec,
-    ) -> Result<()> {
-        let root_vmar: ProcessVmarGuard<'_> = self.lock_root_vmar();
-        self.init_stack
-            .map_and_write(root_vmar.unwrap(), argv, envp, aux_vec)
     }
 
     pub(super) fn heap(&self) -> &Heap {

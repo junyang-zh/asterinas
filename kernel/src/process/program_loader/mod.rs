@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 pub mod elf;
+pub mod init_stack;
 mod shebang;
 
 use self::{
