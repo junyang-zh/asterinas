@@ -138,7 +138,9 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig>(
         let mut cur_entry = pt_guard.entry(start_idx);
         match cur_entry.to_ref() {
             PteStateRef::Mapped(_) => {
-                break;
+                let broken_guard = cur_entry.split_if_mapped_huge(guard).unwrap();
+                cur_pt_addr = broken_guard.paddr();
+                cur_node_guard = Some(broken_guard);
             }
             PteStateRef::Absent => {
                 let allocated_guard = cur_entry.alloc_if_none(guard).unwrap();
