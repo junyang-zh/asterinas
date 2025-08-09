@@ -210,7 +210,7 @@ impl Vmar_ {
         assert!(range.end % PAGE_SIZE == 0);
 
         let preempt_guard = disable_preempt();
-        let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+        let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range);
 
         let mut prot_op = |p: &mut PageProperty| {
             let mut cow = p.flags.contains(PageFlags::AVAIL1);
@@ -283,10 +283,7 @@ impl Vmar_ {
                 let locked_2m_start = page_aligned_addr.align_down(PAGE_SIZE * 512);
                 locked_2m_start..min(locked_2m_start + PAGE_SIZE * 512, MAX_USERSPACE_VADDR)
             };
-            let mut cursor = self
-                .vm_space
-                .cursor_mut(&preempt_guard, &locked_2m_range)
-                .unwrap();
+            let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &locked_2m_range);
             cursor.jump(page_aligned_addr).unwrap();
 
             match cursor.query().unwrap() {
@@ -625,10 +622,7 @@ impl Vmar_ {
         {
             let full_range = 0..MAX_USERSPACE_VADDR;
             let preempt_guard = disable_preempt();
-            let mut cursor = self
-                .vm_space
-                .cursor_mut(&preempt_guard, &full_range)
-                .unwrap();
+            let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &full_range);
             cursor.unmap(full_range.len());
             cursor.flusher().sync_tlb_flush();
         }
@@ -642,7 +636,7 @@ impl Vmar_ {
 
     pub fn remove_mapping(&self, range: Range<usize>) -> Result<()> {
         let preempt_guard = disable_preempt();
-        let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+        let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range);
 
         // let mut remain_size = range.len();
         // while let Some(mapped_va) = cursor.find_next(remain_size) {
@@ -692,9 +686,9 @@ impl Vmar_ {
         let (new_vma_map, new_vmo_backed_id_alloc) = {
             let preempt_guard = disable_preempt();
             let range = self.base..(self.base + self.size);
-            let mut new_cursor = new_vmspace.cursor_mut(&preempt_guard, &range).unwrap();
+            let mut new_cursor = new_vmspace.cursor_mut(&preempt_guard, &range);
             let cur_vmspace = self.vm_space();
-            let mut cur_cursor = cur_vmspace.cursor_mut(&preempt_guard, &range).unwrap();
+            let mut cur_cursor = cur_vmspace.cursor_mut(&preempt_guard, &range);
 
             let old_vma_map = self.vma_map.read();
             let mut new_vma_map = BTreeMap::new();
@@ -1070,8 +1064,7 @@ where
         let preempt_guard = disable_preempt();
         let mut cursor = parent
             .vm_space()
-            .cursor_mut(&preempt_guard, &(map_to_addr..map_to_addr + map_size))
-            .unwrap();
+            .cursor_mut(&preempt_guard, &(map_to_addr..map_to_addr + map_size));
 
         if !can_overwrite {
             while cursor.virt_addr() < map_to_addr + map_size {
@@ -1254,20 +1247,19 @@ mod test {
 
         vm_space
             .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
             .map(VmItem::Frame(frame.into(), page_property)); // Original frame moved here
 
         // Confirms the initial mapping.
         assert!(matches!(
-            vm_space.cursor(&preempt_guard, &map_range).unwrap().query().unwrap(),
+            vm_space.cursor(&preempt_guard, &map_range).query().unwrap(),
             (va, Some(VmItem::Frame(frame, prop))) if va.start == map_range.start && frame.start_paddr() == start_paddr && prop.flags == PageFlags::RW
         ));
 
         // Creates a child page table with copy-on-write protection.
         let child_space = VmSpace::new();
         {
-            let mut child_cursor = child_space.cursor_mut(&preempt_guard, &cow_range).unwrap();
-            let mut parent_cursor = vm_space.cursor_mut(&preempt_guard, &cow_range).unwrap();
+            let mut child_cursor = child_space.cursor_mut(&preempt_guard, &cow_range);
+            let mut parent_cursor = vm_space.cursor_mut(&preempt_guard, &cow_range);
             let mut rss_delta = [0; NUM_RSS_COUNTERS];
             cow_copy_pt(
                 &mut parent_cursor,
@@ -1285,7 +1277,6 @@ mod test {
             let child_map_frame_addr = {
                 let (_, Some(VmItem::Frame(frame, _))) = child_space
                     .cursor(&preempt_guard, &map_range)
-                    .unwrap()
                     .query()
                     .unwrap()
                 else {
@@ -1294,11 +1285,8 @@ mod test {
                 frame.start_paddr()
             };
             let parent_map_frame_addr = {
-                let (_, Some(VmItem::Frame(frame, _))) = vm_space
-                    .cursor(&preempt_guard, &map_range)
-                    .unwrap()
-                    .query()
-                    .unwrap()
+                let (_, Some(VmItem::Frame(frame, _))) =
+                    vm_space.cursor(&preempt_guard, &map_range).query().unwrap()
                 else {
                     panic!("Parent mapping query failed");
                 };
@@ -1311,22 +1299,19 @@ mod test {
         // Unmaps the range from the parent.
         vm_space
             .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
             .unmap(map_range.len());
 
         // Confirms that the child VA remains mapped.
         assert!(matches!(
-            child_space.cursor(&preempt_guard, &map_range).unwrap().query().unwrap(),
+            child_space.cursor(&preempt_guard, &map_range).query().unwrap(),
             (va, Some(VmItem::Frame(frame, prop)))  if va.start == map_range.start && frame.start_paddr() == start_paddr && prop.flags == PageFlags::R
         ));
 
         // Creates a sibling page table (from the now-modified parent).
         let sibling_space = VmSpace::new();
         {
-            let mut sibling_cursor = sibling_space
-                .cursor_mut(&preempt_guard, &cow_range)
-                .unwrap();
-            let mut parent_cursor = vm_space.cursor_mut(&preempt_guard, &cow_range).unwrap();
+            let mut sibling_cursor = sibling_space.cursor_mut(&preempt_guard, &cow_range);
+            let mut parent_cursor = vm_space.cursor_mut(&preempt_guard, &cow_range);
             let mut rss_delta = [0; NUM_RSS_COUNTERS];
             cow_copy_pt(
                 &mut parent_cursor,
@@ -1343,7 +1328,6 @@ mod test {
         assert!(matches!(
             sibling_space
                 .cursor(&preempt_guard, &map_range)
-                .unwrap()
                 .query()
                 .unwrap(),
             (_, None)
@@ -1354,25 +1338,23 @@ mod test {
 
         // Confirms that the child VA remains mapped after the parent is dropped.
         assert!(matches!(
-            child_space.cursor(&preempt_guard, &map_range).unwrap().query().unwrap(),
+            child_space.cursor(&preempt_guard, &map_range).query().unwrap(),
             (va, Some(VmItem::Frame(frame, prop)))  if va.start == map_range.start && frame.start_paddr() == start_paddr && prop.flags == PageFlags::R
         ));
 
         // Unmaps the range from the child.
         child_space
             .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
             .unmap(map_range.len());
 
         // Maps the range in the sibling using the third clone.
         sibling_space
             .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
             .map(VmItem::Frame(frame_clone_for_assert.into(), page_property));
 
         // Confirms that the sibling mapping points back to the original frame's physical address.
         assert!(matches!(
-            sibling_space.cursor(&preempt_guard, &map_range).unwrap().query().unwrap(),
+            sibling_space.cursor(&preempt_guard, &map_range).query().unwrap(),
             (va, Some(VmItem::Frame(frame, prop)))  if va.start == map_range.start && frame.start_paddr() == start_paddr && prop.flags == PageFlags::RW
         ));
 
@@ -1380,7 +1362,6 @@ mod test {
         assert!(matches!(
             child_space
                 .cursor(&preempt_guard, &map_range)
-                .unwrap()
                 .query()
                 .unwrap(),
             (_, None)
