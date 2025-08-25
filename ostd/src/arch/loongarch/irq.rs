@@ -75,13 +75,17 @@ impl HwCpuId {
     }
 }
 
-/// Sends a general inter-processor interrupt (IPI) to the specified CPU.
-///
-/// # Safety
-///
-/// The caller must ensure that the interrupt number is valid and that
-/// the corresponding handler is configured correctly on the remote CPU.
-/// Furthermore, invoking the interrupt handler must also be safe.
-pub(crate) unsafe fn send_ipi(_hw_cpu_id: HwCpuId, _irq_num: u8, _guard: &dyn PinCurrentCpu) {
-    unimplemented!()
+pub(crate) struct IpiGlobalData {
+    _private: (),
+}
+
+impl IpiGlobalData {
+    pub(crate) fn init() -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) fn send_ipi(&self, _hw_cpu_id: HwCpuId, _guard: &dyn PinCurrentCpu) {
+        let _ = crate::smp::do_inter_processor_call; // To suppress lint errors.
+        unimplemented!()
+    }
 }
