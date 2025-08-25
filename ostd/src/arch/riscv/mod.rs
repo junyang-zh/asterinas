@@ -49,13 +49,13 @@ pub(crate) unsafe fn init_on_bsp_after_heap() {
     // been performed.
     unsafe { irq::init(&io_mem_builder) };
 
-    // SAFETY: We're on the BSP and we're ready to boot all APs.
-    unsafe { crate::boot::smp::boot_all_aps() };
-
     // SAFETY: This function is called once and at most once at a proper timing
     // in the boot context of the BSP, with no timer-related operations having
     // been performed.
     unsafe { timer::init() };
+
+    // SAFETY: We're on the BSP and we're ready to boot all APs.
+    unsafe { crate::boot::smp::boot_all_aps() };
 
     // SAFETY:
     // 1. All the system device memory have been removed from the builder.
@@ -82,6 +82,9 @@ pub(crate) unsafe fn init_on_bsp_after_kpt() {
 pub(crate) unsafe fn init_on_ap() {
     // SAFETY: This is only called once on this AP.
     unsafe { trap::init() };
+
+    // SAFETY: This is only called once on this AP.
+    unsafe { timer::init_current_hart() };
 }
 
 pub(crate) fn interrupts_ack(irq_number: usize) {
