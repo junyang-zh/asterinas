@@ -129,9 +129,9 @@ pub fn register_ap_entry(entry: fn()) {
 }
 
 #[no_mangle]
-fn ap_early_entry(cpu_id: u32) -> ! {
+extern "C" fn ap_early_entry(cpu_id: u32) -> ! {
     // SAFETY: `cpu_id` is the correct value of the CPU ID.
-    unsafe { crate::cpu::init_on_ap(cpu_id) };
+    unsafe { crate::cpu::set_this_cpu_id(cpu_id) };
 
     crate::arch::enable_cpu_features();
 
@@ -170,7 +170,9 @@ fn ap_early_entry(cpu_id: u32) -> ! {
 fn report_online_and_hw_cpu_id(cpu_id: u32) {
     // There are no races because this method will only be called in the boot
     // context, where preemption won't occur.
-    let hw_cpu_id = HwCpuId::read_current(&crate::task::disable_preempt());
+    //
+    // SAFETY: CPU-local memory must have been initialized by this point.
+    let hw_cpu_id = unsafe { HwCpuId::read_current(&crate::task::disable_preempt()) };
 
     let old_val = HW_CPU_ID_MAP.lock().insert(cpu_id, hw_cpu_id);
     assert!(old_val.is_none());
