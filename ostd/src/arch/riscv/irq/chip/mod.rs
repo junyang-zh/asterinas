@@ -46,6 +46,30 @@ pub(in crate::arch) unsafe fn init(io_mem_builder: &IoMemAllocatorBuilder) {
     // initialization, and we ensure that only the external interrupt bit is
     // set without affecting other interrupt sources.
     unsafe { riscv::register::sie::set_sext() };
+
+    // SAFETY: Accessing the `sie` CSR to enable the software interrupt in the
+    // BSP is safe here, with the same reasoning as above.
+    unsafe {
+        riscv::register::sie::set_ssoft();
+    }
+}
+
+/// Initializes application-processor-specific PLIC state.
+///
+/// Application Processors (APs) are harts that are not the bootstrapping hart.
+///
+/// # Safety
+///
+/// This function is safe to call on the following conditions:
+/// 1. It is called once and at most once on this AP.
+/// 2. It is called before any other public functions of this module is called
+///    on this AP.
+pub(in crate::arch) unsafe fn init_on_ap() {
+    // SAFETY: Accessing the `sie` CSR to enable the software interrupt in the
+    // AP is safe here since the caller ensures the timing.
+    unsafe {
+        riscv::register::sie::set_ssoft();
+    }
 }
 
 /// An IRQ chip.

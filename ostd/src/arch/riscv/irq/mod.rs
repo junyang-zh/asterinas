@@ -8,7 +8,8 @@ mod ops;
 mod remapping;
 
 pub use chip::{InterruptSourceInFdt, IrqChip, MappedIrqLine, IRQ_CHIP};
-pub(crate) use ipi::{send_ipi, HwCpuId};
+pub(super) use ipi::get_ipi_irq_num;
+pub(crate) use ipi::{HwCpuId, IpiGlobalData};
 pub(crate) use ops::{disable_local, enable_local, enable_local_and_halt, is_local_enabled};
 pub(crate) use remapping::IrqRemapping;
 
@@ -55,7 +56,11 @@ impl HwIrqLine {
                     *interrupt_source_on_chip,
                 );
             }
-            InterruptSource::Software => unimplemented!(),
+            InterruptSource::Software => {
+                // SAFETY: We have already handled the IPI. So clearing the
+                // software interrupt pending bit is safe.
+                unsafe { riscv::register::sip::clear_ssoft() };
+            }
         }
     }
 }

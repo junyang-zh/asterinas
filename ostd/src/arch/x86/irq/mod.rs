@@ -8,7 +8,7 @@ mod ops;
 mod remapping;
 
 pub use chip::{IrqChip, MappedIrqLine, IRQ_CHIP};
-pub(crate) use ipi::{send_ipi, HwCpuId};
+pub(crate) use ipi::{HwCpuId, IpiGlobalData};
 pub(crate) use ops::{disable_local, enable_local, enable_local_and_halt, is_local_enabled};
 pub(crate) use remapping::IrqRemapping;
 

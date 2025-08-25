@@ -59,8 +59,21 @@ pub(crate) unsafe fn late_init_on_bsp() {
     unsafe { crate::io::init(io_mem_builder) };
 }
 
+/// Initializes application-processor-specific state.
+///
+/// On RISC-V, Application Processors (APs) are harts that are not the
+/// bootstrapping hart.
+///
+/// # Safety
+///
+/// This function must be called only once on each application processor.
+/// And it should be called after the BSP's call to [`late_init_on_bsp`].
 pub(crate) unsafe fn init_on_ap() {
-    unimplemented!();
+    // SAFETY: The caller ensures that this function is only called once here.
+    unsafe { trap::init() };
+
+    // SAFETY: The caller ensures that this function is only called once here.
+    unsafe { irq::chip::init_on_ap() };
 }
 
 /// Return the frequency of TSC. The unit is Hz.
