@@ -63,7 +63,12 @@ extern "C" fn trap_handler(f: &mut TrapFrame) {
                         }
                     }
                 }
-                SupervisorSoft => todo!(),
+                SupervisorSoft => {
+                    // SAFETY: We are inter-processor interrupted.
+                    unsafe {
+                        crate::smp::do_inter_processor_call(f);
+                    }
+                }
                 Unknown => {
                     panic!(
                         "Cannot handle unknown supervisor interrupt, scause: {:#x}, trapframe: {:#x?}.",
