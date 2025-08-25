@@ -13,7 +13,7 @@ pub use trap::TrapFrame;
 
 use super::timer::TIMER_IRQ_NUM;
 use crate::{
-    arch::irq::IRQ_CHIP,
+    arch::irq::{get_ipi_irq_num, IRQ_CHIP},
     cpu::{context::CpuException, CpuId},
     cpu_local_cell,
     mm::MAX_USERSPACE_VADDR,
@@ -66,7 +66,9 @@ extern "C" fn trap_handler(f: &mut TrapFrame) {
                         }
                     }
                 }
-                SupervisorSoft => todo!(),
+                SupervisorSoft => {
+                    call_irq_callback_functions(f, get_ipi_irq_num());
+                }
                 Unknown => {
                     panic!(
                         "Cannot handle unknown supervisor interrupt, scause: {:#x}, trapframe: {:#x?}.",
