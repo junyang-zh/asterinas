@@ -80,6 +80,9 @@ pub(crate) unsafe fn init_on_bsp_after_kpt() {
 pub(crate) unsafe fn init_on_ap() {
     // SAFETY: This is only called once on this AP.
     unsafe { trap::init() };
+
+    // SAFETY: This is only called once on this AP.
+    unsafe { timer::init_current_hart() };
 }
 
 pub(crate) fn interrupts_ack(irq_number: usize) {
