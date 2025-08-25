@@ -13,7 +13,7 @@ pub use trap::TrapFrame;
 
 use super::{
     cpu::context::CpuException,
-    irq::{disable_local, enable_local, IRQ_CHIP},
+    irq::{disable_local, enable_local, get_ipi_irq_num, IRQ_CHIP},
     timer::TIMER_IRQ_NUM,
 };
 use crate::{
@@ -78,7 +78,9 @@ extern "C" fn trap_handler(f: &mut TrapFrame) {
                         }
                     }
                 }
-                SupervisorSoft => todo!(),
+                SupervisorSoft => {
+                    call_irq_callback_functions(f, get_ipi_irq_num());
+                }
                 Unknown => {
                     panic!(
                         "Cannot handle unknown supervisor interrupt, scause: {:#x}, trapframe: {:#x?}.",

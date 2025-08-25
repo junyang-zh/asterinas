@@ -6,7 +6,7 @@ use spin::Once;
 use x86_64::registers::rflags::{self, RFlags};
 
 use super::iommu::{alloc_irt_entry, has_interrupt_remapping, IrtEntryHandle};
-use crate::cpu::PinCurrentCpu;
+use crate::{cpu::PinCurrentCpu, smp::do_inter_processor_call, trap::irq::IrqLine};
 
 // Intel(R) 64 and IA-32 rchitectures Software Developer's Manual,
 // Volume 3A, Section 6.2 says "Vector numbers in the range 32 to 255
@@ -111,29 +111,36 @@ impl HwCpuId {
     }
 }
 
-/// Sends a general inter-processor interrupt (IPI) to the specified CPU.
-///
-/// # Safety
-///
-/// The caller must ensure that the interrupt number is valid and that
-/// the corresponding handler is configured correctly on the remote CPU.
-/// Furthermore, invoking the interrupt handler must also be safe.
-pub(crate) unsafe fn send_ipi(hw_cpu_id: HwCpuId, irq_num: u8, guard: &dyn PinCurrentCpu) {
-    use crate::arch::kernel::apic::{self, Icr};
+pub(crate) struct IpiGlobalData {
+    irq: IrqLine,
+}
 
-    let icr = Icr::new(
-        apic::ApicId::from(hw_cpu_id.0),
-        apic::DestinationShorthand::NoShorthand,
-        apic::TriggerMode::Edge,
-        apic::Level::Assert,
-        apic::DeliveryStatus::Idle,
-        apic::DestinationMode::Physical,
-        apic::DeliveryMode::Fixed,
-        irq_num,
-    );
+impl IpiGlobalData {
+    pub(crate) fn init() -> Self {
+        let mut irq = IrqLine::alloc().unwrap();
+        // SAFETY: This will be called upon an inter-processor interrupt.
+        irq.on_active(|f| unsafe { do_inter_processor_call(f) });
+        Self { irq }
+    }
 
-    let apic = apic::get_or_init(guard);
-    // SAFETY: The ICR is valid to generate the request IPI. Generating the request IPI is safe
-    // as guaranteed by the caller.
-    unsafe { apic.send_ipi(icr) };
+    /// Sends a general inter-processor interrupt (IPI) to the specified CPU.
+    pub(crate) fn send_ipi(&self, hw_cpu_id: HwCpuId, guard: &dyn PinCurrentCpu) {
+        use crate::arch::kernel::apic::{self, Icr};
+
+        let icr = Icr::new(
+            apic::ApicId::from(hw_cpu_id.0),
+            apic::DestinationShorthand::NoShorthand,
+            apic::TriggerMode::Edge,
+            apic::Level::Assert,
+            apic::DeliveryStatus::Idle,
+            apic::DestinationMode::Physical,
+            apic::DeliveryMode::Fixed,
+            self.irq.num(),
+        );
+
+        let apic = apic::get_or_init(guard);
+        // SAFETY: The ICR is valid to generate the request IPI. Generating the
+        // request IPI is safe.
+        unsafe { apic.send_ipi(icr) };
+    }
 }

@@ -20,10 +20,9 @@ pub mod trap;
 
 use core::sync::atomic::Ordering;
 
-use crate::{
-    arch::{irq::IRQ_CHIP, timer::TIMER_IRQ_NUM},
-    cpu::CpuId,
-};
+use irq::{get_ipi_irq_num, IRQ_CHIP};
+
+use crate::{arch::timer::TIMER_IRQ_NUM, cpu::CpuId};
 
 #[cfg(feature = "cvm_guest")]
 pub(crate) fn init_cvm_guest() {
@@ -70,12 +69,21 @@ pub(crate) unsafe fn late_init_on_bsp() {
     pci::init();
 }
 
-pub(crate) unsafe fn init_on_ap() {}
+pub(crate) unsafe fn init_on_ap() {
+    // SAFETY: This is only called once on this AP.
+    unsafe { trap::init() };
+
+    // SAFETY: This is only called once on this AP.
+    unsafe { irq::init_on_ap() };
+}
 
 pub(crate) fn interrupts_ack(irq_number: usize) {
-    // TODO: We should check for software interrupts too here. Only those external
-    // interrupts would go through the IRQ chip.
     if irq_number == TIMER_IRQ_NUM.load(Ordering::Relaxed) as usize {
+        return;
+    }
+    if irq_number == get_ipi_irq_num() {
+        // SAFETY: We have already handled the IPI.
+        unsafe { riscv::register::sip::clear_ssoft() };
         return;
     }
 

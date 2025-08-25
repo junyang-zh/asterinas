@@ -9,7 +9,7 @@ use riscv::register::scause::Exception;
 use crate::{
     arch::{
         cpu::extension::{has_extensions, IsaExtensions},
-        irq::IRQ_CHIP,
+        irq::{get_ipi_irq_num, IRQ_CHIP},
         trap::{RawUserContext, TrapFrame},
         TIMER_IRQ_NUM,
     },
@@ -218,7 +218,9 @@ impl UserContextApiInternal for UserContext {
                         }
                     }
                 }
-                Interrupt(SupervisorSoft) => todo!(),
+                Interrupt(SupervisorSoft) => {
+                    call_irq_callback_functions(&self.as_trap_frame(), get_ipi_irq_num());
+                }
                 Interrupt(Unknown) => {
                     panic!(
                         "Cannot handle unknown supervisor interrupt, scause: {:#x}, trapframe: {:?}.",
