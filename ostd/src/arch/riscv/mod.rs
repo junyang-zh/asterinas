@@ -77,9 +77,7 @@ pub(crate) unsafe fn init_on_bsp_after_kpt() {
     unsafe { irq::init_after_kpt() };
 }
 
-pub(crate) unsafe fn init_on_ap() {
-    unimplemented!()
-}
+pub(crate) unsafe fn init_on_ap() {}
 
 pub(crate) fn interrupts_ack(irq_number: usize) {
     // Invoked always in interrupt context, so there's no race condition.
