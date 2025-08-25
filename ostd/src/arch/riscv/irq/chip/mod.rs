@@ -65,7 +65,11 @@ pub(in crate::arch) unsafe fn init(io_mem_builder: &IoMemAllocatorBuilder) {
 /// 2. It is called before any other public functions of this module is called
 ///    on this AP.
 pub(in crate::arch) unsafe fn init_on_ap() {
-    // SAFETY: Accessing the `sie` CSR to enable the software interrupt in the
+    // SAFETY: Accessing the `sie` CSR to enable the external interrupt for the
+    // AP is safe here since the caller ensures the timing.
+    unsafe { riscv::register::sie::set_sext() };
+
+    // SAFETY: Accessing the `sie` CSR to enable the software interrupt for the
     // AP is safe here since the caller ensures the timing.
     unsafe {
         riscv::register::sie::set_ssoft();

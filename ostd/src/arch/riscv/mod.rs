@@ -45,13 +45,17 @@ pub(crate) unsafe fn late_init_on_bsp() {
     // operations having been performed.
     unsafe { irq::chip::init(&io_mem_builder) };
 
-    // SAFETY: We're on the BSP and we're ready to boot all APs.
-    unsafe { crate::boot::smp::boot_all_aps() };
-
     // SAFETY: This function is called once and at most once at a proper timing
     // in the boot context of the BSP, with no timer-related operations having
     // been performed.
     unsafe { timer::init() };
+
+    // SAFETY:
+    // 1. The caller ensures that the function is only called once in the
+    //    boot context of the BSP.
+    // 2. The caller ensures that the function is called after the kernel
+    //    page table is activated on the BSP.
+    unsafe { crate::boot::smp::boot_all_aps() };
 
     // SAFETY:
     // 1. All the system device memory have been removed from the builder.
@@ -74,6 +78,9 @@ pub(crate) unsafe fn init_on_ap() {
 
     // SAFETY: The caller ensures that this function is only called once here.
     unsafe { irq::chip::init_on_ap() };
+
+    // SAFETY: The caller ensures that this function is only called once here.
+    unsafe { timer::init_current_hart() };
 }
 
 /// Return the frequency of TSC. The unit is Hz.
