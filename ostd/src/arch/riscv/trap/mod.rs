@@ -53,19 +53,20 @@ extern "C" fn trap_handler(f: &mut TrapFrame) {
         }
     }
 
-    use riscv::register::scause::Trap::*;
+    use riscv::interrupt::{
+        supervisor::{Exception, Interrupt},
+        Trap,
+    };
 
-    let scause = riscv::register::scause::read();
-    match scause.cause() {
-        Interrupt(interrupt) => {
-            use riscv::register::scause::Interrupt::*;
-
+    let scause = riscv::interrupt::supervisor::cause::<Interrupt, Exception>();
+    match scause {
+        Trap::Interrupt(interrupt) => {
             IS_KERNEL_INTERRUPTED.store(true);
             match interrupt {
-                SupervisorTimer => {
+                Interrupt::SupervisorTimer => {
                     call_irq_callback_functions(f, TIMER_IRQ_NUM.load(Ordering::Relaxed) as usize);
                 }
-                SupervisorExternal => {
+                Interrupt::SupervisorExternal => {
                     let current_cpu = CpuId::current_racy().as_usize() as u32;
                     loop {
                         let irq_chip = IRQ_CHIP.get().unwrap().lock();
@@ -78,19 +79,13 @@ extern "C" fn trap_handler(f: &mut TrapFrame) {
                         }
                     }
                 }
-                SupervisorSoft => {
+                Interrupt::SupervisorSoft => {
                     call_irq_callback_functions(f, get_ipi_irq_num());
-                }
-                Unknown => {
-                    panic!(
-                        "Cannot handle unknown supervisor interrupt, scause: {:#x}, trapframe: {:#x?}.",
-                        scause.bits(), f
-                    );
                 }
             }
             IS_KERNEL_INTERRUPTED.store(false);
         }
-        Exception(e) => {
+        Trap::Exception(e) => {
             use CpuException::*;
 
             let exception = e.into();
@@ -105,13 +100,6 @@ extern "C" fn trap_handler(f: &mut TrapFrame) {
                     if (0..MAX_USERSPACE_VADDR).contains(&fault_addr.0) {
                         handle_user_page_fault(f, &exception);
                     }
-                }
-                Unknown => {
-                    panic!(
-                        "Cannot handle unknown exception, scause: {:#x}, trapframe: {:#x?}.",
-                        scause.bits(),
-                        f
-                    );
                 }
                 _ => {
                     panic!(

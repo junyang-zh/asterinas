@@ -4,7 +4,7 @@
 
 use core::{arch::global_asm, fmt::Debug, sync::atomic::Ordering};
 
-use riscv::register::scause::Exception;
+use riscv::interrupt::supervisor::Exception;
 
 use crate::{
     arch::{
@@ -100,8 +100,6 @@ pub enum CpuException {
     LoadPageFault(FaultAddress),
     /// Store page fault exception.
     StorePageFault(FaultAddress),
-    /// Unknown.
-    Unknown,
 }
 
 impl From<Exception> for CpuException {
@@ -129,7 +127,6 @@ impl From<Exception> for CpuException {
             InstructionPageFault => Self::InstructionPageFault(FaultAddress(stval)),
             LoadPageFault => Self::LoadPageFault(FaultAddress(stval)),
             StorePageFault => Self::StorePageFault(FaultAddress(stval)),
-            Unknown => Self::Unknown,
         }
     }
 }
@@ -186,7 +183,10 @@ impl UserContextApiInternal for UserContext {
     where
         F: FnMut() -> bool,
     {
-        use riscv::register::scause::{Interrupt::*, Trap::*};
+        use riscv::interrupt::{
+            supervisor::{Exception, Interrupt},
+            Trap,
+        };
 
         // Enables userspace traps and sets FPU state to clean.
         self.user_context.sstatus |= (1 << 5) | (2 << 13);
@@ -194,15 +194,15 @@ impl UserContextApiInternal for UserContext {
             scheduler::might_preempt();
             self.user_context.run();
 
-            let scause = riscv::register::scause::read();
-            match scause.cause() {
-                Interrupt(SupervisorTimer) => {
+            let scause = riscv::interrupt::supervisor::cause::<Interrupt, Exception>();
+            match scause {
+                Trap::Interrupt(Interrupt::SupervisorTimer) => {
                     call_irq_callback_functions(
                         &self.as_trap_frame(),
                         TIMER_IRQ_NUM.load(Ordering::Relaxed) as usize,
                     );
                 }
-                Interrupt(SupervisorExternal) => {
+                Trap::Interrupt(Interrupt::SupervisorExternal) => {
                     let current_cpu = CpuId::current_racy().as_usize() as u32;
                     loop {
                         let irq_chip = IRQ_CHIP.get().unwrap().lock();
@@ -218,17 +218,10 @@ impl UserContextApiInternal for UserContext {
                         }
                     }
                 }
-                Interrupt(SupervisorSoft) => {
+                Trap::Interrupt(Interrupt::SupervisorSoft) => {
                     call_irq_callback_functions(&self.as_trap_frame(), get_ipi_irq_num());
                 }
-                Interrupt(Unknown) => {
-                    panic!(
-                        "Cannot handle unknown supervisor interrupt, scause: {:#x}, trapframe: {:?}.",
-                        scause.bits(),
-                        self.as_trap_frame()
-                    );
-                }
-                Exception(e) => {
+                Trap::Exception(e) => {
                     use CpuException::*;
 
                     let exception = e.into();
@@ -237,13 +230,6 @@ impl UserContextApiInternal for UserContext {
                         UserEnvCall => {
                             self.user_context.sepc += 4;
                             return ReturnReason::UserSyscall;
-                        }
-                        Unknown => {
-                            panic!(
-                                "Cannot handle unknown exception, scause: {:#x}, trapframe: {:?}.",
-                                scause.bits(),
-                                self.as_trap_frame()
-                            );
                         }
                         _ => {
                             self.exception = Some(exception);

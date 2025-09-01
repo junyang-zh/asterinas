@@ -18,7 +18,7 @@
 
 use core::arch::global_asm;
 
-use riscv::register::stvec::TrapMode;
+use riscv::register::stvec::Stvec;
 
 use crate::arch::cpu::context::GeneralRegs;
 
@@ -35,11 +35,12 @@ global_asm!(include_str!("trap.S"));
 /// You **MUST NOT** modify these registers later.
 pub unsafe fn init() {
     unsafe {
-        // Set sscratch register to 0, indicating to exception vector that we are
-        // presently executing in the kernel
+        // Set sscratch register to 0, indicating to exception vector that we
+        // are presently executing in the kernel.
         riscv::register::sscratch::write(0);
-        // Set the exception vector address
-        riscv::register::stvec::write(trap_entry as usize, TrapMode::Direct);
+        // Set the exception vector address. We do it in the direct mode, not
+        // vectored mode. So the mode selection bit is not set.
+        riscv::register::stvec::write(Stvec::from_bits(trap_entry as usize));
     }
 }
 

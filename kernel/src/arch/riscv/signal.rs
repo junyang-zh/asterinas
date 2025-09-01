@@ -52,9 +52,6 @@ impl From<&CpuException> for FaultSignal {
             CpuException::UserEnvCall
             | CpuException::SupervisorEnvCall
             | CpuException::MachineEnvCall => (SIGILL, ILL_ILLTRP, None),
-
-            // Unknown exception
-            CpuException::Unknown => (SIGILL, ILL_ILLOPC, None),
         };
 
         FaultSignal::new(num, code, addr)
