@@ -13,7 +13,7 @@ pub(crate) use ipi::{HwCpuId, IpiGlobalData};
 pub(crate) use ops::{disable_local, enable_local, enable_local_and_halt, is_local_enabled};
 pub(crate) use remapping::IrqRemapping;
 
-use crate::{arch::irq::chip::InterruptSourceOnChip, cpu::CpuId};
+use crate::arch::irq::chip::InterruptSourceOnChip;
 
 pub(crate) const IRQ_NUM_MIN: u8 = 0;
 pub(crate) const IRQ_NUM_MAX: u8 = 255;
@@ -52,7 +52,7 @@ impl HwIrqLine {
             InterruptSource::External(interrupt_source_on_chip) => {
                 IRQ_CHIP.get().unwrap().complete_interrupt(
                     // No races because we are in IRQs.
-                    CpuId::current_racy().into(),
+                    crate::arch::boot::smp::get_current_hart_id(),
                     *interrupt_source_on_chip,
                 );
             }
