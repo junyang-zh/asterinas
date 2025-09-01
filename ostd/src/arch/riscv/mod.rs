@@ -20,9 +20,10 @@ pub mod trap;
 
 use core::sync::atomic::Ordering;
 
-use irq::{get_ipi_irq_num, IRQ_CHIP};
-
-use crate::{arch::timer::TIMER_IRQ_NUM, cpu::CpuId};
+use crate::arch::{
+    irq::{get_ipi_irq_num, HwCpuId, IRQ_CHIP},
+    timer::TIMER_IRQ_NUM,
+};
 
 #[cfg(feature = "cvm_guest")]
 pub(crate) fn init_cvm_guest() {
@@ -90,11 +91,10 @@ pub(crate) fn interrupts_ack(irq_number: usize) {
         return;
     }
 
-    IRQ_CHIP
-        .get()
-        .unwrap()
-        .lock()
-        .complete_interrupt(CpuId::current_racy().as_usize() as u32, irq_number as u32);
+    IRQ_CHIP.get().unwrap().lock().complete_interrupt(
+        unsafe { HwCpuId::read_current(&crate::task::disable_preempt()).as_usize() as u32 },
+        irq_number as u32,
+    );
 }
 
 /// Return the frequency of TSC. The unit is Hz.

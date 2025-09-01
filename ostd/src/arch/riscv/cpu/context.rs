@@ -9,11 +9,10 @@ use riscv::interrupt::supervisor::Exception;
 use crate::{
     arch::{
         cpu::extension::{has_extensions, IsaExtensions},
-        irq::{get_ipi_irq_num, IRQ_CHIP},
+        irq::get_ipi_irq_num,
         trap::{RawUserContext, TrapFrame},
         TIMER_IRQ_NUM,
     },
-    cpu::CpuId,
     task::scheduler,
     trap::call_irq_callback_functions,
     user::{ReturnReason, UserContextApi, UserContextApiInternal},
@@ -203,20 +202,7 @@ impl UserContextApiInternal for UserContext {
                     );
                 }
                 Trap::Interrupt(Interrupt::SupervisorExternal) => {
-                    let current_cpu = CpuId::current_racy().as_usize() as u32;
-                    loop {
-                        let irq_chip = IRQ_CHIP.get().unwrap().lock();
-                        match irq_chip.claim_interrupt(current_cpu) {
-                            Some(irq_num) => {
-                                drop(irq_chip);
-                                call_irq_callback_functions(
-                                    &self.as_trap_frame(),
-                                    irq_num as usize,
-                                );
-                            }
-                            None => break,
-                        }
-                    }
+                    crate::arch::irq::handle_supervisor_external_interrupt(&self.as_trap_frame());
                 }
                 Trap::Interrupt(Interrupt::SupervisorSoft) => {
                     call_irq_callback_functions(&self.as_trap_frame(), get_ipi_irq_num());

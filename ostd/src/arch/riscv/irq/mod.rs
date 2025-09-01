@@ -15,7 +15,7 @@ use spin::Once;
 
 use crate::{
     arch::{boot::DEVICE_TREE, irq::plic::Plic},
-    cpu::{CpuId, PinCurrentCpu},
+    cpu::PinCurrentCpu,
     io::IoMemAllocatorBuilder,
     mm::kspace::IS_KERNEL_PAGE_TABLE_ACTIVATED,
     sync::SpinLock,
@@ -130,6 +130,21 @@ pub(crate) fn is_local_enabled() -> bool {
     riscv::register::sstatus::read().sie()
 }
 
+pub(crate) fn handle_supervisor_external_interrupt(f: &crate::arch::trap::TrapFrame) {
+    let current_cpu =
+        unsafe { HwCpuId::read_current(&crate::task::disable_preempt()) }.as_usize() as u32;
+    loop {
+        let irq_chip = IRQ_CHIP.get().unwrap().lock();
+        match irq_chip.claim_interrupt(current_cpu) {
+            Some(irq_num) => {
+                drop(irq_chip);
+                crate::trap::call_irq_callback_functions(f, irq_num as usize);
+            }
+            None => break,
+        }
+    }
+}
+
 /// An IRQ chip.
 ///
 /// This abstracts the hardware IRQ chips (or IRQ controllers), allowing the bus
@@ -169,7 +184,7 @@ impl IrqChip {
         unsafe {
             plic.set_priority(interrupt_source.interrupt, 1);
             plic.set_interrupt_enabled(
-                CpuId::current_racy().as_usize() as u32,
+                HwCpuId::read_current(&crate::task::disable_preempt()).as_usize() as u32,
                 interrupt_source.interrupt,
                 true,
             );
@@ -216,7 +231,11 @@ impl IrqChip {
         let plic = &mut self.plics[*index];
         // SAFETY: The kernel page table is already activated.
         unsafe {
-            plic.set_interrupt_enabled(CpuId::current_racy().as_usize() as u32, *interrupt, false);
+            plic.set_interrupt_enabled(
+                HwCpuId::read_current(&crate::task::disable_preempt()).as_usize() as u32,
+                *interrupt,
+                false,
+            );
             plic.set_priority(*interrupt, 0);
         }
         plic.unmap_interrupt_source(*interrupt);
@@ -319,6 +338,10 @@ impl HwCpuId {
         let _ = guard;
         // SAFETY: The safety is ensured by the caller.
         Self(unsafe { super::boot::smp::get_current_hart_id() })
+    }
+
+    pub(crate) fn as_usize(&self) -> usize {
+        self.0 as usize
     }
 }
 

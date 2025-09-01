@@ -13,12 +13,10 @@ pub use trap::TrapFrame;
 
 use super::{
     cpu::context::CpuException,
-    irq::{disable_local, enable_local, get_ipi_irq_num, IRQ_CHIP},
+    irq::{disable_local, enable_local, get_ipi_irq_num},
     timer::TIMER_IRQ_NUM,
 };
-use crate::{
-    cpu::CpuId, cpu_local_cell, mm::MAX_USERSPACE_VADDR, trap::call_irq_callback_functions,
-};
+use crate::{cpu_local_cell, mm::MAX_USERSPACE_VADDR, trap::call_irq_callback_functions};
 
 cpu_local_cell! {
     static IS_KERNEL_INTERRUPTED: bool = false;
@@ -67,17 +65,7 @@ extern "C" fn trap_handler(f: &mut TrapFrame) {
                     call_irq_callback_functions(f, TIMER_IRQ_NUM.load(Ordering::Relaxed) as usize);
                 }
                 Interrupt::SupervisorExternal => {
-                    let current_cpu = CpuId::current_racy().as_usize() as u32;
-                    loop {
-                        let irq_chip = IRQ_CHIP.get().unwrap().lock();
-                        match irq_chip.claim_interrupt(current_cpu) {
-                            Some(irq_num) => {
-                                drop(irq_chip);
-                                call_irq_callback_functions(f, irq_num as usize);
-                            }
-                            None => break,
-                        }
-                    }
+                    super::irq::handle_supervisor_external_interrupt(f);
                 }
                 Interrupt::SupervisorSoft => {
                     call_irq_callback_functions(f, get_ipi_irq_num());
