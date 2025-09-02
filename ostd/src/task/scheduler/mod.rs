@@ -85,7 +85,7 @@ use crate::{
 pub fn inject_scheduler(scheduler: &'static dyn Scheduler<Task>) {
     SCHEDULER.call_once(|| scheduler);
 
-    timer::register_callback(|| {
+    timer::register_callback(|_| {
         SCHEDULER.get().unwrap().mut_local_rq_with(&mut |local_rq| {
             let should_pick_next = local_rq.update_current(UpdateFlags::Tick);
             if should_pick_next {

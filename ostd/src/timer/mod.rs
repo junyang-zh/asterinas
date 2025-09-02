@@ -4,27 +4,32 @@
 
 pub(crate) mod jiffies;
 
-use alloc::{boxed::Box, vec::Vec};
-use core::cell::RefCell;
+use alloc::{boxed::Box, vec, vec::Vec};
 
 pub use jiffies::Jiffies;
 
-use crate::{cpu_local, trap};
+use crate::{sync::RcuOption, trap::irq::DisabledLocalIrqGuard};
 
-type InterruptCallback = Box<dyn Fn() + Sync + Send>;
+type InterruptCallback = fn(&DisabledLocalIrqGuard);
 
-cpu_local! {
-    pub(crate) static INTERRUPT_CALLBACKS: RefCell<Vec<InterruptCallback>> = RefCell::new(Vec::new());
-}
+pub(crate) static INTERRUPT_CALLBACKS: RcuOption<Box<Vec<InterruptCallback>>> =
+    RcuOption::new_none();
 
 /// Register a function that will be executed during the system timer interruption.
-pub fn register_callback<F>(func: F)
-where
-    F: Fn() + Sync + Send + 'static,
-{
-    let irq_guard = trap::irq::disable_local();
-    INTERRUPT_CALLBACKS
-        .get_with(&irq_guard)
-        .borrow_mut()
-        .push(Box::new(func));
+pub fn register_callback(func: InterruptCallback) {
+    loop {
+        let guard = INTERRUPT_CALLBACKS.read();
+        let new_callbacks;
+        if let Some(copied_callbacks) = guard.get() {
+            let mut cloned_callbacks = (*copied_callbacks).clone();
+            cloned_callbacks.push(func);
+            new_callbacks = Some(cloned_callbacks);
+        } else {
+            new_callbacks = Some(Box::new(vec![func]));
+        }
+        if guard.compare_exchange(new_callbacks).is_ok() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
 }

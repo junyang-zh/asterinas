@@ -8,7 +8,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use ostd::{
     arch::{read_tsc, timer::TIMER_FREQ, tsc_freq},
+    cpu::{CpuId, PinCurrentCpu},
     timer,
+    trap::irq::DisabledLocalIrqGuard,
 };
 use spin::Once;
 
@@ -67,20 +69,22 @@ fn update_clocksource() {
 static TSC_UPDATE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn init_timer() {
-    // The `max_delay_secs` should be set as `clock.max_delay_secs() >> 1` or something much smaller than `max_delay_secs`.
-    // This is because the initialization of this timer occurs during system startup,
-    // and the system will also undergo other initialization processes, during which time interrupts are disabled.
-    // This results in the actual trigger time of the timer being delayed by about 5 seconds compared to the set time.
-    // If without KVM, the delayed time will be larger.
-    // TODO: This is a temporary solution, and should be modified in the future.
-    let max_delay_secs = CLOCK.get().unwrap().max_delay_secs() >> 1;
-    let delay_counts = TIMER_FREQ * max_delay_secs;
+    let update = move |guard: &DisabledLocalIrqGuard| {
+        if guard.current_cpu() == CpuId::bsp() {
+            // The `max_delay_secs` should be set as `clock.max_delay_secs() >> 1` or something much smaller than `max_delay_secs`.
+            // This is because the initialization of this timer occurs during system startup,
+            // and the system will also undergo other initialization processes, during which time interrupts are disabled.
+            // This results in the actual trigger time of the timer being delayed by about 5 seconds compared to the set time.
+            // If without KVM, the delayed time will be larger.
+            // TODO: This is a temporary solution, and should be modified in the future.
+            let max_delay_secs = CLOCK.get().unwrap().max_delay_secs() >> 1;
+            let delay_counts = TIMER_FREQ * max_delay_secs;
 
-    let update = move || {
-        let counter = TSC_UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let counter = TSC_UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        if counter % delay_counts == 0 {
-            update_clocksource();
+            if counter % delay_counts == 0 {
+                update_clocksource();
+            }
         }
     };
 

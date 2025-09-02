@@ -3,7 +3,12 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 
 use aster_softirq::{softirq_id::TIMER_SOFTIRQ_ID, SoftIrqLine};
-use ostd::{sync::RcuOption, timer};
+use ostd::{
+    cpu::{CpuId, PinCurrentCpu},
+    sync::RcuOption,
+    timer,
+    trap::irq::DisabledLocalIrqGuard,
+};
 
 #[expect(clippy::type_complexity)]
 static TIMER_SOFTIRQ_CALLBACKS: RcuOption<Box<Vec<fn()>>> = RcuOption::new_none();
@@ -11,7 +16,10 @@ static TIMER_SOFTIRQ_CALLBACKS: RcuOption<Box<Vec<fn()>>> = RcuOption::new_none(
 pub(super) fn init() {
     SoftIrqLine::get(TIMER_SOFTIRQ_ID).enable(timer_softirq_handler);
 
-    timer::register_callback(|| {
+    timer::register_callback(|guard: &DisabledLocalIrqGuard| {
+        if guard.current_cpu() != CpuId::bsp() {
+            return;
+        }
         SoftIrqLine::get(TIMER_SOFTIRQ_ID).raise();
     });
 }

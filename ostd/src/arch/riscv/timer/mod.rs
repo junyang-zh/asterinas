@@ -95,11 +95,13 @@ fn timer_callback(_: &TrapFrame) {
         crate::timer::jiffies::ELAPSED.fetch_add(1, Ordering::Relaxed);
     }
 
-    let callbacks_guard = INTERRUPT_CALLBACKS.get_with(&irq_guard);
-    for callback in callbacks_guard.borrow().iter() {
-        (callback)();
+    let callbacks = INTERRUPT_CALLBACKS.read_with(&irq_guard);
+    if let Some(callbacks) = callbacks {
+        for callback in callbacks.iter() {
+            (callback)(&irq_guard);
+        }
+        drop(callbacks);
     }
-    drop(callbacks_guard);
 
     set_next_timer();
 }

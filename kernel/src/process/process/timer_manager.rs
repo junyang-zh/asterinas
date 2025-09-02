@@ -7,7 +7,9 @@ use alloc::{
 };
 
 use id_alloc::IdAlloc;
-use ostd::{arch::trap::is_kernel_interrupted, sync::Mutex, timer};
+use ostd::{
+    arch::trap::is_kernel_interrupted, sync::Mutex, timer, trap::irq::DisabledLocalIrqGuard,
+};
 
 use super::Process;
 use crate::{
@@ -30,7 +32,7 @@ use crate::{
 /// This function will be invoked at the system timer interrupt, and
 /// invoke the callbacks of expired timers which are based on the updated
 /// CPU clock.
-fn update_cpu_time() {
+fn update_cpu_time(_guard: &DisabledLocalIrqGuard) {
     let Some(current_thread) = Thread::current() else {
         return;
     };
