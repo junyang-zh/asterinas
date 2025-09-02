@@ -189,12 +189,11 @@ impl IrqChip {
         // SAFETY: The kernel page table is already activated.
         unsafe {
             plic.set_priority(interrupt_source.interrupt, 1);
-            plic.set_interrupt_enabled(
-                HwCpuId::read_current(&crate::task::disable_preempt()).as_usize() as u32,
-                interrupt_source.interrupt,
-                true,
-            );
         }
+
+        super::boot::smp::for_each_hart_id(|hart_id| unsafe {
+            plic.set_interrupt_enabled(hart_id, interrupt_source.interrupt, true);
+        });
 
         Ok(MappedIrqLine {
             irq_line,
@@ -235,13 +234,13 @@ impl IrqChip {
             .as_ref()
             .unwrap();
         let plic = &mut self.plics[*index];
+
+        super::boot::smp::for_each_hart_id(|hart_id| unsafe {
+            plic.set_interrupt_enabled(hart_id, *interrupt, false);
+        });
+
         // SAFETY: The kernel page table is already activated.
         unsafe {
-            plic.set_interrupt_enabled(
-                HwCpuId::read_current(&crate::task::disable_preempt()).as_usize() as u32,
-                *interrupt,
-                false,
-            );
             plic.set_priority(*interrupt, 0);
         }
         plic.unmap_interrupt_source(*interrupt);

@@ -61,7 +61,7 @@ pub(crate) unsafe fn bringup_all_aps(info_ptr: *const PerApRawInfo, pt_ptr: Padd
     });
 }
 
-fn for_each_hart_id(mut f: impl FnMut(u32)) {
+pub(in crate::arch) fn for_each_hart_id(mut f: impl FnMut(u32)) {
     // Count CPU nodes in the device tree
     // RISC-V device trees typically have CPU nodes under /cpus
     let Some(device_tree) = super::DEVICE_TREE.get() else {

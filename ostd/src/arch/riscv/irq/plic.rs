@@ -160,7 +160,7 @@ impl Plic {
             }
 
             assert!(self.num_targets % 2 == 0);
-            for hart in 0..(self.num_targets / 2) {
+            crate::arch::boot::smp::for_each_hart_id(|hart| {
                 // Disable all interrupt sources for all targets.
                 for interrupt_source in 1..self.num_interrupt_sources {
                     self.set_interrupt_enabled(hart, interrupt_source, false);
@@ -175,7 +175,7 @@ impl Plic {
                 {
                     self.complete_interrupt(hart, irq_num);
                 }
-            }
+            });
         }
     }
 }
