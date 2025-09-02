@@ -87,6 +87,12 @@ pub(super) unsafe fn init(io_mem_builder: &IoMemAllocatorBuilder) {
 ///
 /// This function must be called once and only once on each AP.
 pub(super) unsafe fn init_on_ap() {
+    // SAFETY: Accessing the `sie` CSR to enable the external interrupt in the
+    // AP is safe here.
+    unsafe {
+        riscv::register::sie::set_sext();
+    }
+
     // SAFETY: Accessing the `sie` CSR to enable the software interrupt in the
     // AP is safe here.
     unsafe {
