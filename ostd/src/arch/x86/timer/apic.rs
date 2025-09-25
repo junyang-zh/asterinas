@@ -4,7 +4,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use log::info;
 
-use super::TIMER_FREQ;
 use crate::{
     arch::{
         kernel::apic::{self, Apic, DivideConfig},
@@ -12,14 +11,15 @@ use crate::{
         trap::TrapFrame,
         tsc_freq,
     },
+    irq::IrqLine,
     task::disable_preempt,
-    trap::irq::IrqLine,
+    timer::TIMER_FREQ,
 };
 
 /// Initializes APIC with TSC-deadline mode or periodic mode.
 ///
 /// Return the corresponding [`IrqLine`] for the system timer.
-pub(super) fn init_bsp() -> IrqLine {
+pub(super) fn init_on_bsp() -> IrqLine {
     if is_tsc_deadline_mode_supported() {
         init_deadline_mode_config();
     } else {
@@ -34,7 +34,7 @@ pub(super) fn init_bsp() -> IrqLine {
 /// Initializes APIC timer on AP.
 ///
 /// The caller should provide the [`IrqLine`] for the system timer.
-pub(super) fn init_ap(timer_irq: &IrqLine) {
+pub(super) fn init_on_ap(timer_irq: &IrqLine) {
     init_timer(timer_irq);
 }
 

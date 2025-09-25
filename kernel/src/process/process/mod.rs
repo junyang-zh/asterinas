@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::{
+    sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering},
+    time::Duration,
+};
 
 use self::timer_manager::PosixTimerManager;
 use super::{
@@ -52,8 +55,8 @@ pub type Sid = u32;
 
 pub type ExitCode = u32;
 
-pub(super) fn init() {
-    timer_manager::init();
+pub(super) fn init_on_each_cpu() {
+    timer_manager::init_on_each_cpu();
 }
 
 pub(super) fn init_in_first_process(ctx: &Context) {
@@ -86,12 +89,17 @@ pub struct Process {
     children: Mutex<BTreeMap<Pid, Arc<Process>>>,
     /// Process group
     pub(super) process_group: Mutex<Weak<ProcessGroup>>,
+    /// The resource usage statistics of reaped child processes.
+    reaped_children_stats: Mutex<ReapedChildrenStats>,
     /// resource limits
     resource_limits: ResourceLimits,
     /// Scheduling priority nice value
     /// According to POSIX.1, the nice value is a per-process attribute,
     /// the threads in a process should share a nice value.
     nice: AtomicNice,
+    /// The adjustment value of the out-of-memory (OOM) killer score.
+    // FIXME: Support OOM killer.
+    oom_score_adj: AtomicI16,
 
     // Child reaper attribute
     /// Whether the process is a child subreaper.
@@ -201,6 +209,7 @@ impl Process {
 
         resource_limits: ResourceLimits,
         nice: Nice,
+        oom_score_adj: i16,
         sig_dispositions: Arc<Mutex<SigDispositions>>,
         user_ns: Arc<UserNamespace>,
     ) -> Arc<Self> {
@@ -221,6 +230,7 @@ impl Process {
             parent: ParentProcess::new(parent),
             children: Mutex::new(BTreeMap::new()),
             process_group: Mutex::new(Weak::new()),
+            reaped_children_stats: Mutex::new(ReapedChildrenStats::default()),
             is_child_subreaper: AtomicBool::new(false),
             has_child_subreaper: AtomicBool::new(false),
             sig_dispositions,
@@ -228,6 +238,7 @@ impl Process {
             exit_signal: AtomicSigNum::new_empty(),
             resource_limits,
             nice: AtomicNice::new(nice),
+            oom_score_adj: AtomicI16::new(oom_score_adj),
             timer_manager: PosixTimerManager::new(&prof_clock, process_ref),
             prof_clock,
             user_ns: Mutex::new(user_ns),
@@ -287,6 +298,10 @@ impl Process {
         self.tasks.lock().main().as_thread().unwrap().clone()
     }
 
+    pub fn oom_score_adj(&self) -> &AtomicI16 {
+        &self.oom_score_adj
+    }
+
     // *********** Parent and child ***********
 
     pub fn parent(&self) -> &ParentProcess {
@@ -303,6 +318,10 @@ impl Process {
 
     pub fn children_wait_queue(&self) -> &WaitQueue {
         &self.children_wait_queue
+    }
+
+    pub fn reaped_children_stats(&self) -> &Mutex<ReapedChildrenStats> {
+        &self.reaped_children_stats
     }
 
     // *********** Process group & Session ***********
@@ -805,4 +824,27 @@ pub fn broadcast_signal_async(process_group: Weak<ProcessGroup>, signum: SigNum)
         },
         work_queue::WorkPriority::High,
     );
+}
+
+/// The resource usage statistics of child processes that have terminated and
+/// been reaped by the parent.
+///
+/// These statistics include the resources consumed by grandchildren and more
+/// distant descendants, if all intermediate child processes have waited on
+/// their own terminated children.
+#[derive(Default)]
+pub struct ReapedChildrenStats {
+    user_time: Duration,
+    kernel_time: Duration,
+}
+
+impl ReapedChildrenStats {
+    pub fn add(&mut self, utime: Duration, stime: Duration) {
+        self.user_time += utime;
+        self.kernel_time += stime;
+    }
+
+    pub fn get(&self) -> (Duration, Duration) {
+        (self.user_time, self.kernel_time)
+    }
 }

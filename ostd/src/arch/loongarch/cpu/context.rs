@@ -11,7 +11,8 @@ use crate::{
         mm::tlb_flush_addr,
         trap::{RawUserContext, TrapFrame},
     },
-    trap::call_irq_callback_functions,
+    cpu::PrivilegeLevel,
+    irq::call_irq_callback_functions,
     user::{ReturnReason, UserContextApi, UserContextApiInternal},
 };
 
@@ -219,7 +220,7 @@ impl UserContextApiInternal for UserContext {
                         log::debug!("Handling hardware interrupt: {:?}", interrupt);
                         while let Some(irq) = crate::arch::kernel::irq::claim() {
                             // Call the IRQ callback functions for the claimed interrupt
-                            call_irq_callback_functions(&self.as_trap_frame(), irq as _);
+                            call_irq_callback_functions(&self.as_trap_frame(), irq as _, PrivilegeLevel::User);
                         }
                     }
                     Interrupt::PMI => todo!(),

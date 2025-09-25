@@ -29,6 +29,7 @@
 #![feature(associated_type_defaults)]
 #![register_tool(component_access_control)]
 
+use component::InitStage;
 use kcmdline::KCmdlineArg;
 use ostd::{
     arch::qemu::{exit_qemu, QemuExitCode},
@@ -83,7 +84,7 @@ mod vm;
 #[controlled]
 fn main() {
     ostd::early_println!("[kernel] OSTD initialized. Preparing components.");
-    component::init_all(component::parse_metadata!()).unwrap();
+    component::init_all(InitStage::Bootstrap, component::parse_metadata!()).unwrap();
     init();
 
     // Spawn all AP idle threads.
@@ -109,10 +110,13 @@ fn init() {
 }
 
 fn init_on_each_cpu() {
+    sched::init_on_each_cpu();
+    process::init_on_each_cpu();
     fs::init_on_each_cpu();
 }
 
 fn init_in_first_kthread(fs_resolver: &FsResolver) {
+    component::init_all(InitStage::Kthread, component::parse_metadata!()).unwrap();
     // Work queue should be initialized before interrupt is enabled,
     // in case any irq handler uses work queue as bottom half
     thread::work_queue::init_in_first_kthread();
@@ -124,6 +128,7 @@ fn init_in_first_kthread(fs_resolver: &FsResolver) {
 }
 
 fn init_in_first_process(ctx: &Context) {
+    component::init_all(InitStage::Process, component::parse_metadata!()).unwrap();
     device::init_in_first_process(ctx).unwrap();
     fs::init_in_first_process(ctx);
     process::init_in_first_process(ctx);
@@ -186,14 +191,6 @@ fn first_kthread() {
 }
 
 fn print_banner() {
-    println!("\x1B[36m");
-    println!(
-        r"
-   _   ___ _____ ___ ___ ___ _  _   _   ___
-  /_\ / __|_   _| __| _ \_ _| \| | /_\ / __|
- / _ \\__ \ | | | _||   /| || .` |/ _ \\__ \
-/_/ \_\___/ |_| |___|_|_\___|_|\_/_/ \_\___/
-"
-    );
-    println!("\x1B[0m");
+    println!("");
+    println!("{}", logo_ascii_art::get_gradient_color_version());
 }

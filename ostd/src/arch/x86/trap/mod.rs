@@ -25,21 +25,22 @@ use cfg_if::cfg_if;
 use log::debug;
 use spin::Once;
 
-use super::{cpu::context::GeneralRegs, ex_table::ExTable};
+use super::cpu::context::GeneralRegs;
 use crate::{
     arch::{
         cpu::context::{CpuException, PageFaultErrorCode, RawPageFaultInfo},
         if_tdx_enabled,
         irq::{disable_local, enable_local},
     },
-    cpu_local_cell,
+    cpu::PrivilegeLevel,
+    ex_table::ExTable,
+    irq::call_irq_callback_functions,
     mm::{
         kspace::{KERNEL_PAGE_TABLE, LINEAR_MAPPING_BASE_VADDR, LINEAR_MAPPING_VADDR_RANGE},
         page_prop::{CachePolicy, PageProperty},
         PageFlags, PrivilegedPageFlags as PrivFlags, MAX_USERSPACE_VADDR, PAGE_SIZE,
     },
     task::disable_preempt,
-    trap::call_irq_callback_functions,
 };
 
 cfg_if! {
@@ -47,10 +48,6 @@ cfg_if! {
         use tdx_guest::{tdcall, handle_virtual_exception};
         use crate::arch::tdx_guest::TrapFrameWrapper;
     }
-}
-
-cpu_local_cell! {
-    static KERNEL_INTERRUPT_NESTED_LEVEL: u8 = 0;
 }
 
 /// Trap frame of kernel interrupt
@@ -76,24 +73,8 @@ cpu_local_cell! {
 #[expect(missing_docs)]
 pub struct TrapFrame {
     // Pushed by 'trap.S'
-    pub rax: usize,
-    pub rbx: usize,
-    pub rcx: usize,
-    pub rdx: usize,
-    pub rsi: usize,
-    pub rdi: usize,
-    pub rbp: usize,
-    pub rsp: usize,
-    pub r8: usize,
-    pub r9: usize,
-    pub r10: usize,
-    pub r11: usize,
-    pub r12: usize,
-    pub r13: usize,
-    pub r14: usize,
-    pub r15: usize,
+    pub general_regs: GeneralRegs,
     pub _pad: usize,
-
     pub trap_num: usize,
     pub error_code: usize,
 
@@ -133,16 +114,17 @@ pub(crate) unsafe fn init() {
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 #[repr(C)]
 pub(super) struct RawUserContext {
-    pub(super) general: GeneralRegs,
+    pub(super) general_regs: GeneralRegs,
+
+    // Software-saved user state.
+    pub(super) rip: usize,
+    pub(super) rflags: usize,
+    pub(super) fsbase: usize,
+    pub(super) gsbase: usize,
+
+    // Trap information
     pub(super) trap_num: usize,
     pub(super) error_code: usize,
-}
-
-/// Returns true if this function is called within the context of an IRQ handler
-/// and the IRQ occurs while the CPU is executing in the kernel mode.
-/// Otherwise, it returns false.
-pub fn is_kernel_interrupted() -> bool {
-    KERNEL_INTERRUPT_NESTED_LEVEL.load() != 0
 }
 
 /// Handle traps (only from kernel).
@@ -197,9 +179,7 @@ extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             );
         }
         None => {
-            KERNEL_INTERRUPT_NESTED_LEVEL.add_assign(1);
-            call_irq_callback_functions(f, f.trap_num);
-            KERNEL_INTERRUPT_NESTED_LEVEL.sub_assign(1);
+            call_irq_callback_functions(f, f.trap_num, PrivilegeLevel::Kernel);
         }
     }
 }

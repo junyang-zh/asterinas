@@ -56,6 +56,16 @@ impl TryFrom<usize> for CpuId {
     }
 }
 
+/// The CPU privilege level: user mode or kernel mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum PrivilegeLevel {
+    /// User mode.
+    User = 0,
+    /// Kernel mode.
+    Kernel = 1,
+}
+
 /// The number of CPUs.
 static mut NUM_CPUS: u32 = 1;
 
@@ -136,7 +146,7 @@ unsafe fn set_this_cpu_id(id: u32) {
 /// The implementor must ensure that the current task is pinned to the current
 /// CPU while any one of the instances of the implemented structure exists.
 ///
-/// [`DisabledLocalIrqGuard`]: crate::trap::irq::DisabledLocalIrqGuard
+/// [`DisabledLocalIrqGuard`]: crate::irq::DisabledLocalIrqGuard
 /// [`DisabledPreemptGuard`]: crate::task::DisabledPreemptGuard
 pub unsafe trait PinCurrentCpu {
     /// Returns the ID of the current CPU.

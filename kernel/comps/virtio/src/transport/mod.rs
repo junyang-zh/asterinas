@@ -3,13 +3,13 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::fmt::Debug;
 
+use aster_pci::cfg_space::Bar;
 use aster_util::safe_ptr::SafePtr;
 use ostd::{
     arch::device::io_port::{PortRead, PortWrite},
-    bus::pci::cfg_space::Bar,
     io::IoMem,
+    irq::IrqCallbackFunction,
     mm::{DmaCoherent, PodOnce},
-    trap::irq::IrqCallbackFunction,
     Pod,
 };
 

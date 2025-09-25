@@ -84,8 +84,21 @@ use crate::{
 /// before any [`Task`]-related APIs are invoked.
 pub fn inject_scheduler(scheduler: &'static dyn Scheduler<Task>) {
     SCHEDULER.call_once(|| scheduler);
+}
 
-    timer::register_callback(|| {
+/// Enables preemptive scheduling on the current CPU.
+///
+/// After calling this function on a CPU,
+/// a task that is executing in the user mode may get preempted
+/// if another runnable task on the same CPU is deemed more urgent by the scheduler.
+///
+/// OSTD achieves task preemption by registering a per-CPU timer callback
+/// to invoke the scheduler periodically.
+/// Thus, this function should be called _once_ on every CPU
+/// by an OSTD-based kernel during its initialization phase,
+/// after it has injected its scheduler via [`inject_scheduler`].
+pub fn enable_preemption_on_cpu() {
+    timer::register_callback_on_cpu(|| {
         SCHEDULER.get().unwrap().mut_local_rq_with(&mut |local_rq| {
             let should_pick_next = local_rq.update_current(UpdateFlags::Tick);
             if should_pick_next {
@@ -137,7 +150,7 @@ pub trait Scheduler<T = Task>: Sync + Send {
 ///   or any synchronization primitive built upon it (e.g., [`crate::sync::WaitQueue`], [`crate::sync::Mutex`]),
 ///   which blocks the current task until a wake-up event occurs.
 /// - **Ticking**, triggered periodically by the system timer
-///   (see [`crate::arch::timer::TIMER_FREQ`]),
+///   (see [`crate::timer::TIMER_FREQ`]),
 ///   which provides an opportunity to do time accounting and consider preemption.
 /// - **Exiting**, triggered when the execution logic of a task has come to an end,
 ///   which informs the scheduler that the task is exiting and will never be enqueued again.

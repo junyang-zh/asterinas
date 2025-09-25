@@ -49,14 +49,14 @@ pub trait SignalContext {
 pub fn handle_pending_signal(
     user_ctx: &mut UserContext,
     ctx: &Context,
-    syscall_number: Option<usize>,
+    initial_syscall_ret: Option<usize>,
 ) {
-    let syscall_restart = if let Some(syscall_number) = syscall_number
+    let syscall_restart = if let Some(initial_syscall_ret) = initial_syscall_ret
         && user_ctx.syscall_ret() == -(Errno::ERESTARTSYS as i32) as usize
     {
         // We should never return `ERESTARTSYS` to the userspace.
         user_ctx.set_syscall_ret(-(Errno::EINTR as i32) as usize);
-        Some(syscall_number)
+        Some(initial_syscall_ret)
     } else {
         None
     };
@@ -90,7 +90,7 @@ pub fn handle_pending_signal(
             restorer_addr,
             mask,
         } => {
-            if let Some(syscall_number) = syscall_restart
+            if let Some(initial_syscall_ret) = syscall_restart
                 && flags.contains(SigActionFlags::SA_RESTART)
             {
                 #[cfg(target_arch = "x86_64")]
@@ -100,7 +100,7 @@ pub fn handle_pending_signal(
                 #[cfg(target_arch = "loongarch64")]
                 const SYSCALL_INSTR_LEN: usize = 4; // syscall
 
-                user_ctx.set_syscall_num(syscall_number);
+                user_ctx.set_syscall_ret(initial_syscall_ret);
                 user_ctx
                     .set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
             }
@@ -315,7 +315,7 @@ pub fn handle_user_signal(
             // Clear `DF` flag for C function entry to conform to x86-64 calling convention.
             // Bit 10 is the DF flag.
             const X86_RFLAGS_DF: usize = 1 << 10;
-            user_ctx.general_regs_mut().rflags &= !X86_RFLAGS_DF;
+            user_ctx.set_rflags(user_ctx.rflags() & !X86_RFLAGS_DF);
         }
     }
 

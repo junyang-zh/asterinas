@@ -10,15 +10,15 @@ use core::{fmt, sync::atomic::Ordering};
 use ostd::{
     arch::read_tsc as sched_clock,
     cpu::{all_cpus, CpuId, PinCurrentCpu},
+    irq::disable_local,
     sync::SpinLock,
     task::{
         scheduler::{
-            info::CommonSchedInfo, inject_scheduler, EnqueueFlags, LocalRunQueue, Scheduler,
-            UpdateFlags,
+            enable_preemption_on_cpu, info::CommonSchedInfo, inject_scheduler, EnqueueFlags,
+            LocalRunQueue, Scheduler, UpdateFlags,
         },
         AtomicCpuId, Task,
     },
-    trap::irq::disable_local,
 };
 
 use super::{
@@ -53,6 +53,10 @@ pub fn init() {
     // We set this after injecting the scheduler into ostd,
     // so that the loadavg statistics are updated after the scheduler is used.
     set_stats_from_scheduler(scheduler);
+}
+
+pub fn init_on_each_cpu() {
+    enable_preemption_on_cpu();
 }
 
 /// Represents the middle layer between scheduling classes and generic scheduler

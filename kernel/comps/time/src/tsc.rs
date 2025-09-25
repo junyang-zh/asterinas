@@ -7,8 +7,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use ostd::{
-    arch::{read_tsc, timer::TIMER_FREQ, tsc_freq},
-    timer,
+    arch::{read_tsc, tsc_freq},
+    timer::{self, TIMER_FREQ},
 };
 use spin::Once;
 
@@ -85,5 +85,5 @@ fn init_timer() {
     };
 
     // TODO: re-organize the code structure and use the `Timer` to achieve the updating.
-    timer::register_callback(update);
+    timer::register_callback_on_cpu(update);
 }

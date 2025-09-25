@@ -32,7 +32,7 @@ pub use namespace::{
 pub use pid_file::PidFile;
 pub use process::{
     broadcast_signal_async, enqueue_signal_async, spawn_init_process, ExitCode, JobControl, Pgid,
-    Pid, Process, ProcessGroup, Session, Sid, Terminal,
+    Pid, Process, ProcessGroup, ReapedChildrenStats, Session, Sid, Terminal,
 };
 pub use process_filter::ProcessFilter;
 pub use process_vm::{renew_vm_and_map, MAX_LEN_STRING_ARG, MAX_NR_STRING_ARGS};
@@ -44,8 +44,11 @@ pub use wait::{do_wait, WaitOptions, WaitStatus};
 use crate::context::Context;
 
 pub(super) fn init() {
-    process::init();
     posix_thread::futex::init();
+}
+
+pub(super) fn init_on_each_cpu() {
+    process::init_on_each_cpu();
 }
 
 pub(super) fn init_in_first_process(ctx: &Context) {

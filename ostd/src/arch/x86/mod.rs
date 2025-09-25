@@ -5,17 +5,15 @@
 pub mod boot;
 pub mod cpu;
 pub mod device;
-pub(crate) mod ex_table;
 pub(crate) mod io;
 pub(crate) mod iommu;
 pub(crate) mod irq;
 pub mod kernel;
 pub(crate) mod mm;
-pub(crate) mod pci;
 pub mod qemu;
 pub(crate) mod serial;
 pub(crate) mod task;
-pub mod timer;
+mod timer;
 pub mod trap;
 
 #[cfg(feature = "cvm_guest")]
@@ -44,12 +42,12 @@ pub(crate) fn init_cvm_guest() {
 
 /// Architecture-specific initialization on the bootstrapping processor.
 ///
-/// It should be called when the heap and frame allocators are available.
-///
 /// # Safety
 ///
-/// This function must be called only once in the boot context of the
-/// bootstrapping processor.
+/// 1. This function should only be called once in the boot context of the BSP.
+/// 2. This function should be called after the heap allocator is initialized.
+/// 3. This function should be called after the kernel page table is activated
+///    on the BSP.
 pub(crate) unsafe fn late_init_on_bsp() {
     // SAFETY: This function is only called once on BSP.
     unsafe { trap::init() };
@@ -60,9 +58,13 @@ pub(crate) unsafe fn late_init_on_bsp() {
     kernel::irq::init(&io_mem_builder);
 
     kernel::tsc::init_tsc_freq();
-    timer::init_bsp();
+    timer::init_on_bsp();
 
-    // SAFETY: We're on the BSP and we're ready to boot all APs.
+    // SAFETY:
+    // 1. The caller ensures that the function is only called once in the
+    //    boot context of the BSP.
+    // 2. The caller ensures that the function is called after the kernel
+    //    page table is activated on the BSP.
     unsafe { crate::boot::smp::boot_all_aps() };
 
     if_tdx_enabled!({
@@ -89,7 +91,7 @@ pub(crate) unsafe fn late_init_on_bsp() {
 ///
 /// [`init_on_bsp`]: crate::cpu::init_on_bsp
 pub(crate) unsafe fn init_on_ap() {
-    timer::init_ap();
+    timer::init_on_ap();
 }
 
 pub(crate) fn interrupts_ack(irq_number: usize) {

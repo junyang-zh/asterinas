@@ -15,6 +15,7 @@ use ostd::{
     mm::Vaddr,
     sync::SpinLock,
     task::DisabledPreemptGuard,
+    user::UserContextApi,
     Pod,
 };
 
@@ -27,10 +28,6 @@ impl LinuxAbi for UserContext {
 
     fn syscall_ret(&self) -> usize {
         self.rax()
-    }
-
-    fn set_syscall_num(&mut self, num: usize) {
-        self.set_rax(num);
     }
 
     fn set_syscall_ret(&mut self, ret: usize) {
@@ -107,8 +104,6 @@ macro_rules! copy_gp_regs {
         $dst.r13 = $src.r13;
         $dst.r14 = $src.r14;
         $dst.r15 = $src.r15;
-        $dst.rip = $src.rip;
-        $dst.rflags = $src.rflags;
     };
 }
 
@@ -116,11 +111,15 @@ impl SigContext {
     pub fn copy_user_regs_to(&self, dst: &mut UserContext) {
         let gp_regs = dst.general_regs_mut();
         copy_gp_regs!(self, gp_regs);
+        dst.set_instruction_pointer(self.rip);
+        dst.set_rflags(self.rflags);
     }
 
     pub fn copy_user_regs_from(&mut self, src: &UserContext) {
         let gp_regs = src.general_regs();
         copy_gp_regs!(gp_regs, self);
+        self.rip = src.instruction_pointer();
+        self.rflags = src.rflags();
 
         // TODO: Fill exception information in `SigContext`.
     }

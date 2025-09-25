@@ -3,16 +3,14 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::fmt::Debug;
 
+use aster_pci::{capability::CapabilityData, cfg_space::Bar, common_device::PciCommonDevice};
 use aster_util::safe_ptr::SafePtr;
 use log::{info, warn};
 use ostd::{
-    bus::{
-        pci::{capability::CapabilityData, cfg_space::Bar, common_device::PciCommonDevice},
-        BusProbeError,
-    },
+    bus::BusProbeError,
     io::IoMem,
+    irq::IrqCallbackFunction,
     mm::{DmaCoherent, HasDaddr, PAGE_SIZE},
-    trap::irq::IrqCallbackFunction,
 };
 
 use crate::{
