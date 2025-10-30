@@ -20,9 +20,10 @@
 #   LOAD
 #   STORE
 
-    .section .text
-    .global trap_entry
-    .balign 4
+.text
+
+.balign 4
+.global trap_entry
 trap_entry:
     # If coming from userspace, preserve the user stack pointer and load
     # the kernel stack pointer. If we came from the kernel, sscratch
@@ -82,7 +83,8 @@ trap_from_user:
     beqz t1, end_trap_from_user
 end_trap_from_kernel:
     mv a0, sp               # first arg is TrapFrame
-    la ra, trap_return      # set return address
+    lla ra, trap_return     # set return address
+.extern trap_handler
     j trap_handler
 
 end_trap_from_user:
@@ -108,7 +110,7 @@ end_trap_from_user:
     ret
 
 .global run_user
-run_user:
+run_user: # (regs: &mut RawUserContext)
     # save callee-saved registers
     addi sp, sp, -14 * XLENB
     STORE_SP s0, 0

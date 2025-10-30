@@ -30,8 +30,11 @@
 .equ LOONGARCH_CSR_SAVE6,           0x36    /* Save 6 */
 .equ LOONGARCH_CSR_SAVE7,           0x37    /* Save 7 */
 
+.equ KERNEL_VMA_OFFSET,             0x9000000000000000
+
 .section ".boot", "awx", @progbits
-.globl _start
+
+.global _start
 _start:
     # Set DMW0 (kernel)
     li.d    $t0, 0x9000000000000011     # CA, PLV0, 0x9000_xxxx_xxxx_xxxx
@@ -67,9 +70,9 @@ _start:
     csrwr   $t0, LOONGARCH_CSR_PWCH
 
     # Set the boot page table
-    la   $t0, boot_l4pt
+    la.local   $t0, boot_l4pt
     csrwr   $t0, LOONGARCH_CSR_PGDL
-    la   $t0, boot_l4pt
+    la.local   $t0, boot_l4pt
     csrwr   $t0, LOONGARCH_CSR_PGDH
 
     # Initialize TLB
@@ -82,50 +85,44 @@ _start:
     csrwr   $t0, LOONGARCH_CSR_PRMD
 
     # Set the entry of TLB refill exception
-    la.global   $t0, _handle_tlb_refill
-    # Convert the address to physical address
-.extern KERNEL_VMA_OFFSET
-    la.global   $t1, KERNEL_VMA_OFFSET
-    sub.d   $t0, $t0, $t1
+    la.local   $t0, _handle_tlb_refill - KERNEL_VMA_OFFSET
     csrwr   $t0, LOONGARCH_CSR_TLBRENTRY
 
     # Update SP/PC to use the virtual address
-    la      $sp, boot_stack_top
+    li.d    $t1, KERNEL_VMA_OFFSET
+    la.local   $sp, boot_stack_top
     add.d   $sp, $sp, $t1
-    la.global   $t0, _start_virt
+    la.local   $t0, _start_virt - KERNEL_VMA_OFFSET
+    add.d   $t0, $t0, $t1
     jr      $t0
 
 .balign 4096
-.globl boot_l4pt
 boot_l4pt:
     .zero 8 * 512
 
 .section ".boot.stack", "aw", @nobits
-.globl boot_stack_bottom
+
 boot_stack_bottom:
     .balign 4096
     .skip 0x40000  # 256 KiB
-.globl boot_stack_top
 boot_stack_top:
 
 # From here, we're in the .text section: we no longer use physical address.
 .text
-.globl _start_virt
+
 _start_virt:
     # Unset DMW1 (kernel)
     csrwr   $zero, LOONGARCH_CSR_DMW1
 
     # Initialize r21 to the CPU-local start address.
 .extern __cpu_local_start
-    la.global   $r21, __cpu_local_start
+    la.local   $r21, __cpu_local_start
 
     # Jump to rust loongarch_boot
-    la.global   $t0, loongarch_boot
+    la.local   $t0, loongarch_boot
     jr      $t0
 
 .balign 4096
-.text
-.globl _handle_tlb_refill
 _handle_tlb_refill:
     # Save $t0, $t1
     csrwr   $t0, LOONGARCH_CSR_TLBRSAVE

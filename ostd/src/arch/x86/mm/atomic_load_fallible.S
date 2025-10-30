@@ -1,12 +1,14 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 
+.text
+.code64
+
 // Atomically loads a 32-bit integer value. This function works with exception handling
 // and can recover from a page fault.
 //
 // Returns the loaded value or `!0u64` if failed to load.
-.text
 .global __atomic_load_fallible
-.code64
+.type __atomic_load_fallible, @function
 __atomic_load_fallible: # (ptr: *const u32) -> u64;
 .load:
     mov eax, [rdi]
@@ -14,8 +16,9 @@ __atomic_load_fallible: # (ptr: *const u32) -> u64;
 .load_fault:
     mov rax, -1
     ret
+.size __atomic_load_fallible, .-__atomic_load_fallible
 
-.pushsection .ex_table, "a"
+.pushsection .ex_table, "a", @progbits
     .align 8
     .quad [.load]
     .quad [.load_fault]
