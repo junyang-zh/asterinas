@@ -34,9 +34,11 @@ jobs:
       matrix:
         include:
           - test_id: 'boot-debug'
+            smp: 4
 
           - test_id: 'boot-release'
             release: true
+            smp: 4
 
           - test_id: 'syscall-release'
             release: true
