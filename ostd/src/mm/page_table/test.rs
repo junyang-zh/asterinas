@@ -52,6 +52,7 @@ mod test_utils {
         let mut cursor = pt.cursor_mut(&preempt_guard, &va).unwrap();
         for (vaddr, paddr, level) in largest_pages::<TestPtConfig>(va.start, pa, va.len()) {
             cursor.jump(vaddr).unwrap();
+            cursor.adjust_level(level);
             unsafe { cursor.map((paddr, level, prop)) };
         }
     }
@@ -487,6 +488,24 @@ mod overlapping_mappings {
             cursor.map((phys_range.start, 2, page_property));
         }
     }
+
+    #[ktest]
+    #[should_panic(expected = "cursor level do not match the item mapping level")]
+    fn mismatched_level_map() {
+        const HUGE_PAGE_SIZE: usize = PAGE_SIZE * 512;
+
+        let page_table = PageTable::<TestPtConfig>::empty();
+        let virt_range = 0..HUGE_PAGE_SIZE * 2;
+        let page_property = PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback);
+        let preempt_guard = disable_preempt();
+
+        let mut cursor = page_table.cursor_mut(&preempt_guard, &virt_range).unwrap();
+        assert_eq!(cursor.level(), 2);
+
+        unsafe {
+            cursor.map((0, 1, page_property));
+        }
+    }
 }
 
 mod navigation {
@@ -528,11 +547,13 @@ mod navigation {
             .unwrap();
 
         assert_eq!(cursor.virt_addr(), 0);
-        assert!(cursor.query().is_none());
+        while cursor.push_level_if_exists().is_some() {}
+        assert!(matches!(cursor.query(), PteStateRef::Absent));
 
         cursor.jump(FIRST_MAP_ADDR).unwrap();
         assert_eq!(cursor.virt_addr(), FIRST_MAP_ADDR);
-        let Some(queried_item) = cursor.query() else {
+        while cursor.push_level_if_exists().is_some() {}
+        let PteStateRef::Mapped(queried_item) = cursor.query() else {
             panic!("expected a mapped item at the first address");
         };
         let queried_va = cursor.cur_va_range();
@@ -822,10 +843,11 @@ mod mapping {
             let mut cursor = pt.cursor(&preempt_guard, &from).unwrap();
             let mut frame_i = 0;
             loop {
+                while cursor.push_level_if_exists().is_some() {}
                 let item = cursor.query();
                 let va = cursor.cur_va_range();
 
-                let Some(TestPtItemRef((pa, level, prop), _)) = item else {
+                let PteStateRef::Mapped(TestPtItemRef((pa, level, prop), _)) = item else {
                     panic!("expected mapped untracked physical address, got `None`");
                 };
 
@@ -880,10 +902,11 @@ mod mapping {
         {
             let mut cursor = pt.cursor(&preempt_guard, &protect_va_range).unwrap();
             loop {
+                while cursor.push_level_if_exists().is_some() {}
                 let item = cursor.query();
                 let va = cursor.cur_va_range();
 
-                let Some(TestPtItemRef((pa, level, prop), _)) = item else {
+                let PteStateRef::Mapped(TestPtItemRef((pa, level, prop), _)) = item else {
                     panic!("expected mapped untracked physical address, got `None`");
                 };
 
