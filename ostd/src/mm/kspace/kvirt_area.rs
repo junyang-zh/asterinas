@@ -12,7 +12,7 @@ use crate::{
         HasSize, PAGE_SIZE, Paddr, Split, Vaddr,
         frame::{Frame, meta::AnyFrameMeta},
         page_prop::PageProperty,
-        page_table::largest_pages,
+        page_table::{self, largest_pages},
     },
 };
 
@@ -148,10 +148,12 @@ impl KVirtArea {
 
         for (va, frame) in cursor_range.step_by(PAGE_SIZE).zip(frames) {
             cursor.jump(va).unwrap();
-            cursor.adjust_level(1);
+            let page_table::Entry::Vacant(entry) = cursor.query_subtree(1) else {
+                panic!("mapping over an already mapped page");
+            };
             // SAFETY: The constructor of the `KVirtArea` has already ensured
             // that this mapping does not affect kernel's memory safety.
-            unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
+            unsafe { entry.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
         }
 
         Self { range }
@@ -202,9 +204,11 @@ impl KVirtArea {
                 largest_pages::<KernelPtConfig>(va_range.start, pa_range.start, len)
             {
                 cursor.jump(va).unwrap();
-                cursor.adjust_level(level);
+                let page_table::Entry::Vacant(entry) = cursor.query_subtree(level) else {
+                    panic!("mapping over an already mapped page");
+                };
                 // SAFETY: The caller of `map_untracked_frames` has ensured the safety of this mapping.
-                unsafe { cursor.map(MappedItem::Untracked(pa, level, prop)) };
+                unsafe { entry.map(MappedItem::Untracked(pa, level, prop)) };
             }
         }
 
@@ -220,16 +224,12 @@ impl Drop for KVirtArea {
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
         let range = self.start()..self.end();
         let mut cursor = page_table.cursor_mut(&irq_guard, &range).unwrap();
-        while let Some(_va) = cursor.find_next_unmappable_subtree(self.end()) {
-            while cursor.cur_va_range().start < range.start || cursor.cur_va_range().end > range.end
-            {
-                cursor.adjust_level(cursor.level() - 1);
-            }
+        while let Some(entry) = cursor.find_subtree(self.end()) {
             // SAFETY:
             // 1. The range is under `KVirtArea`, so it is safe to unmap.
             // 2. The caller of `KVirtArea` will ensure TLB conherence when the range is used again,
             //    so the unmapped items are safe to be dropped immediately.
-            let frag = unsafe { cursor.unmap() }.unwrap();
+            let (_, frag) = unsafe { entry.unmap() };
             drop(frag);
         }
 

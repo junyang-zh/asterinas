@@ -11,7 +11,7 @@ use crate::{
     mm::{
         Daddr, Frame, FrameAllocOptions, HasPaddr, PAGE_SIZE, Paddr, PageFlags, PageTable, VmIo,
         page_prop::{CachePolicy, PageProperty, PrivilegedPageFlags as PrivFlags},
-        page_table::PageTableError,
+        page_table::{self, PageTableError},
     },
     task::disable_preempt,
 };
@@ -311,10 +311,12 @@ impl ContextTable {
         let pt = self.get_or_create_page_table(device);
         let preempt_guard = disable_preempt();
         let mut cursor = pt.cursor_mut(&preempt_guard, &from).unwrap();
-        cursor.adjust_level(1);
+        let page_table::Entry::Vacant(entry) = cursor.query_subtree(1) else {
+            panic!("mapping over an already mapped page");
+        };
 
         // SAFETY: The safety is upheld by the caller.
-        unsafe { cursor.map((paddr, 1, prop)) };
+        unsafe { entry.map((paddr, 1, prop)) };
 
         Ok(())
     }
@@ -330,12 +332,14 @@ impl ContextTable {
         let pt = self.get_or_create_page_table(device);
         let preempt_guard = disable_preempt();
         let mut cursor = pt.cursor_mut(&preempt_guard, &dva_range).unwrap();
-        cursor.adjust_level(1);
+        let page_table::Entry::Value(entry) = cursor.query_subtree(1) else {
+            return Ok(());
+        };
 
-        debug_assert_eq!(cursor.cur_va_range(), dva_range);
+        debug_assert_eq!(entry.cur_va_range(), dva_range);
         // SAFETY: This unmaps a page from the context table, which is always safe.
-        let frag = unsafe { cursor.unmap() };
-        debug_assert!(frag.is_some());
+        let (_, frag) = unsafe { entry.unmap() };
+        drop(frag);
 
         Ok(())
     }

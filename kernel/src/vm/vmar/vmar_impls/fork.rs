@@ -4,7 +4,7 @@ use ostd::{
     mm::{
         CachePolicy, PageFlags, page_size_at,
         tlb::TlbFlushOp,
-        vm_space::{CursorMut, VmQueriedItem},
+        vm_space::{CursorMut, Entry, VmQueriedItem},
     },
     task::disable_preempt,
 };
@@ -77,18 +77,21 @@ fn cow_copy_pt(src: &mut CursorMut<'_>, dst: &mut CursorMut<'_>, size: usize) ->
         *flags -= PageFlags::W;
     };
 
-    while let Some(mapped_va) = src.find_next(end_va) {
-        let mapped_size = match src.query() {
+    while let Some(entry) = src.find_leaf(end_va) {
+        let mapped_va = entry.virt_addr();
+        let mapped_size = match entry.item() {
             VmQueriedItem::MappedRam { frame, mut prop } => {
                 let frame = (*frame).clone();
                 let mapped_size = page_size_at(frame.map_level());
 
-                src.protect(op);
+                entry.protect(op);
 
                 dst.jump(mapped_va).unwrap();
-                dst.adjust_level(frame.map_level());
                 op(&mut prop.flags, &mut prop.cache);
-                dst.map(frame, prop);
+                let Entry::Vacant(entry) = dst.query_subtree(frame.map_level()) else {
+                    unreachable!("the destination page table must be vacant");
+                };
+                entry.map(frame, prop);
 
                 num_copied += 1;
                 mapped_size
@@ -98,7 +101,10 @@ fn cow_copy_pt(src: &mut CursorMut<'_>, dst: &mut CursorMut<'_>, size: usize) ->
                 let (iomem, offset) = src.find_iomem_by_paddr(paddr).unwrap();
                 let mapped_size = page_size_at(level);
                 dst.jump(mapped_va).unwrap();
-                dst.map_iomem(iomem, prop, mapped_size, offset);
+                let Entry::Vacant(entry) = dst.query_subtree(level) else {
+                    unreachable!("the destination page table must be vacant");
+                };
+                entry.map_iomem(iomem, prop, mapped_size, offset);
                 mapped_size
             }
             _ => {
@@ -140,10 +146,12 @@ mod test {
         let paddr = frame.paddr();
         let frame_clone_for_assert = frame.clone();
 
-        vm_space
-            .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .map(frame.into(), page_property); // Original frame moved here
+        let mut cursor = vm_space.cursor_mut(&preempt_guard, &map_range).unwrap();
+        let Entry::Vacant(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.map(frame.into(), page_property); // Original frame moved here
+        drop(cursor);
 
         // Confirms the initial mapping.
         assert!(matches!(
@@ -181,10 +189,12 @@ mod test {
         }
 
         // Unmaps the page from the parent.
-        vm_space
-            .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .unmap();
+        let mut cursor = vm_space.cursor_mut(&preempt_guard, &map_range).unwrap();
+        let Entry::Value(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.unmap();
+        drop(cursor);
 
         // Confirms that the child VA remains mapped.
         assert!(matches!(
@@ -222,16 +232,22 @@ mod test {
         ));
 
         // Unmaps the page from the child.
-        child_space
-            .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .unmap();
+        let mut cursor = child_space.cursor_mut(&preempt_guard, &map_range).unwrap();
+        let Entry::Value(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.unmap();
+        drop(cursor);
 
         // Maps the range in the sibling using the third clone.
-        sibling_space
+        let mut cursor = sibling_space
             .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .map(frame_clone_for_assert.into(), page_property);
+            .unwrap();
+        let Entry::Vacant(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.map(frame_clone_for_assert.into(), page_property);
+        drop(cursor);
 
         // Confirms that the sibling mapping points back to the original frame's physical address.
         assert!(matches!(
@@ -265,10 +281,12 @@ mod test {
             .expect("Failed to acquire `IoMem` for testing");
         let iomem_clone_for_assert = iomem.clone();
 
-        vm_space
-            .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .map_iomem(iomem.clone(), page_property, PAGE_SIZE, 0);
+        let mut cursor = vm_space.cursor_mut(&preempt_guard, &map_range).unwrap();
+        let Entry::Vacant(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.map_iomem(iomem.clone(), page_property, PAGE_SIZE, 0);
+        drop(cursor);
 
         // Confirms the initial mapping.
         assert!(matches!(
@@ -310,10 +328,12 @@ mod test {
         }
 
         // Unmaps the range from the parent.
-        vm_space
-            .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .unmap();
+        let mut cursor = vm_space.cursor_mut(&preempt_guard, &map_range).unwrap();
+        let Entry::Value(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.unmap();
+        drop(cursor);
 
         // Confirms that the child VA remains mapped.
         assert!(matches!(
@@ -351,16 +371,22 @@ mod test {
         ));
 
         // Unmaps the range from the child.
-        child_space
-            .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .unmap();
+        let mut cursor = child_space.cursor_mut(&preempt_guard, &map_range).unwrap();
+        let Entry::Value(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.unmap();
+        drop(cursor);
 
         // Maps the range in the sibling using the cloned IoMem.
-        sibling_space
+        let mut cursor = sibling_space
             .cursor_mut(&preempt_guard, &map_range)
-            .unwrap()
-            .map_iomem(iomem_clone_for_assert, page_property, PAGE_SIZE, 0);
+            .unwrap();
+        let Entry::Vacant(entry) = cursor.query_leaf() else {
+            unreachable!();
+        };
+        entry.map_iomem(iomem_clone_for_assert, page_property, PAGE_SIZE, 0);
+        drop(cursor);
 
         // Confirms that the sibling mapping points back to the original `IoMem`'s physical address.
         assert!(matches!(

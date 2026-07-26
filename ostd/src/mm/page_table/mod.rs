@@ -28,7 +28,7 @@ mod cursor;
 mod node;
 
 pub(in crate::mm) use cursor::PageTableFrag;
-pub(crate) use cursor::{Cursor, CursorMut};
+pub(crate) use cursor::{Cursor, CursorMut, Entry};
 pub(in crate::mm) use node::PteStateRef;
 use node::*; // FIXME: Remove glob imports.
 

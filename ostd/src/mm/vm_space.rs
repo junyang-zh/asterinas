@@ -8,7 +8,10 @@
 //! the page table cursor, providing efficient, powerful concurrent accesses
 //! to the page table.
 
-use core::{ops::Range, sync::atomic::Ordering};
+use core::{
+    ops::{Deref, Range},
+    sync::atomic::Ordering,
+};
 
 use super::{AnyUFrameMeta, PagingLevel, page_table::PageTableConfig};
 use crate::{
@@ -335,33 +338,97 @@ pub struct CursorMut<'a> {
     vmspace: &'a VmSpace,
 }
 
+/// The state of a queried VM-space entry.
+pub enum Entry<'cursor, 'space, T> {
+    /// An entry that contains a mapping or points to a subtree.
+    Value(T),
+    /// An absent entry.
+    Vacant(VacantEntry<'cursor, 'space>),
+}
+
+/// A mutable cursor positioned at a mapped leaf entry.
+pub struct Leaf<'cursor, 'space> {
+    cursor: &'cursor mut CursorMut<'space>,
+}
+
+/// A mutable cursor positioned at a mapping or a page-table subtree.
+pub struct Subtree<'cursor, 'space> {
+    cursor: &'cursor mut CursorMut<'space>,
+}
+
+/// A mutable cursor positioned at an absent entry.
+pub struct VacantEntry<'cursor, 'space> {
+    cursor: &'cursor mut CursorMut<'space>,
+    num_unmapped_frames: usize,
+}
+
+impl<'space> Deref for Leaf<'_, 'space> {
+    type Target = CursorMut<'space>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+    }
+}
+
+impl<'space> Deref for Subtree<'_, 'space> {
+    type Target = CursorMut<'space>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+    }
+}
+
+impl<'space> Deref for VacantEntry<'_, 'space> {
+    type Target = CursorMut<'space>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+    }
+}
+
 impl<'a> CursorMut<'a> {
-    /// Queries the mapping at the current virtual address.
-    ///
-    /// This is the same as [`Cursor::query`].
-    ///
-    /// If the cursor is pointing to a valid virtual address that is locked,
-    /// it will return the virtual address range and the mapped item.
-    pub fn query(&self) -> VmQueriedItem<'_> {
-        self.pt_cursor.query().into()
+    /// Queries the leaf entry at the current virtual address.
+    pub fn query_leaf(&mut self) -> Entry<'_, 'a, Leaf<'_, 'a>> {
+        let is_leaf = matches!(self.pt_cursor.query_leaf(), page_table::Entry::Value(_));
+        if is_leaf {
+            Entry::Value(Leaf { cursor: self })
+        } else {
+            Entry::Vacant(VacantEntry {
+                cursor: self,
+                num_unmapped_frames: 0,
+            })
+        }
     }
 
-    /// Moves the cursor forward to the next mapped virtual address.
+    /// Queries the entry at `level`.
     ///
-    /// This is the same as [`Cursor::find_next`].
-    pub fn find_next(&mut self, end: Vaddr) -> Option<Vaddr> {
-        self.pt_cursor.find_next(end)
+    /// This allocates missing intermediate page tables and splits larger
+    /// mappings as needed to reach `level`.
+    pub fn query_subtree(&mut self, level: PagingLevel) -> Entry<'_, 'a, Subtree<'_, 'a>> {
+        let is_subtree = matches!(
+            self.pt_cursor.query_subtree(level),
+            page_table::Entry::Value(_)
+        );
+        if is_subtree {
+            Entry::Value(Subtree { cursor: self })
+        } else {
+            Entry::Vacant(VacantEntry {
+                cursor: self,
+                num_unmapped_frames: 0,
+            })
+        }
     }
 
-    /// Moves the cursor forward to the largest possible subtree that contains
-    /// mapped pages.
-    ///
-    /// This is similar to [`Self::find_next`], except that the cursor will
-    /// stop at the highest possible level, that the subtree's virtual address
-    /// range is fully covered by the range ending at `end`. This is useful for
-    /// [`CursorMut::unmap`].
-    pub fn find_next_unmappable_subtree(&mut self, end: Vaddr) -> Option<Vaddr> {
-        self.pt_cursor.find_next_unmappable_subtree(end)
+    /// Finds the next mapped leaf before `end`.
+    pub fn find_leaf(&mut self, end: Vaddr) -> Option<Leaf<'_, 'a>> {
+        self.pt_cursor.find_leaf(end)?;
+        Some(Leaf { cursor: self })
+    }
+
+    /// Finds the next largest mapped subtree before `end`.
+    pub fn find_subtree(&mut self, end: Vaddr) -> Option<Subtree<'_, 'a>> {
+        self.pt_cursor.find_subtree(end)?;
+        Some(Subtree { cursor: self })
     }
 
     /// Jumps to the virtual address.
@@ -376,20 +443,6 @@ impl<'a> CursorMut<'a> {
         Ok(())
     }
 
-    /// Adjusts the level of the cursor to the given level.
-    ///
-    /// When the specified level page table is not allocated, it will allocate
-    /// and go to that page table. If the current virtual address contains a
-    /// huge mapping, and the specified level is lower than the mapping, it
-    /// will split the huge mapping into smaller mappings.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the specified level is invalid.
-    pub fn adjust_level(&mut self, level: PagingLevel) {
-        self.pt_cursor.adjust_level(level);
-    }
-
     /// Gets the virtual address of the current slot.
     pub fn virt_addr(&self) -> Vaddr {
         self.pt_cursor.virt_addr()
@@ -400,13 +453,6 @@ impl<'a> CursorMut<'a> {
         self.pt_cursor.level()
     }
 
-    /// Moves the cursor down to the next level if the next level page table exists.
-    ///
-    /// Returns the new level if the next level page table exists, or `None` otherwise.
-    pub fn push_level_if_exists(&mut self) -> Option<PagingLevel> {
-        self.pt_cursor.push_level_if_exists()
-    }
-
     /// Gets the current virtual address range of the cursor.
     pub fn cur_va_range(&self) -> Range<Vaddr> {
         self.pt_cursor.cur_va_range()
@@ -415,18 +461,6 @@ impl<'a> CursorMut<'a> {
     /// Gets the dedicated TLB flusher for this cursor.
     pub fn flusher(&mut self) -> &mut TlbFlusher<'a, DisabledPreemptGuard> {
         &mut self.flusher
-    }
-
-    /// Maps a frame into the current slot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the current virtual address is already mapped.
-    pub fn map(&mut self, frame: UFrame, prop: PageProperty) {
-        let item = VmItem::new_tracked(frame, prop);
-
-        // SAFETY: It is safe to map untyped memory into the userspace.
-        unsafe { self.pt_cursor.map(item) };
     }
 
     /// Maps a range of [`IoMem`] into the current slot.
@@ -447,7 +481,7 @@ impl<'a> CursorMut<'a> {
     /// Panics if
     ///  - `len` or `offset` is not aligned to the page size;
     ///  - the current virtual address is already mapped.
-    pub fn map_iomem(&mut self, io_mem: IoMem, prop: PageProperty, len: usize, offset: usize) {
+    fn map_iomem(&mut self, io_mem: IoMem, prop: PageProperty, len: usize, offset: usize) {
         assert_eq!(len % PAGE_SIZE, 0);
         assert_eq!(offset % PAGE_SIZE, 0);
 
@@ -466,12 +500,11 @@ impl<'a> CursorMut<'a> {
 
         for (va, pa, level) in largest_pages::<UserPtConfig>(cur_va, paddr_begin, map_size) {
             self.pt_cursor.jump(va).unwrap();
-            self.pt_cursor.adjust_level(level);
-            // SAFETY: It is safe to map I/O memory into the userspace.
-            unsafe {
-                self.pt_cursor
-                    .map(VmItem::new_untracked_io(pa, level, prop))
+            let page_table::Entry::Vacant(entry) = self.pt_cursor.query_subtree(level) else {
+                panic!("mapping over an already mapped page");
             };
+            // SAFETY: It is safe to map I/O memory into the userspace.
+            unsafe { entry.map(VmItem::new_untracked_io(pa, level, prop)) };
         }
 
         // If the `iomems` list in `VmSpace` does not contain the current I/O
@@ -485,14 +518,11 @@ impl<'a> CursorMut<'a> {
         }
     }
 
-    /// Finds an [`IoMem`] that was previously mapped to by [`Self::map_iomem`] and contains the
-    /// physical address.
+    /// Finds a previously mapped [`IoMem`] that contains the physical address.
     ///
-    /// This method can recover the originally mapped `IoMem` from the physical address returned by
-    /// [`Self::query`]. If the query returns a [`VmQueriedItem::MappedIoMem`], this method is
-    /// guaranteed to succeed with the specific physical address. However, if the corresponding
-    /// mapping is subsequently unmapped, it is unspecified whether this method will still succeed
-    /// or not.
+    /// This can recover the original `IoMem` from the physical address in a
+    /// [`VmQueriedItem::MappedIoMem`] returned by [`Leaf::item`]. It is
+    /// guaranteed to succeed while the corresponding mapping still exists.
     ///
     /// On success, this method returns the `IoMem` and the offset from the `IoMem` start to the
     /// given physical address. Otherwise, this method returns `None`.
@@ -500,22 +530,7 @@ impl<'a> CursorMut<'a> {
         self.vmspace.find_iomem_by_paddr(paddr)
     }
 
-    /// Removes all the mappings at the current PTE.
-    ///
-    /// The unmapped virtual address range depends on the current level of the
-    /// cursor, and can be queried via [`Self::cur_va_range`]. Adjust the
-    /// level via [`Self::adjust_level`] before unmapping to change the
-    /// unmapped range.
-    ///
-    /// The number of unmapped frames is returned.
-    pub fn unmap(&mut self) -> usize {
-        // SAFETY:
-        // 1. It is safe to unmap memory in the userspace.
-        // 2. We drop the unmapped items only after flushing TLB entries, which is safe.
-        let Some(frag) = (unsafe { self.pt_cursor.unmap() }) else {
-            return 0;
-        };
-
+    fn handle_unmapped_frag(&mut self, frag: PageTableFrag<UserPtConfig>) -> usize {
         match frag {
             PageTableFrag::Mapped { va, item, .. } => {
                 // SAFETY: If the item is not a scalar (e.g., a frame
@@ -569,20 +584,131 @@ impl<'a> CursorMut<'a> {
         }
     }
 
-    /// Applies the operation to the current PTE.
-    ///
-    /// The protected virtual address range depends on the current level of the
-    /// cursor, and can be queried via [`Self::cur_va_range`]. Adjust the
-    /// level via [`Self::adjust_level`] before protecting to change the
-    /// protected range.
-    pub fn protect(&mut self, mut op: impl FnMut(&mut PageFlags, &mut CachePolicy)) {
-        // SAFETY: It is safe to set `PageFlags` and `CachePolicy` of memory
-        // in the userspace.
+    fn next_entry(&mut self) -> Option<Entry<'_, 'a, Subtree<'_, 'a>>> {
+        let level = self.level();
+        let next_va = self.cur_va_range().end;
+        self.jump(next_va).ok()?;
+        Some(self.query_subtree(level))
+    }
+}
+
+impl<'cursor, 'space> Leaf<'cursor, 'space> {
+    /// Gets the mapped item.
+    pub fn item(&self) -> VmQueriedItem<'space> {
+        let item: VmQueriedItem<'space> = self.cursor.pt_cursor.query().into();
+        debug_assert!(matches!(
+            item,
+            VmQueriedItem::MappedRam { .. } | VmQueriedItem::MappedIoMem { .. }
+        ));
+        item
+    }
+
+    /// Applies a protection operation to the mapped item.
+    pub fn protect(self, mut op: impl FnMut(&mut PageFlags, &mut CachePolicy)) -> Self {
+        let page_table::Entry::Value(entry) = self.cursor.pt_cursor.query_leaf() else {
+            unreachable!("a leaf entry must remain mapped");
+        };
+        // SAFETY: It is safe to change userspace mapping properties.
         unsafe {
-            self.pt_cursor.protect(&mut |prop| {
+            entry.protect(&mut |prop| {
                 op(&mut prop.flags, &mut prop.cache);
-            })
+            });
         }
+        self
+    }
+
+    /// Removes the mapped item.
+    pub fn unmap(self) -> VacantEntry<'cursor, 'space> {
+        let page_table::Entry::Value(entry) = self.cursor.pt_cursor.query_leaf() else {
+            unreachable!("a leaf entry must remain mapped");
+        };
+        // SAFETY: Userspace mappings may be removed, and the fragment is
+        // retained until the corresponding TLB flush is issued.
+        let (_, frag) = unsafe { entry.unmap() };
+        let num_unmapped_frames = self.cursor.handle_unmapped_frag(frag);
+        VacantEntry {
+            cursor: self.cursor,
+            num_unmapped_frames,
+        }
+    }
+
+    /// Moves to the next entry at the same paging level.
+    pub fn next(self) -> Option<Entry<'cursor, 'space, Subtree<'cursor, 'space>>> {
+        self.cursor.next_entry()
+    }
+}
+
+impl<'cursor, 'space> Subtree<'cursor, 'space> {
+    /// Gets the mapped item, or `None` if this entry points to a subtree.
+    pub fn item(&self) -> Option<VmQueriedItem<'space>> {
+        match self.cursor.pt_cursor.query() {
+            state @ PteStateRef::Mapped(_) => Some(state.into()),
+            PteStateRef::PageTable(_) => None,
+            PteStateRef::Absent => unreachable!("a subtree entry cannot be vacant"),
+        }
+    }
+
+    /// Resolves this entry to a mapped leaf or a vacancy.
+    pub fn query_leaf(self) -> Entry<'cursor, 'space, Leaf<'cursor, 'space>> {
+        self.cursor.query_leaf()
+    }
+
+    /// Removes the mapping or subtree.
+    pub fn unmap(self) -> VacantEntry<'cursor, 'space> {
+        let level = self.cursor.level();
+        let page_table::Entry::Value(entry) = self.cursor.pt_cursor.query_subtree(level) else {
+            unreachable!("a subtree entry must remain present");
+        };
+        // SAFETY: Userspace mappings may be removed, and the fragment is
+        // retained until the corresponding TLB flush is issued.
+        let (_, frag) = unsafe { entry.unmap() };
+        let num_unmapped_frames = self.cursor.handle_unmapped_frag(frag);
+        VacantEntry {
+            cursor: self.cursor,
+            num_unmapped_frames,
+        }
+    }
+
+    /// Moves to the next entry at the same paging level.
+    pub fn next(self) -> Option<Entry<'cursor, 'space, Subtree<'cursor, 'space>>> {
+        self.cursor.next_entry()
+    }
+}
+
+impl<'cursor, 'space> VacantEntry<'cursor, 'space> {
+    /// Gets the number of frames removed when this entry became vacant.
+    pub fn num_unmapped_frames(&self) -> usize {
+        self.num_unmapped_frames
+    }
+
+    /// Maps a frame into this vacant entry.
+    pub fn map(self, frame: UFrame, prop: PageProperty) -> Leaf<'cursor, 'space> {
+        let item = VmItem::new_tracked(frame, prop);
+        let page_table::Entry::Vacant(entry) = self.cursor.pt_cursor.query_leaf() else {
+            unreachable!("a vacant entry must remain absent");
+        };
+        // SAFETY: It is safe to map untyped memory into userspace.
+        unsafe { entry.map(item) };
+        Leaf {
+            cursor: self.cursor,
+        }
+    }
+
+    /// Maps an I/O-memory range starting at this vacant entry.
+    pub fn map_iomem(
+        self,
+        io_mem: IoMem,
+        prop: PageProperty,
+        len: usize,
+        offset: usize,
+    ) -> Entry<'cursor, 'space, Leaf<'cursor, 'space>> {
+        self.cursor.map_iomem(io_mem, prop, len, offset);
+        self.cursor.query_leaf()
+    }
+
+    /// Moves to the next entry at the same paging level.
+    pub fn next(self) -> Option<Entry<'cursor, 'space, Subtree<'cursor, 'space>>> {
+        self.cursor.next_entry()
     }
 }
 

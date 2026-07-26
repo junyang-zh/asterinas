@@ -39,8 +39,8 @@ use core::{
 use align_ext::AlignExt;
 
 use super::{
-    Entry, PageTable, PageTableConfig, PageTableError, PageTableGuard, PagingConstsTrait,
-    PagingLevel, PteState, PteStateRef, page_size, pte_index,
+    PageTable, PageTableConfig, PageTableError, PageTableGuard, PagingConstsTrait, PagingLevel,
+    PteState, PteStateRef, node::Entry as NodeEntry, page_size, pte_index,
 };
 use crate::{
     mm::{
@@ -83,24 +83,22 @@ pub(crate) struct Cursor<'rcu, C: PageTableConfig> {
 
 /// The cursor of a page table that is capable of map, unmap or protect pages.
 ///
-/// It has all the capabilities of a [`Cursor`], which can navigate over the
-/// page table corresponding to the address range. A virtual address range
-/// in a page table can only be accessed by one cursor, regardless of the
-/// mutability of the cursor.
+/// Mutable entry operations are exposed through [`Leaf`], [`Subtree`], and
+/// [`VacantEntry`]. A virtual address range can only be accessed by one
+/// cursor, regardless of the cursor's mutability.
 #[derive(Debug)]
 pub(crate) struct CursorMut<'rcu, C: PageTableConfig>(Cursor<'rcu, C>);
 
-// Inherit all immutable methods from `Cursor`.
 impl<'rcu, C: PageTableConfig> Deref for CursorMut<'rcu, C> {
     type Target = Cursor<'rcu, C>;
 
-    fn deref(&self) -> &Cursor<'rcu, C> {
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl<'rcu, C: PageTableConfig> DerefMut for CursorMut<'rcu, C> {
-    fn deref_mut(&mut self) -> &mut Cursor<'rcu, C> {
+impl<C: PageTableConfig> DerefMut for CursorMut<'_, C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
@@ -123,6 +121,53 @@ pub(crate) enum PageTableFrag<C: PageTableConfig> {
         len: usize,
         num_frames: usize,
     },
+}
+
+/// The state of a queried page-table entry.
+pub(crate) enum Entry<'cursor, 'rcu, C: PageTableConfig, T> {
+    /// An entry that contains a mapping or points to a subtree.
+    Value(T),
+    /// An absent entry.
+    Vacant(VacantEntry<'cursor, 'rcu, C>),
+}
+
+/// A cursor positioned at a mapped leaf entry.
+pub(crate) struct Leaf<'cursor, 'rcu, C: PageTableConfig> {
+    cursor: &'cursor mut CursorMut<'rcu, C>,
+}
+
+/// A cursor positioned at a mapping or a page-table subtree.
+pub(crate) struct Subtree<'cursor, 'rcu, C: PageTableConfig> {
+    cursor: &'cursor mut CursorMut<'rcu, C>,
+}
+
+/// A cursor positioned at an absent entry.
+pub(crate) struct VacantEntry<'cursor, 'rcu, C: PageTableConfig> {
+    cursor: &'cursor mut CursorMut<'rcu, C>,
+}
+
+impl<'rcu, C: PageTableConfig> Deref for Leaf<'_, 'rcu, C> {
+    type Target = CursorMut<'rcu, C>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+    }
+}
+
+impl<'rcu, C: PageTableConfig> Deref for Subtree<'_, 'rcu, C> {
+    type Target = CursorMut<'rcu, C>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+    }
+}
+
+impl<'rcu, C: PageTableConfig> Deref for VacantEntry<'_, 'rcu, C> {
+    type Target = CursorMut<'rcu, C>;
+
+    fn deref(&self) -> &Self::Target {
+        self.cursor
+    }
 }
 
 impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
@@ -273,7 +318,10 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
         }
         let entry_size = page_size::<C>(level);
         let entry_start = self.va.align_down(entry_size);
-        entry_start == self.va && entry_start + entry_size <= end
+        entry_start == self.va
+            && entry_start
+                .checked_add(entry_size)
+                .is_some_and(|entry_end| entry_end <= end)
     }
 
     /// Jumps to the given virtual address.
@@ -354,7 +402,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
         debug_assert!(old.is_none());
     }
 
-    fn cur_entry(&mut self) -> Entry<'_, 'rcu, C> {
+    fn cur_entry(&mut self) -> NodeEntry<'_, 'rcu, C> {
         let node = self.path[self.level as usize - 1].as_mut().unwrap();
         node.entry(pte_index::<C>(self.va, self.level))
     }
@@ -379,6 +427,79 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
         Ok(Self(Cursor::<'rcu, C>::new(pt, guard, va)?))
     }
 
+    /// Queries the leaf entry at the current virtual address.
+    pub fn query_leaf(&mut self) -> Entry<'_, 'rcu, C, Leaf<'_, 'rcu, C>> {
+        loop {
+            match self.0.query() {
+                PteStateRef::PageTable(pt) => {
+                    // SAFETY: The child page table is locked by this cursor.
+                    let guard = unsafe { pt.make_guard_unchecked(self.0.rcu_guard) };
+                    self.0.push_level(guard);
+                }
+                PteStateRef::Mapped(_) if self.entry_fits(self.0.barrier_va.end) => {
+                    return Entry::Value(Leaf { cursor: self });
+                }
+                PteStateRef::Mapped(_) => {
+                    let level = self
+                        .0
+                        .level
+                        .checked_sub(1)
+                        .expect("a base-page mapping cannot cross the cursor boundary");
+                    self.adjust_level(level);
+                }
+                PteStateRef::Absent => {
+                    return Entry::Vacant(VacantEntry { cursor: self });
+                }
+            }
+        }
+    }
+
+    /// Queries the entry at `level`.
+    ///
+    /// This allocates missing intermediate page tables and splits larger
+    /// mappings as needed to reach `level`.
+    pub fn query_subtree(
+        &mut self,
+        level: PagingLevel,
+    ) -> Entry<'_, 'rcu, C, Subtree<'_, 'rcu, C>> {
+        assert!(1 <= level && level <= self.0.guard_level);
+        self.adjust_level(level);
+
+        match self.0.query() {
+            PteStateRef::Absent => Entry::Vacant(VacantEntry { cursor: self }),
+            PteStateRef::Mapped(_) | PteStateRef::PageTable(_) => {
+                Entry::Value(Subtree { cursor: self })
+            }
+        }
+    }
+
+    /// Finds the next mapped leaf before `end`.
+    pub fn find_leaf(&mut self, end: Vaddr) -> Option<Leaf<'_, 'rcu, C>> {
+        loop {
+            self.0.find_next(end)?;
+            if self.entry_fits(end) {
+                return Some(Leaf { cursor: self });
+            }
+            let level = self
+                .0
+                .level
+                .checked_sub(1)
+                .expect("a base-page mapping cannot cross the search boundary");
+            self.adjust_level(level);
+        }
+    }
+
+    /// Finds the next largest mapped subtree before `end`.
+    pub fn find_subtree(&mut self, end: Vaddr) -> Option<Subtree<'_, 'rcu, C>> {
+        self.0.find_next_unmappable_subtree(end)?;
+        Some(Subtree { cursor: self })
+    }
+
+    fn entry_fits(&self, end: Vaddr) -> bool {
+        let range = self.0.cur_va_range();
+        range.start >= self.0.barrier_va.start && range.end <= end
+    }
+
     /// Adjusts to the given level.
     ///
     /// When the specified level page table is not allocated, it will allocate
@@ -389,31 +510,32 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
     /// # Panics
     ///
     /// Panics if the specified level is invalid.
-    pub fn adjust_level(&mut self, to: PagingLevel) {
-        assert!(1 <= to && to <= self.guard_level);
+    fn adjust_level(&mut self, to: PagingLevel) {
+        let cursor = &mut self.0;
+        assert!(1 <= to && to <= cursor.guard_level);
 
-        let rcu_guard = self.rcu_guard;
+        let rcu_guard = cursor.rcu_guard;
 
-        while self.level != to {
-            if self.level < to {
-                self.pop_level();
+        while cursor.level != to {
+            if cursor.level < to {
+                cursor.pop_level();
                 continue;
             }
             // We are at a higher level, go down.
-            let mut cur_entry = self.cur_entry();
+            let mut cur_entry = cursor.cur_entry();
             match cur_entry.to_ref() {
                 PteStateRef::PageTable(pt) => {
                     // SAFETY: The `pt` must be locked and no other guards exist.
                     let pt_guard = unsafe { pt.make_guard_unchecked(rcu_guard) };
-                    self.push_level(pt_guard);
+                    cursor.push_level(pt_guard);
                 }
                 PteStateRef::Absent => {
                     let child_guard = cur_entry.alloc_if_none(rcu_guard).unwrap();
-                    self.push_level(child_guard);
+                    cursor.push_level(child_guard);
                 }
                 PteStateRef::Mapped(_) => {
                     let split_child = cur_entry.split_if_mapped_huge(rcu_guard).unwrap();
-                    self.push_level(split_child);
+                    cursor.push_level(split_child);
                 }
             }
         }
@@ -437,8 +559,9 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
     /// The caller should ensure that
     ///  - the range being mapped does not affect kernel's memory safety;
     ///  - the physical address to be mapped is valid and safe to use.
-    pub unsafe fn map(&mut self, item: C::Item) {
-        debug_assert!(self.va < self.barrier_va.end);
+    unsafe fn map(&mut self, item: C::Item) {
+        let cursor = &mut self.0;
+        debug_assert!(cursor.va < cursor.barrier_va.end);
 
         let (_, level, _) = C::item_raw_info(&item);
         assert!(
@@ -446,22 +569,22 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
             "cursor level not suitable for mapping"
         );
         assert_eq!(
-            self.level, level,
+            cursor.level, level,
             "cursor level do not match the item mapping level"
         );
         let size = page_size::<C>(level);
         assert_eq!(
-            self.va % size,
+            cursor.va % size,
             0,
             "cursor virtual address not aligned for mapping"
         );
-        let end = self.va + size;
+        let end = cursor.va + size;
         assert!(
-            end <= self.barrier_va.end,
+            end <= cursor.barrier_va.end,
             "cursor virtual address out-of-bound for mapping"
         );
 
-        if !matches!(self.cur_entry().to_ref(), PteStateRef::Absent) {
+        if !matches!(cursor.cur_entry().to_ref(), PteStateRef::Absent) {
             panic!("mapping over an already mapped page");
         }
 
@@ -469,11 +592,6 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
     }
 
     /// Removes the page table fragment at the current PTE.
-    ///
-    /// The unmapped virtual address range depends on the current level of the
-    /// cursor, and can be queried via [`Self::cur_va_range`]. Adjust the
-    /// level via [`Self::adjust_level`] before unmapping to change the
-    /// unmapped range.
     ///
     /// The caller should handle TLB coherence if necessary, using the returned
     /// virtual address range.
@@ -490,19 +608,18 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
     ///
     /// Panics if the current level is at the top level and the corresponding
     /// [`PageTableConfig::TOP_LEVEL_CAN_UNMAP`] is false.
-    pub unsafe fn unmap(&mut self) -> Option<PageTableFrag<C>> {
-        if !C::TOP_LEVEL_CAN_UNMAP && self.level == C::NR_LEVELS {
+    unsafe fn unmap(&mut self) -> Option<PageTableFrag<C>> {
+        if !C::TOP_LEVEL_CAN_UNMAP && self.0.level == C::NR_LEVELS {
             panic!("unmapping top-level page table nodes");
         }
+        assert!(
+            self.entry_fits(self.0.barrier_va.end),
+            "current page-table entry exceeds the locked range"
+        );
         self.replace_cur_entry(PteState::Absent)
     }
 
     /// Applies the operation to the current PTE.
-    ///
-    /// The protected virtual address range depends on the current level of the
-    /// cursor, and can be queried via [`Self::cur_va_range`]. Adjust the
-    /// level via [`Self::adjust_level`] before protecting to change the
-    /// protected range.
     ///
     /// It only modifies the page properties if the current entry state is
     /// [`PteState::Mapped`]. Otherwise, it does nothing.
@@ -514,17 +631,22 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
     ///    kernel's memory safety;
     ///  - the privileged flag `AVAIL1` should not be altered, since this flag
     ///    is reserved for all page tables.
-    pub unsafe fn protect(&mut self, op: &mut impl FnMut(&mut PageProperty)) {
-        self.cur_entry().protect(op);
+    unsafe fn protect(&mut self, op: &mut impl FnMut(&mut PageProperty)) {
+        assert!(
+            self.entry_fits(self.0.barrier_va.end),
+            "current page-table entry exceeds the locked range"
+        );
+        self.0.cur_entry().protect(op);
     }
 
     fn replace_cur_entry(&mut self, new_child: PteState<C>) -> Option<PageTableFrag<C>> {
-        let rcu_guard = self.rcu_guard;
+        let cursor = &mut self.0;
+        let rcu_guard = cursor.rcu_guard;
 
-        let va = self.va;
-        let level = self.level;
+        let va = cursor.va;
+        let level = cursor.level;
 
-        let old = self.cur_entry().replace(new_child);
+        let old = cursor.cur_entry().replace(new_child);
         match old {
             PteState::Absent => None,
             PteState::Mapped(item) => Some(PageTableFrag::Mapped { va, item }),
@@ -547,10 +669,126 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
                 Some(PageTableFrag::StrayPageTable {
                     pt,
                     va,
-                    len: page_size::<C>(self.level),
+                    len: page_size::<C>(cursor.level),
                     num_frames,
                 })
             }
         }
     }
+}
+
+#[cfg_attr(not(ktest), expect(dead_code))]
+impl<'cursor, 'rcu, C: PageTableConfig> Leaf<'cursor, 'rcu, C> {
+    /// Gets the mapped item.
+    pub fn item(&self) -> C::ItemRef<'rcu> {
+        let PteStateRef::Mapped(item) = self.cursor.0.query() else {
+            unreachable!("a leaf entry must remain mapped");
+        };
+        item
+    }
+
+    /// Applies a protection operation to the mapped item.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the safety requirements of [`CursorMut::protect`].
+    pub unsafe fn protect(self, op: &mut impl FnMut(&mut PageProperty)) -> Self {
+        // SAFETY: The caller upholds the requirements.
+        unsafe { self.cursor.protect(op) };
+        self
+    }
+
+    /// Removes the mapped item.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the safety requirements of [`CursorMut::unmap`].
+    pub unsafe fn unmap(self) -> (VacantEntry<'cursor, 'rcu, C>, PageTableFrag<C>) {
+        let frag = unsafe { self.cursor.unmap() }.expect("a leaf entry must remain mapped");
+        (
+            VacantEntry {
+                cursor: self.cursor,
+            },
+            frag,
+        )
+    }
+
+    /// Moves to the next entry at the same paging level.
+    pub fn next(self) -> Option<Entry<'cursor, 'rcu, C, Subtree<'cursor, 'rcu, C>>> {
+        next_entry(self.cursor)
+    }
+}
+
+#[cfg_attr(not(ktest), expect(dead_code))]
+impl<'cursor, 'rcu, C: PageTableConfig> Subtree<'cursor, 'rcu, C> {
+    /// Gets the mapped item, or `None` if this entry points to a subtree.
+    pub fn item(&self) -> Option<C::ItemRef<'rcu>> {
+        match self.cursor.0.query() {
+            PteStateRef::Mapped(item) => Some(item),
+            PteStateRef::PageTable(_) => None,
+            PteStateRef::Absent => unreachable!("a subtree entry cannot be vacant"),
+        }
+    }
+
+    /// Resolves this entry to a mapped leaf or a vacancy.
+    pub fn query_leaf(self) -> Entry<'cursor, 'rcu, C, Leaf<'cursor, 'rcu, C>> {
+        self.cursor.query_leaf()
+    }
+
+    /// Removes the mapping or subtree.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the safety requirements of [`CursorMut::unmap`].
+    pub unsafe fn unmap(self) -> (VacantEntry<'cursor, 'rcu, C>, PageTableFrag<C>) {
+        let frag = unsafe { self.cursor.unmap() }.expect("a subtree entry must remain present");
+        (
+            VacantEntry {
+                cursor: self.cursor,
+            },
+            frag,
+        )
+    }
+
+    /// Moves to the next entry at the same paging level.
+    pub fn next(self) -> Option<Entry<'cursor, 'rcu, C, Subtree<'cursor, 'rcu, C>>> {
+        next_entry(self.cursor)
+    }
+}
+
+#[cfg_attr(not(ktest), expect(dead_code))]
+impl<'cursor, 'rcu, C: PageTableConfig> VacantEntry<'cursor, 'rcu, C> {
+    /// Maps an item into this vacant entry.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the safety requirements of [`CursorMut::map`].
+    pub unsafe fn map(self, item: C::Item) -> Leaf<'cursor, 'rcu, C> {
+        let (_, level, _) = C::item_raw_info(&item);
+        self.cursor.adjust_level(level);
+        debug_assert!(matches!(self.cursor.0.query(), PteStateRef::Absent));
+        // SAFETY: The caller upholds the requirements.
+        unsafe { self.cursor.map(item) };
+        Leaf {
+            cursor: self.cursor,
+        }
+    }
+
+    /// Moves to the next entry at the same paging level.
+    pub fn next(self) -> Option<Entry<'cursor, 'rcu, C, Subtree<'cursor, 'rcu, C>>> {
+        next_entry(self.cursor)
+    }
+}
+
+#[cfg_attr(not(ktest), expect(dead_code))]
+fn next_entry<'cursor, 'rcu, C: PageTableConfig>(
+    cursor: &'cursor mut CursorMut<'rcu, C>,
+) -> Option<Entry<'cursor, 'rcu, C, Subtree<'cursor, 'rcu, C>>> {
+    let level = cursor.level();
+    if cursor.cur_va_range().end >= cursor.0.barrier_va.end {
+        return None;
+    }
+
+    cursor.0.move_forward();
+    Some(cursor.query_subtree(level))
 }

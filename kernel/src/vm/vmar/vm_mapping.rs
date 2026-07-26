@@ -13,7 +13,9 @@ use ostd::{
     io::IoMem,
     mm::{
         CachePolicy, Frame, FrameAllocOptions, PageFlags, PageProperty, UFrame, VmSpace,
-        io::util::HasVmReaderWriter, tlb::TlbFlushOp, vm_space::VmQueriedItem,
+        io::util::HasVmReaderWriter,
+        tlb::TlbFlushOp,
+        vm_space::{Entry, VmQueriedItem},
     },
     task::disable_preempt,
 };
@@ -229,7 +231,10 @@ impl VmMapping {
         let mut cursor = vm_space.cursor_mut(&preempt_guard, &map_range).unwrap();
         let io_page_prop =
             PageProperty::new_user(PageFlags::from(self.perms), io_mem.cache_policy());
-        cursor.map_iomem(io_mem, io_page_prop, self.map_size.get(), vmo_offset);
+        let Entry::Vacant(entry) = cursor.query_leaf() else {
+            unreachable!("a new device mapping must be vacant");
+        };
+        entry.map_iomem(io_mem, io_page_prop, self.map_size.get(), vmo_offset);
     }
 
     /// Prints the mapping information in the format of `/proc/[pid]/maps`.
@@ -438,60 +443,62 @@ impl VmMapping {
             let preempt_guard = disable_preempt();
             let mut cursor = vm_space.cursor_mut(&preempt_guard, &va_range)?;
 
-            while cursor.push_level_if_exists().is_some() {}
-            let item = cursor.query();
-            match item {
-                VmQueriedItem::MappedRam { frame, mut prop } => {
-                    if VmPerms::from(prop.flags).contains(required_perms) {
-                        // The page fault is already handled maybe by other threads.
-                        // Just flush the TLB and return.
-                        TlbFlushOp::for_range(va_range).perform_on_current();
-                        return Ok(());
+            match cursor.query_leaf() {
+                Entry::Value(entry) => match entry.item() {
+                    VmQueriedItem::MappedRam { frame, mut prop } => {
+                        if VmPerms::from(prop.flags).contains(required_perms) {
+                            // The page fault is already handled maybe by other threads.
+                            // Just flush the TLB and return.
+                            TlbFlushOp::for_range(va_range).perform_on_current();
+                            return Ok(());
+                        }
+                        assert!(is_write);
+                        // Perform COW if it is a write access to a shared mapping.
+
+                        // Skip if the page fault is already handled.
+                        if prop.flags.contains(PageFlags::W) {
+                            return Ok(());
+                        }
+
+                        // If the forked child or parent immediately unmaps the page after
+                        // the fork without accessing it, we are the only reference to the
+                        // frame. We can directly map the frame as writable without copying.
+                        let only_reference = frame.reference_count() == 1;
+
+                        let new_flags = PageFlags::W | PageFlags::ACCESSED | PageFlags::DIRTY;
+
+                        if self.is_shared || only_reference {
+                            entry.protect(|flags, _cache| {
+                                *flags |= new_flags;
+                            });
+                            cursor
+                                .flusher()
+                                .issue_tlb_flush(TlbFlushOp::for_range(va_range));
+                            cursor.flusher().dispatch_tlb_flush();
+                        } else {
+                            let new_frame = duplicate_frame(&frame)?;
+                            prop.flags |= new_flags;
+                            entry.unmap().map(new_frame.into(), prop);
+                            // FIXME: Linux re-classifies the page from `File` to `Anon` in RSS,
+                            // when a COW on a file-backed mapping happens.
+                            // We currently do not support this re-classification,
+                            // since it will introduce some complexity when unmapping this page.
+                        }
+                        cursor.flusher().sync_tlb_flush();
                     }
-                    assert!(is_write);
-                    // Perform COW if it is a write access to a shared mapping.
-
-                    // Skip if the page fault is already handled.
-                    if prop.flags.contains(PageFlags::W) {
-                        return Ok(());
+                    VmQueriedItem::MappedIoMem { .. } => {
+                        // The page of I/O memory is populated when the memory
+                        // mapping is created.
+                        return_errno_with_message!(
+                            Errno::EFAULT,
+                            "device memory page faults cannot be resolved"
+                        );
                     }
-
-                    // If the forked child or parent immediately unmaps the page after
-                    // the fork without accessing it, we are the only reference to the
-                    // frame. We can directly map the frame as writable without copying.
-                    let only_reference = frame.reference_count() == 1;
-
-                    let new_flags = PageFlags::W | PageFlags::ACCESSED | PageFlags::DIRTY;
-
-                    if self.is_shared || only_reference {
-                        cursor.protect(|flags, _cache| {
-                            *flags |= new_flags;
-                        });
-                        cursor
-                            .flusher()
-                            .issue_tlb_flush(TlbFlushOp::for_range(va_range));
-                        cursor.flusher().dispatch_tlb_flush();
-                    } else {
-                        let new_frame = duplicate_frame(&frame)?;
-                        prop.flags |= new_flags;
-                        cursor.unmap();
-                        cursor.map(new_frame.into(), prop);
-                        // FIXME: Linux re-classifies the page from `File` to `Anon` in RSS,
-                        // when a COW on a file-backed mapping happens.
-                        // We currently do not support this re-classification,
-                        // since it will introduce some complexity when unmapping this page.
+                    VmQueriedItem::None | VmQueriedItem::PageTable => {
+                        unreachable!("a leaf entry must contain a mapping")
                     }
-                    cursor.flusher().sync_tlb_flush();
-                }
-                VmQueriedItem::MappedIoMem { .. } => {
-                    // The page of I/O memory is populated when the memory
-                    // mapping is created.
-                    return_errno_with_message!(
-                        Errno::EFAULT,
-                        "device memory page faults cannot be resolved"
-                    );
-                }
-                VmQueriedItem::None => {
+                },
+                Entry::Vacant(entry) => {
                     // Map a new frame to the page fault address.
                     let (frame, is_readonly) = match self.prepare_page(page_aligned_addr, is_write)
                     {
@@ -521,11 +528,8 @@ impl VmMapping {
                     }
                     let map_prop = PageProperty::new_user(page_flags, CachePolicy::Writeback);
 
-                    cursor.map(frame, map_prop);
+                    entry.map(frame, map_prop);
                     rss_delta.add(self.rss_type(), 1);
-                }
-                VmQueriedItem::PageTable => {
-                    unreachable!("pushed but still queried a page table")
                 }
             }
             break 'retry;
@@ -621,16 +625,14 @@ impl VmMapping {
                 VmoCommitError,
             >| {
                 cursor.jump(cur_va).unwrap();
-                while cursor.push_level_if_exists().is_some() {}
-                if cursor.query().is_none() {
+                if let Entry::Vacant(entry) = cursor.query_leaf() {
                     // We regard all the surrounding pages as accessed, no matter
                     // if it is really so. Then the hardware won't bother to update
                     // the accessed bit of the page table on following accesses.
                     let page_flags = PageFlags::from(vm_perms) | PageFlags::ACCESSED;
                     let page_prop = PageProperty::new_user(page_flags, CachePolicy::Writeback);
                     let (_, frame) = commit_fn()?;
-                    cursor.adjust_level(1);
-                    cursor.map(frame.into(), page_prop);
+                    entry.map(frame.into(), page_prop);
                     rss_delta_ref.add(self.rss_type(), 1);
                 }
                 cur_va += PAGE_SIZE;
@@ -779,12 +781,8 @@ impl VmMapping {
         let mut cursor = vm_space.cursor_mut(&preempt_guard, &range).unwrap();
         let mut num_unmapped = 0;
 
-        while cursor.find_next_unmappable_subtree(range.end).is_some() {
-            while cursor.cur_va_range().start < range.start || cursor.cur_va_range().end > range.end
-            {
-                cursor.adjust_level(cursor.level() - 1);
-            }
-            num_unmapped += cursor.unmap();
+        while let Some(entry) = cursor.find_subtree(range.end) {
+            num_unmapped += entry.unmap().num_unmapped_frames();
         }
 
         cursor.flusher().dispatch_tlb_flush();
@@ -806,13 +804,9 @@ impl VmMapping {
 
         let op = |flags: &mut PageFlags, _cache: &mut CachePolicy| *flags = new_flags;
 
-        while cursor.find_next(range.end).is_some() {
-            while cursor.cur_va_range().start < range.start || cursor.cur_va_range().end > range.end
-            {
-                cursor.adjust_level(cursor.level() - 1);
-            }
-            cursor.protect(op);
-            let va = cursor.cur_va_range();
+        while let Some(entry) = cursor.find_leaf(range.end) {
+            let va = entry.cur_va_range();
+            entry.protect(op);
             cursor
                 .flusher()
                 .issue_tlb_flush(TlbFlushOp::for_range(va.clone()));

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use ostd::{
-    mm::{page_size_at, vm_space::VmQueriedItem},
+    mm::{
+        page_size_at,
+        vm_space::{Entry, VmQueriedItem},
+    },
     task::disable_preempt,
 };
 
@@ -199,32 +202,37 @@ impl Vmar {
         let mut current_offset = 0;
         while current_offset < old_size {
             cursor.jump(old_range.start + current_offset).unwrap();
-            let Some(mapped_va) = cursor.find_next(old_range.end) else {
+            let Some(entry) = cursor.find_leaf(old_range.end) else {
                 break;
             };
 
+            let mapped_va = entry.virt_addr();
             let offset = mapped_va - old_range.start;
             let new_map_va = new_range.start + offset;
 
-            match cursor.query() {
+            match entry.item() {
                 VmQueriedItem::MappedRam { frame, prop } => {
                     let frame = (*frame).clone();
                     let level = frame.map_level();
 
-                    cursor.unmap();
+                    entry.unmap();
                     cursor.jump(new_map_va).unwrap();
-                    cursor.adjust_level(level);
-
-                    cursor.map(frame, prop);
+                    let Entry::Vacant(entry) = cursor.query_subtree(level) else {
+                        unreachable!("the remap destination must be vacant");
+                    };
+                    entry.map(frame, prop);
                 }
                 VmQueriedItem::MappedIoMem { paddr, prop, level } => {
-                    cursor.unmap();
+                    entry.unmap();
                     cursor.jump(new_map_va).unwrap();
 
                     // For MMIO pages, find the corresponding `IoMem` and map it
                     // at the new location
                     let (iomem, offset) = cursor.find_iomem_by_paddr(paddr).unwrap();
-                    cursor.map_iomem(iomem, prop, page_size_at(level), offset);
+                    let Entry::Vacant(entry) = cursor.query_subtree(level) else {
+                        unreachable!("the remap destination must be vacant");
+                    };
+                    entry.map_iomem(iomem, prop, page_size_at(level), offset);
                 }
                 _ => {
                     unreachable!("mapped item found but query failed")

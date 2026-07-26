@@ -52,7 +52,7 @@ use super::{
         meta::{AnyFrameMeta, MetaPageMeta, mapping},
     },
     page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
-    page_table::{PageTable, PageTableConfig},
+    page_table::{self, PageTable, PageTableConfig},
 };
 use crate::{
     arch::mm::{PageTableEntry, PagingConsts},
@@ -242,9 +242,11 @@ pub fn init_kernel_page_table(meta_pages: Segment<MetaPageMeta>) {
         let mut cursor = kpt.cursor_mut(&preempt_guard, &from).unwrap();
         for (va, pa, level) in largest_pages::<KernelPtConfig>(from.start, 0, max_paddr) {
             cursor.jump(va).unwrap();
-            cursor.adjust_level(level);
+            let page_table::Entry::Vacant(entry) = cursor.query_subtree(level) else {
+                panic!("mapping over an already mapped page");
+            };
             // SAFETY: we are doing the linear mapping for the kernel.
-            unsafe { cursor.map(MappedItem::Untracked(pa, level, prop)) };
+            unsafe { entry.map(MappedItem::Untracked(pa, level, prop)) };
         }
     }
 
@@ -266,9 +268,11 @@ pub fn init_kernel_page_table(meta_pages: Segment<MetaPageMeta>) {
             largest_pages::<KernelPtConfig>(from.start, pa_range.start, pa_range.len())
         {
             cursor.jump(va).unwrap();
-            cursor.adjust_level(level);
+            let page_table::Entry::Vacant(entry) = cursor.query_subtree(level) else {
+                panic!("mapping over an already mapped page");
+            };
             // SAFETY: We are doing the metadata mappings for the kernel.
-            unsafe { cursor.map(MappedItem::Untracked(pa, level, prop)) };
+            unsafe { entry.map(MappedItem::Untracked(pa, level, prop)) };
         }
     }
 
@@ -294,9 +298,11 @@ pub fn init_kernel_page_table(meta_pages: Segment<MetaPageMeta>) {
             largest_pages::<KernelPtConfig>(from.start, region.base(), from.len())
         {
             cursor.jump(va).unwrap();
-            cursor.adjust_level(level);
+            let page_table::Entry::Vacant(entry) = cursor.query_subtree(level) else {
+                panic!("mapping over an already mapped page");
+            };
             // SAFETY: we are doing the kernel code mapping.
-            unsafe { cursor.map(MappedItem::Untracked(pa, level, prop)) };
+            unsafe { entry.map(MappedItem::Untracked(pa, level, prop)) };
         }
     }
 
