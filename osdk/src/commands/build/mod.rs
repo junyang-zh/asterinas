@@ -235,11 +235,15 @@ fn build_kernel_elf(
         "-C no-redzone=y",
     ]);
 
+    let x86_features = format!(
+        "-C target-feature={}",
+        std::env::var("X86_TARGET_FEATURES").unwrap_or_else(|_| "+ermsb".into())
+    );
     if matches!(arch, Arch::X86_64) {
         // This is a workaround for <https://github.com/asterinas/asterinas/issues/839>.
         // It makes running on Intel CPUs after Ivy Bridge (2012) faster, but much slower
         // on older CPUs.
-        rustflags.push("-C target-feature=+ermsb");
+        rustflags.push(&x86_features);
     } else if matches!(arch, Arch::RiscV64) {
         // Enable the Zicbom extension for RISC-V to support cache block operations.
         rustflags.push("-C target-feature=+zicbom");

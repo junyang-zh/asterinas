@@ -23,6 +23,8 @@ COVERAGE ?= 0
 INITRAMFS ?= on
 CMDLINE ?=
 
+X86_TARGET_FEATURES ?= +ermsb
+
 # Specify the primary system console (supported: tty0, ttyS0, hvc0).
 # - tty0: The active virtual terminal (VT).
 # - ttyS0: The serial (UART) terminal.
