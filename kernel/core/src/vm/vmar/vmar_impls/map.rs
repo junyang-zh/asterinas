@@ -401,6 +401,10 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             return Err(err);
         }
 
+        // A stale translation can bypass a first fault. Synchronize before
+        // either mapping metadata or eagerly populated PTEs become visible.
+        cursor.sync_deferred_unmaps_before_publish();
+
         if matches!(vm_mapping.mapped_mem(), MappedMemory::Device(_)) {
             let frames_mapped = map_device_pages(&mut cursor, &affected_range, perms, device_pages);
             vm_mapping.add_frames_mapped(frames_mapped);

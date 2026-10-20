@@ -153,6 +153,7 @@ impl Vmar {
 
         let new_mapping = vm_mapping.enlarge(new_size - old_size);
 
+        cursor.sync_deferred_unmaps_before_publish();
         map_to_page_table(&mut cursor, new_mapping);
 
         self.refresh_rmap_entries(
@@ -257,6 +258,7 @@ impl Vmar {
                 self.add_mapping_size(&preempt_guard, growth)?;
             }
 
+            cursor.sync_deferred_unmaps_before_publish();
             Ok(remap_op.perform_move_and_extend(&mut cursor))
         })();
 

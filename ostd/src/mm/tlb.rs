@@ -2,6 +2,9 @@
 
 //! TLB flush operations.
 
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+pub(crate) mod latr;
+
 use alloc::vec::Vec;
 use core::{mem::MaybeUninit, ops::Range, sync::atomic::Ordering};
 
@@ -26,6 +29,8 @@ pub struct TlbFlusher<'a, G: PinCurrentCpu> {
     ops_stack: OpsStack,
     ipi_sender: Option<&'static IpiSender>,
     _pin_current: G,
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    has_lazy: bool,
 }
 
 impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
@@ -43,6 +48,8 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
             ops_stack: OpsStack::new(),
             ipi_sender: crate::smp::IPI_SENDER.get(),
             _pin_current: pin_current_guard,
+            #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+            has_lazy: false,
         }
     }
 
@@ -73,6 +80,44 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
         self.ops_stack.push(op, Some(drop_after_flush));
     }
 
+    /// Retains an unmapped frame until lazy remote invalidation AND an RCU
+    /// grace period complete. Permission revocations must use synchronous APIs.
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    pub fn latr_with(&mut self, op: TlbFlushOp, frame: RcuDrop<Frame<dyn AnyFrameMeta>>) {
+        let cpus = self.target_cpus.load(Ordering::Release);
+        if let Err(frame) = latr::add(&cpus, op.clone(), frame) {
+            self.issue_tlb_flush_with(op, frame);
+        } else {
+            self.has_lazy = true;
+        }
+    }
+
+    /// Transfers eligible pure-unmap requests to bounded background ownership.
+    /// Ordinary requests, including reserve overflow, still complete here.
+    /// The covering VM cursor must publish its generation before unlocking.
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    pub(crate) fn defer_unmap_flush(&mut self) -> bool {
+        self.dispatch_tlb_flush();
+        let deferred = core::mem::replace(&mut self.has_lazy, false);
+        self.sync_tlb_flush();
+        deferred
+    }
+
+    /// Completes lazy requests from all origins published before this barrier.
+    /// Callbacks acknowledge only after architectural invalidation completes.
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    pub(crate) fn sync_all_deferred_unmaps(&mut self) {
+        let mut targets = crate::cpu::CpuSet::new_full();
+        targets.remove(self._pin_current.current_cpu());
+        let pending = self
+            .ipi_sender
+            .map(|sender| sender.inter_processor_call(&targets, latr::do_flush));
+        latr::do_flush();
+        if let Some(pending) = pending {
+            pending.wait();
+        }
+    }
+
     /// Dispatches all the pending TLB flush requests.
     ///
     /// All previous pending requests issued by [`Self::issue_tlb_flush`] or
@@ -80,6 +125,10 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
     /// function. But it may not be synchronous. Upon the return of this
     /// function, the TLB entries may not be coherent.
     pub fn dispatch_tlb_flush(&mut self) {
+        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+        if self.has_lazy {
+            latr::flush_local();
+        }
         if self.ops_stack.is_empty() {
             return;
         }
@@ -132,6 +181,20 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
     /// processed in IRQs, two CPUs may deadlock if they are waiting for each
     /// other's TLB coherence.
     pub fn sync_tlb_flush(&mut self) {
+        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+        if self.has_lazy {
+            // Preserve the public synchronisation contract, including COW,
+            // MAP_FIXED replacement and page-cache invalidation callers.
+            latr::flush_local();
+            if let Some(sender) = self.ipi_sender {
+                let mut targets = latr::pending_cpus();
+                targets.remove(self._pin_current.current_cpu());
+                self.pending_ipis
+                    .extend(&sender.inter_processor_call(&targets, latr::do_flush));
+            }
+            self.has_lazy = false;
+        }
+
         if self.ipi_sender.is_none() {
             // We performed some TLB flushes in the boot context. The AP's boot
             // process should take care of them.

@@ -110,6 +110,8 @@ pub fn inject_scheduler(scheduler: &'static dyn Scheduler<Task>) {
 /// by an OSTD-based kernel during its initialization phase,
 /// after it has injected its scheduler via [`inject_scheduler`].
 pub fn enable_preemption_on_cpu() {
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    timer::register_callback_on_cpu(crate::mm::tlb::latr::timer_flush);
     timer::register_callback_on_cpu(|| {
         scheduler_singleton().mut_local_rq_with(&mut |local_rq| {
             let should_pick_next = local_rq.update_current(UpdateFlags::Tick);

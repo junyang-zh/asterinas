@@ -19,6 +19,7 @@ aster-i8042.workspace = true
 
 [features]
 single_vmar_alloc = ["aster-core/single_vmar_alloc"]
+lazy_tlb_flush_on_unmap = ["aster-core/lazy_tlb_flush_on_unmap"]
 artifact_busy_poll = ["aster-core/artifact_busy_poll"]
 default = ["cvm_guest"]
 coverage = ["aster-core/coverage"]

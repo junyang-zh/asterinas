@@ -41,6 +41,8 @@ pub(super) fn switch_to_task(next_task: Arc<Task>, preempt_guard: DisabledPreemp
     // before switching, so the next task inherits no guard from this task.
     drop(preempt_guard);
 
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    crate::mm::tlb::latr::do_flush();
     before_switching_to(&next_task, &irq_guard);
 
     // `before_switching_to` guarantees that from now on, and while the next task is running on the

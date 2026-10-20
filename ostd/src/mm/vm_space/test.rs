@@ -22,6 +22,50 @@ fn create_dummy_frame() -> UFrame {
     uframe
 }
 
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+#[ktest]
+fn deferred_generations_saturate_without_eliding_publication_barriers() {
+    let vmspace = VmSpace::<()>::new();
+    vmspace.cpus.store(&CpuSet::new_full(), Ordering::Release);
+    vmspace
+        .deferred_issued
+        .store(u64::MAX - 1, Ordering::Relaxed);
+    vmspace
+        .deferred_completed
+        .store(u64::MAX - 1, Ordering::Relaxed);
+    let preempt = disable_preempt();
+    let range = 0x1000..0x2000;
+    let prop = PageProperty::new_user(PageFlags::R, CachePolicy::Writeback);
+    let mut cursor = vmspace.cursor_mut(&preempt, &range).unwrap();
+    for _ in 0..3 {
+        cursor.jump(range.start).unwrap();
+        cursor.map(create_dummy_frame(), prop);
+        assert_eq!(cursor.unmap(), 1);
+        cursor.complete_deferred_unmap();
+        assert_eq!(vmspace.deferred_issued.load(Ordering::Acquire), u64::MAX);
+        cursor.sync_deferred_unmaps_before_publish();
+        assert_eq!(vmspace.deferred_completed.load(Ordering::Acquire), u64::MAX);
+        assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
+
+        // At saturation, equal watermarks cannot justify skipping a barrier.
+        // Queue a retained frame without dispatching, preserving the origin's
+        // pending bit until the barrier performs its own local invalidation.
+        let frame = create_dummy_frame();
+        {
+            let _irq = crate::irq::disable_local();
+            cursor.flusher.latr_with(
+                TlbFlushOp::for_single(range.start),
+                Frame::rcu_from_unsized(RcuDrop::new(frame.clone())),
+            );
+            assert!(crate::mm::tlb::latr::pending_cpus_for_test().contains(preempt.current_cpu()));
+        }
+        cursor.sync_deferred_unmaps_before_publish();
+        assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
+        cursor.flusher.dispatch_tlb_flush();
+        cursor.flusher.sync_tlb_flush();
+    }
+}
+
 /// Creates a new `VmSpace` and verifies its initial state.
 #[ktest]
 fn vmspace_creation() {

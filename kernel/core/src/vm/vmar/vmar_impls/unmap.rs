@@ -88,6 +88,30 @@ impl Vmar {
         let preempt_guard = disable_preempt();
         let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
         let mut rs_as_delta = RsAsDelta::new(self);
+        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+        if range.len() == PAGE_SIZE {
+            let can_defer = cursor.find_next_mapped(range.end).is_some_and(|mapping| {
+                mapping.map_to_addr() <= range.start
+                    && mapping.map_end() >= range.end
+                    && !mapping.is_shared()
+                    && matches!(mapping.mapped_mem(), super::MappedMemory::Anonymous)
+            });
+            cursor.jump(range.start).unwrap();
+            if can_defer {
+                let mapping = take_next_unmappable(&mut cursor, range.end)
+                    .unwrap()
+                    .unwrap_mapping();
+                mapping.unmap(&mut cursor, &mut rs_as_delta);
+                cursor.complete_deferred_unmap();
+                // Private anonymous mappings have no reverse-map entries.
+                drop(rs_as_delta);
+                drop(cursor);
+                drop(preempt_guard);
+                #[cfg(ktest)]
+                self.accounting_pause.hit(accounting_tests::AFTER_UNMAP_PT);
+                return Ok(());
+            }
+        }
         let old_rmap_entries =
             Self::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&range));
 
