@@ -530,6 +530,8 @@ fn set_need_preempt(cpu_id: CpuId) {
 /// This should only be called if the current is to exit.
 #[track_caller]
 pub(super) fn exit_current() -> ! {
+    #[cfg(feature = "breakdown_counters")]
+    crate::mm::breakdown::exit_task(crate::mm::breakdown::current_task_id());
     let mut is_first_try = true;
 
     reschedule(|local_rq: &mut dyn LocalRunQueue| {
@@ -583,6 +585,9 @@ fn reschedule<F>(mut f: F)
 where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
+    #[cfg(feature = "breakdown_counters")]
+    let _profile = crate::mm::breakdown::enter(crate::mm::breakdown::Phase::Scheduler);
+
     super::atomic_mode::might_sleep();
     // SAFETY: RCU readers disable preemption. The atomic-mode check above
     // excludes any live read-side guard. Process callbacks before changing

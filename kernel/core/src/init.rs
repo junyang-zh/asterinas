@@ -109,6 +109,8 @@ fn idle_step() {
 }
 
 fn bsp_idle_loop() {
+    #[cfg(feature = "breakdown_counters")]
+    ostd::mm::breakdown::mark_idle();
     ostd::info!("Idle thread for CPU #0 started");
 
     // Spawn the first non-idle kernel thread on BSP.
@@ -138,6 +140,8 @@ fn bsp_idle_loop() {
 }
 
 fn ap_idle_loop() {
+    #[cfg(feature = "breakdown_counters")]
+    ostd::mm::breakdown::mark_idle();
     ostd::info!(
         "Idle thread for CPU #{} started",
         // No races because this function runs on a certain AP.

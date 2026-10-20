@@ -54,6 +54,10 @@ pub fn inject_post_schedule_handler(handler: fn()) {
 /// execute user code. Multiple tasks can share a single user space.
 #[derive(Debug)]
 pub struct Task {
+    #[cfg(feature = "breakdown_counters")]
+    pub(crate) profile_id: u64,
+    #[cfg(feature = "breakdown_counters")]
+    pub(crate) profile_is_idle: AtomicBool,
     #[expect(clippy::type_complexity)]
     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
 
@@ -124,6 +128,8 @@ impl Task {
     /// BUG: This method highly depends on the current scheduling policy.
     #[track_caller]
     pub fn run(self: &Arc<Self>) {
+        #[cfg(feature = "breakdown_counters")]
+        crate::mm::breakdown::fork(crate::mm::breakdown::current_task_id(), crate::mm::breakdown::task_id(self));
         scheduler::run_new_task(self.clone());
     }
 
@@ -239,7 +245,13 @@ impl TaskOptions {
         // we only need to align the stack pointer to 16 bytes.
         ctx.set_stack_pointer(kstack.end_vaddr() - 16);
 
+        #[cfg(feature = "breakdown_counters")]
+        static NEXT_PROFILE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
         let new_task = Task {
+            #[cfg(feature = "breakdown_counters")]
+            profile_id: NEXT_PROFILE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            #[cfg(feature = "breakdown_counters")]
+            profile_is_idle: AtomicBool::new(false),
             func: ForceSync::new(Cell::new(self.func)),
             data: self.data.unwrap_or_else(|| Box::new(())),
             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),

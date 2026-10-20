@@ -71,6 +71,7 @@ unwinding = { workspace = true, features = ["fde-static"] }
 
 [features]
 lazy_tlb_flush_on_unmap = []
+breakdown_counters = []
 memory_accounting = []
 default = ["cvm_guest"]
 # The guest OS support for Confidential VMs (CVMs), e.g., Intel TDX

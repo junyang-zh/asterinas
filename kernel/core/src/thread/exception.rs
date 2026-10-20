@@ -31,7 +31,11 @@ pub(super) fn handle_exception(ctx: &Context, user_ctx: &UserContext, exception:
 
 /// Handles the page fault occurs in the VMAR.
 fn handle_page_fault_from_vmar(vmar: &Vmar, page_fault_info: &PageFaultInfo) -> Result<(), ()> {
+    #[cfg(feature = "breakdown_counters")]
+    let mut profile = ostd::mm::breakdown::enter(ostd::mm::breakdown::Phase::PageFault);
     if let Err(e) = vmar.handle_page_fault(page_fault_info) {
+        #[cfg(feature = "breakdown_counters")]
+        profile.fail();
         warn!(
             "page fault handler failed: info: {:#x?}, err: {:?}",
             page_fault_info, e

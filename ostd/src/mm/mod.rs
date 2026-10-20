@@ -11,6 +11,8 @@
     expect(unused_imports)
 )]
 
+#[cfg(feature = "breakdown_counters")]
+pub mod breakdown;
 pub mod dma;
 pub mod fault;
 pub mod frame;

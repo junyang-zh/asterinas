@@ -40,6 +40,8 @@ use crate::{
     },
 };
 
+#[cfg(feature = "breakdown_counters")]
+mod breakdown_counters;
 mod cmdline;
 mod cpuinfo;
 mod filesystems;
@@ -151,6 +153,8 @@ impl RootDirOps {
     }
 
     const STATIC_ENTRIES: &'static [StaticEntry] = &[
+        #[cfg(feature = "breakdown_counters")]
+        ("breakdown-counters", InodeType::File, breakdown_counters::BreakdownCountersFileOps::new_inode),
         ("cmdline", InodeType::File, CmdLineFileOps::new_inode),
         ("cpuinfo", InodeType::File, CpuInfoFileOps::new_inode),
         (

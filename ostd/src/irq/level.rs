@@ -89,10 +89,14 @@ pub(super) fn enter<F: FnOnce()>(f: F, cpu_priv_at_irq: PrivilegeLevel) {
         let bit_1 = 0b10;
         bit_1 | bit_0
     };
+    #[cfg(feature = "breakdown_counters")]
+    crate::mm::breakdown::irq_enter();
     INTERRUPT_LEVEL.add_assign(increment);
 
     f();
 
+    #[cfg(feature = "breakdown_counters")]
+    crate::mm::breakdown::irq_exit();
     INTERRUPT_LEVEL.sub_assign(increment);
 }
 
