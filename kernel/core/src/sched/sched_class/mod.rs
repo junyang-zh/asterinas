@@ -238,6 +238,14 @@ impl Scheduler for ClassScheduler {
             return None;
         }
 
+        // A wake can be delayed past the task's final dequeue. The successful
+        // CPU reservation acquires that dequeue's terminal-state publication,
+        // even if migration made the initially observed runqueue stale.
+        if task.is_finished() {
+            task.cpu().set_to_none();
+            return None;
+        }
+
         // Preempt if the new task has a higher priority.
         let should_preempt = rq
             .current

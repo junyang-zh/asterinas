@@ -260,9 +260,19 @@ impl Waker {
     /// delivered, _or_ that the waiter will be dropped after being woken. It's up to the caller to
     /// handle the latter case properly to avoid missing the wake event.
     pub fn wake_up(&self) -> bool {
+        self.wake_up_impl(
+            #[cfg(ktest)]
+            || {},
+        )
+    }
+
+    fn wake_up_impl(&self, #[cfg(ktest)] after_publish: impl FnOnce()) -> bool {
         if self.has_woken.swap(true, Ordering::Release) {
             return false;
         }
+        // Force the real publication/enqueue gap in the lifecycle regression.
+        #[cfg(ktest)]
+        after_publish();
         scheduler::unpark_target(self.task.clone());
 
         true
@@ -324,6 +334,53 @@ mod test {
         queue_wake(|queue| {
             queue.wake_all();
         });
+    }
+
+    #[ktest]
+    fn delayed_wake_does_not_requeue_finished_task() {
+        let published = Arc::new(SpinLock::<Option<Arc<Waker>>>::new(None));
+        let target_published = published.clone();
+        let target = TaskOptions::new(move || {
+            let (waiter, waker) = Waiter::new_pair();
+            *target_published.lock() = Some(waker.clone());
+            // Stay runnable until wake_up publishes its flag. This forces wait()
+            // to consume the flag without depending on the delayed enqueue.
+            while !waker.has_woken.load(Ordering::Acquire) {
+                Task::yield_now();
+            }
+            waiter.wait();
+            drop(waiter);
+            // Return through the real kernel_task_entry/exit_current path.
+        })
+        .spawn()
+        .unwrap();
+
+        let waker = loop {
+            if let Some(waker) = published.lock().take() {
+                break waker;
+            }
+            Task::yield_now();
+        };
+        let mut preempt_guard = None;
+        assert!(waker.wake_up_impl(|| {
+            // The target never parks, so CPU=None after publication means its
+            // final dequeue completed. Bound the wait to diagnose a broken test.
+            for _ in 0..10_000 {
+                if target.schedule_info().cpu.get().is_none() {
+                    break;
+                }
+                Task::yield_now();
+            }
+            assert!(target.schedule_info().cpu.get().is_none());
+            // FIFO uses the BSP. Keep the stale task from running before the
+            // assertion, so the red build reports the actual illegal enqueue.
+            preempt_guard = Some(crate::task::disable_preempt());
+        }));
+        assert!(
+            target.schedule_info().cpu.get().is_none(),
+            "a wake delayed past exit requeued a finished task"
+        );
+        drop(preempt_guard);
     }
 
     #[ktest]

@@ -54,6 +54,12 @@ impl<T: CommonSchedInfo + Send + Sync> Scheduler<T> for FifoScheduler<T> {
         if still_in_rq && let Err(_) = runnable.cpu().set_if_is_none(target_cpu) {
             return None;
         }
+        // The successful CPU reservation acquires any terminal publication
+        // from the final dequeue, including when the old owner was another CPU.
+        if runnable.is_finished() {
+            runnable.cpu().set_to_none();
+            return None;
+        }
         rq.queue.push_back(runnable);
 
         // All tasks are important. Do not preempt the current task without good reason.

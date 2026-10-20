@@ -144,6 +144,11 @@ fn scheduler_singleton() -> &'static dyn Scheduler<Task> {
 pub trait Scheduler<T = Task>: Sync + Send {
     /// Enqueues a runnable task.
     ///
+    /// A wake may arrive after a task finishes. Reject terminal tasks after
+    /// reserving their CPU, under the target runqueue lock. The reservation must
+    /// acquire the terminal state published before the final CPU clear.
+    /// An early terminal-state check alone does not close the exit/enqueue race.
+    ///
     /// The scheduler implementer can perform load-balancing or some time accounting work here.
     ///
     /// The newly-enqueued task may have a higher priority than the currently running one on a CPU
@@ -529,6 +534,14 @@ pub(super) fn exit_current() -> ! {
         let next_task_opt = if is_first_try {
             is_first_try = false;
             let should_pick_next = local_rq.update_current(UpdateFlags::Exit);
+            // A delayed wake must not resurrect this task. The runqueue lock
+            // serializes this publication with enqueue; the CPU clear below
+            // releases it to enqueues that reserve a different runqueue.
+            local_rq
+                .current()
+                .unwrap()
+                .is_finished
+                .store(true, core::sync::atomic::Ordering::Relaxed);
             let _current = local_rq.dequeue_current();
             should_pick_next.then(|| local_rq.pick_next())
         } else {

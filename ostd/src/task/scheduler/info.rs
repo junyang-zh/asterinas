@@ -32,6 +32,8 @@ impl AtomicCpuId {
 
     /// Sets the inner value of an `AtomicCpuId` if it's empty.
     ///
+    /// A successful reservation acquires state published by `set_to_none`.
+    ///
     /// The return value is a result indicating whether the new value was written
     /// and containing the previous value. If the previous value is empty, it returns
     /// `Ok(())`. Otherwise, it returns `Err(previous_value)` which the previous
@@ -41,7 +43,7 @@ impl AtomicCpuId {
             .compare_exchange(
                 Self::NONE,
                 cpu_id.into(),
-                Ordering::Relaxed,
+                Ordering::Acquire,
                 Ordering::Relaxed,
             )
             .map(|_| ())
@@ -56,7 +58,8 @@ impl AtomicCpuId {
     /// Sets the inner value of an `AtomicCpuId` to `AtomicCpuId::NONE`, i.e. makes
     /// an `AtomicCpuId` empty.
     pub fn set_to_none(&self) {
-        self.0.store(Self::NONE, Ordering::Relaxed);
+        // Publish the final task state before another enqueue reserves this CPU slot.
+        self.0.store(Self::NONE, Ordering::Release);
     }
 
     /// Gets the inner value of an `AtomicCpuId`.
@@ -77,6 +80,10 @@ impl Default for AtomicCpuId {
 }
 
 impl CommonSchedInfo for Task {
+    fn is_finished(&self) -> bool {
+        Task::is_finished(self)
+    }
+
     fn cpu(&self) -> &AtomicCpuId {
         &self.schedule_info().cpu
     }
@@ -84,6 +91,13 @@ impl CommonSchedInfo for Task {
 
 /// Trait for fetching common scheduling information.
 pub trait CommonSchedInfo {
+    /// Whether the task has reached its terminal scheduling state.
+    ///
+    /// Publish this under the owning runqueue lock before clearing `cpu()`.
+    /// Enqueue must check it after successfully reserving `cpu()`, while holding
+    /// the target runqueue lock, and release the reservation when rejecting it.
+    fn is_finished(&self) -> bool;
+
     /// Gets the CPU that the task is running on or lately ran on.
     fn cpu(&self) -> &AtomicCpuId;
 }

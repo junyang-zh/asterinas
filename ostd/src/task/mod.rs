@@ -70,10 +70,22 @@ pub struct Task {
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
 
+    /// Set under the current runqueue lock before the final dequeue.
+    is_finished: AtomicBool,
+
     schedule_info: TaskScheduleInfo,
 }
 
 impl Task {
+    /// Returns whether this task has completed its function and begun its final dequeue.
+    ///
+    /// This is distinct from an upper-layer thread exit: cleanup may still need to run
+    /// until the task function returns. Schedulers must check this after reserving the
+    /// task CPU, under the target runqueue lock, before inserting a task.
+    pub fn is_finished(&self) -> bool {
+        self.is_finished.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Gets the current task.
     ///
     /// It returns `None` if the function is called in the bootstrap context.
@@ -234,6 +246,7 @@ impl TaskOptions {
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
+            is_finished: AtomicBool::new(false),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },
