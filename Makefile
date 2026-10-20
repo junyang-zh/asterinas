@@ -23,7 +23,21 @@ COVERAGE ?= 0
 INITRAMFS ?= on
 CMDLINE ?=
 
+# Artifact benchmark boot uses a separately prepared archive and preserved data.
+ARTIFACT_INITRAMFS ?= $(CURDIR)/test/initramfs/build/artifact-initramfs.cpio.gz
+BENCH_DATA_IMAGE ?= $(CURDIR)/test/build/bench_data.img
+ARTIFACT_EXT2_IMAGE ?= $(CURDIR)/test/build/ext2.img
+ARTIFACT_EXFAT_IMAGE ?= $(CURDIR)/test/build/exfat.img
+QMP_PORT ?= 4444
+BENCH_FEATURES ?= artifact_busy_poll,lazy_tlb_flush_on_unmap
+ARTIFACT_COMMA := ,
 X86_TARGET_FEATURES ?= +ermsb
+ifneq ($(filter run_benchmark kernel_benchmark,$(MAKECMDGOALS)),)
+SCHEME := artifact
+CONSOLE := ttyS0
+X86_TARGET_FEATURES := +ermsb,+fsrm
+override FEATURES := $(strip $(FEATURES))$(if $(and $(strip $(FEATURES)),$(strip $(BENCH_FEATURES))),$(ARTIFACT_COMMA))$(strip $(BENCH_FEATURES))
+endif
 
 # Specify the primary system console (supported: tty0, ttyS0, hvc0).
 # - tty0: The active virtual terminal (VT).
@@ -265,6 +279,10 @@ else
 CARGO_OSDK_INITRAMFS_OPTION := --initramfs=$(abspath test/initramfs/build/initramfs.cpio.gz)
 endif
 
+ifneq ($(filter run_benchmark kernel_benchmark,$(MAKECMDGOALS)),)
+CARGO_OSDK_INITRAMFS_OPTION := --initramfs=$(abspath $(ARTIFACT_INITRAMFS))
+endif
+
 ifeq ($(INITRAMFS),on)
 CARGO_OSDK_COMMON_ARGS += $(CARGO_OSDK_INITRAMFS_OPTION)
 endif
@@ -342,6 +360,15 @@ initramfs: check_vdso
 .PHONY: rootfs
 rootfs: check_vdso
 	@$(MAKE) --no-print-directory -C test/initramfs rootfs-boot-images
+
+.PHONY: kernel_benchmark run_benchmark
+kernel_benchmark: $(CARGO_OSDK)
+	@test -f "$(ARTIFACT_INITRAMFS)"
+	@cd kernel && cargo osdk build $(CARGO_OSDK_BUILD_ARGS)
+
+run_benchmark: $(CARGO_OSDK)
+	@test -f "$(ARTIFACT_INITRAMFS)"
+	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS)
 
 # Build the kernel with an initramfs
 .PHONY: kernel

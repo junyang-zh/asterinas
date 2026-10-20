@@ -95,3 +95,8 @@ supported_archs = ["aarch64"]
 boot.method = "vmm-direct"
 build.strip_elf = false
 qemu.args = "$(./tools/qemu_args.sh aarch64)"
+
+# Artifact measurements use headless serial, loopback QMP and fixed disk order.
+[scheme."artifact"]
+supported_archs = ["x86_64"]
+qemu.args = "$(./tools/qemu_benchmark_args.sh)"
