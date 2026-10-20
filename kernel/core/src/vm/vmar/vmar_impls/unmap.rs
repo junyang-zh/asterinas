@@ -92,7 +92,11 @@ impl Vmar {
             Self::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&range));
 
         let result = self.remove_mappings(&mut cursor, range.len(), &mut rs_as_delta);
-        self.refresh_rmap_entries(&mut cursor, old_rmap_entries, core::slice::from_ref(&range));
+        // Removal cannot create a reverse mapping. Preserve registration
+        // updates whenever the old snapshot contained any shared mappings.
+        if !old_rmap_entries.is_empty() {
+            self.refresh_rmap_entries(&mut cursor, old_rmap_entries, core::slice::from_ref(&range));
+        }
 
         drop(rs_as_delta);
         drop(cursor);

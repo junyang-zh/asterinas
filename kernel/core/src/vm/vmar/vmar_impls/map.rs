@@ -381,6 +381,10 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             perms | may_perms,
         );
 
+        // No new shared VMO and no old entries means there is nothing to
+        // refresh, including metadata fragments split or merged by insertion.
+        let refresh_rmap = !old_rmap_entries.is_empty() || vm_mapping.vmo_for_rmap().is_some();
+
         #[cfg(ktest)]
         if let Some(action) = before_admission {
             action();
@@ -410,11 +414,13 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_to_page_table(&mut cursor, vm_mapping);
         }
 
-        parent.refresh_rmap_entries(
-            &mut cursor,
-            old_rmap_entries,
-            core::slice::from_ref(&affected_range),
-        );
+        if refresh_rmap {
+            parent.refresh_rmap_entries(
+                &mut cursor,
+                old_rmap_entries,
+                core::slice::from_ref(&affected_range),
+            );
+        }
 
         drop(cursor);
         drop(preempt_guard);
