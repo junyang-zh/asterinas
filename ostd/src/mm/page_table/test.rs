@@ -1303,3 +1303,21 @@ mod boot_pt {
         );
     }
 }
+
+
+#[ktest]
+fn try_cursor_conflict_releases_partial_locks() {
+    let pt = PageTable::<UserPtConfig>::empty();
+    let preempt = disable_preempt();
+    // Materialise two adjacent leaf PTs under the same parent.
+    drop(pt.cursor_mut(&preempt, &(0..PAGE_SIZE)).unwrap());
+    let second = page_size::<UserPtConfig>(2);
+    drop(pt.cursor_mut(&preempt, &(second..second + PAGE_SIZE)).unwrap());
+    let held = pt.cursor_mut(&preempt, &(second..second + PAGE_SIZE)).unwrap();
+    // The failed broad transaction first acquires the parent and first child,
+    // then encounters the held second child. Both earlier locks must roll back.
+    assert!(pt.try_cursor_mut(&preempt, &(0..second + PAGE_SIZE)).unwrap().is_none());
+    assert!(pt.try_cursor_mut(&preempt, &(0..PAGE_SIZE)).unwrap().is_some());
+    drop(held);
+    assert!(pt.try_cursor_mut(&preempt, &(0..second + PAGE_SIZE)).unwrap().is_some());
+}
