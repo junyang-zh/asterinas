@@ -44,10 +44,9 @@ impl Vmar {
             cursor.find_next_mapped_with(range.end, |mapping| (mapping.range(), mapping.perms()))
         {
             if last_protected_addr < vm_mapping_range.start {
-                return_errno_with_message!(
-                    Errno::ENOMEM,
-                    "protect: the range covers unmapped pages"
-                );
+                // Earlier mappings may already have lost permissions. Reach
+                // the common synchronization before reporting this hole.
+                break;
             }
 
             // Skip if no actions needed.
