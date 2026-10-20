@@ -17,7 +17,7 @@ use crate::{
     thread::kernel_thread::ThreadOptions,
     vm::{
         perms::VmPerms,
-        vmar::{OffsetType, RemapOldMappingAction, RssType, Vmar, VmarHandle},
+        vmar::{OffsetType, PageFaultInfo, RemapOldMappingAction, RssType, Vmar, VmarHandle},
     },
 };
 
@@ -234,6 +234,230 @@ fn empty_hints(vmar: &Vmar) {
     for cpu in all_cpus() {
         *vmar.allocator.must_be_free.get_on_cpu(cpu).lock() = 0..0;
     }
+}
+
+#[ktest]
+fn fixed_mapping_completes_while_hint_is_held() {
+    let vmar = new_vmar();
+    let before = vmar.get_mappings_total_size();
+    let rss_before = vmar.get_rss_counter(RssType::Anon);
+    let base = 0x300_000;
+    map(
+        &vmar,
+        base,
+        1,
+        OffsetType::FixedNoReplace,
+        VmPerms::READ | VmPerms::WRITE,
+    )
+    .unwrap();
+    write_byte(&vmar, base, 0x93);
+    let address = base + 2 * PAGE_SIZE;
+    let controller_guard = disable_preempt();
+    let remote = remote_cpu(controller_guard.current_cpu());
+    let cache_cpu =
+        CpuId::try_from(cpu_range_for_vaddr_range(&(address..address + PAGE_SIZE)).start).unwrap();
+    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = address..address + PAGE_SIZE;
+    vmar.allocator.test_pause.arm(remote, FIXED);
+    let result = Arc::new(SpinLock::<Option<Result<Vaddr>>>::new(None));
+    let completed = Arc::new(AtomicBool::new(false));
+    let worker_result = result.clone();
+    let worker_completed = completed.clone();
+    let worker_vmar = vmar.clone_arc();
+    let worker = ThreadOptions::new(move || {
+        let outcome = map(
+            &worker_vmar,
+            address,
+            1,
+            OffsetType::FixedNoReplace,
+            VmPerms::READ,
+        );
+        *worker_result.lock() = Some(outcome);
+        worker_completed.store(true, Ordering::Release);
+    })
+    .cpu_affinity(remote.into())
+    .spawn();
+
+    let reached = wait_flag(&vmar.allocator.test_pause.reached);
+    let hint = vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock();
+    vmar.allocator.test_pause.release();
+    // This is a progress observation, not a throughput/time threshold. The
+    // existing bounded wait is only a fail-safe: release even on failure so
+    // the blocking implementation can finish and join before we assert.
+    let completed_while_held = wait_flag(&completed);
+    let retained_stale_hint = hint.contains(&address);
+    drop(hint);
+    drop(controller_guard);
+    worker.join();
+    assert!(reached, "fixed worker did not reach the acquisition hook");
+    assert!(!vmar.allocator.test_pause.timed_out.load(Ordering::Acquire));
+    assert!(
+        completed_while_held,
+        "fixed mapping waited for contended hint maintenance"
+    );
+    assert!(retained_stale_hint);
+    assert_eq!(result.lock().take().unwrap().unwrap(), address);
+    assert_eq!(read_byte(&vmar, base), 0x93);
+    assert_mapping_perms(
+        &vmar,
+        base..base + PAGE_SIZE,
+        VmPerms::READ | VmPerms::WRITE,
+    );
+    assert_mapping_perms(&vmar, address..address + PAGE_SIZE, VmPerms::READ);
+    assert_eq!(
+        vmar.handle_page_fault(&PageFaultInfo::new(address, VmPerms::WRITE))
+            .unwrap_err()
+            .error(),
+        Errno::EACCES
+    );
+    assert_eq!(vmar.get_mappings_total_size(), before + 2 * PAGE_SIZE);
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 1);
+    assert_eq!(read_byte(&vmar, address), 0);
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 2);
+    vmar.remove_mapping(base..address + PAGE_SIZE).unwrap();
+    assert_eq!(vmar.get_mappings_total_size(), before);
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before);
+}
+
+fn assert_mapping_perms(vmar: &Vmar, range: Range<Vaddr>, perms: VmPerms) {
+    let mut covered = 0;
+    vmar.for_each_mapping(range.clone(), true, |mapping| {
+        assert_eq!(mapping.perms() & VmPerms::ALL_PERMS, perms);
+        covered += get_intersected_range(&mapping.range(), &range).len();
+    })
+    .unwrap();
+    assert_eq!(covered, range.len());
+}
+
+enum StaleHint {
+    Local,
+    Remote,
+    CoveringRemap,
+}
+
+fn stale_hint_preserves_mapping(kind: StaleHint) {
+    let vmar = new_vmar();
+    let controller_guard = disable_preempt();
+    let current = controller_guard.current_cpu();
+    let cache_cpu = match kind {
+        StaleHint::Local => allocation_cpu(current),
+        StaleHint::Remote => remote_cpu(allocation_cpu(current)),
+        StaleHint::CoveringRemap => CpuId::bsp(),
+    };
+    let address = assigned_range_on_cpu(cache_cpu).start + 32 * PAGE_SIZE;
+    let occupied = address..address + 2 * PAGE_SIZE;
+    let source = address - 2 * PAGE_SIZE;
+    let before = vmar.get_mappings_total_size();
+    let rss_before = vmar.get_rss_counter(RssType::Anon);
+    map(
+        &vmar,
+        address,
+        2,
+        OffsetType::FixedNoReplace,
+        VmPerms::READ | VmPerms::WRITE,
+    )
+    .unwrap();
+    write_byte(&vmar, address, 0xa3);
+    write_byte(&vmar, address + PAGE_SIZE, 0x5c);
+    vmar.protect(VmPerms::READ, occupied.clone()).unwrap();
+    if matches!(kind, StaleHint::CoveringRemap) {
+        map(
+            &vmar,
+            source,
+            1,
+            OffsetType::FixedNoReplace,
+            VmPerms::READ | VmPerms::WRITE,
+        )
+        .unwrap();
+        write_byte(&vmar, source, 0x72);
+    }
+
+    // Simulate skipped fixed-path maintenance. Only this hint is usable, so
+    // the first cached attempt must encounter the installed read-only mapping.
+    empty_hints(&vmar);
+    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = occupied.clone();
+    let stage = if matches!(kind, StaleHint::CoveringRemap) {
+        REMAP_CACHED
+    } else {
+        CACHED
+    };
+    // Use the existing one-shot hook as an observation, without a timed pause.
+    vmar.allocator.test_pause.release();
+    vmar.allocator.test_pause.arm(current, stage);
+    let allocated = if matches!(kind, StaleHint::CoveringRemap) {
+        vmar.remap(
+            source,
+            PAGE_SIZE,
+            None,
+            2 * PAGE_SIZE,
+            RemapOldMappingAction::Unmap,
+        )
+        .unwrap()
+    } else {
+        vmar.new_map(
+            NonZeroUsize::new(2 * PAGE_SIZE).unwrap(),
+            VmPerms::READ | VmPerms::WRITE,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+    };
+    assert!(vmar.allocator.test_pause.reached.load(Ordering::Acquire));
+    assert!(!vmar.allocator.test_pause.timed_out.load(Ordering::Acquire));
+    let new_range = allocated..allocated + 2 * PAGE_SIZE;
+    assert!(!is_intersected(&occupied, &new_range));
+    assert_eq!(read_byte(&vmar, address), 0xa3);
+    assert_eq!(read_byte(&vmar, address + PAGE_SIZE), 0x5c);
+    assert_mapping_perms(&vmar, occupied.clone(), VmPerms::READ);
+    for page in [address, address + PAGE_SIZE] {
+        // Alien writes deliberately force faults (ptrace semantics). Use a
+        // normal fault to test user write rejection instead.
+        assert_eq!(
+            vmar.handle_page_fault(&PageFaultInfo::new(page, VmPerms::WRITE))
+                .unwrap_err()
+                .error(),
+            Errno::EACCES
+        );
+    }
+    assert_mapping_perms(&vmar, new_range.clone(), VmPerms::READ | VmPerms::WRITE);
+    assert_eq!(vmar.get_mappings_total_size(), before + 4 * PAGE_SIZE);
+    if matches!(kind, StaleHint::CoveringRemap) {
+        assert!(
+            vmar.for_each_mapping(source..source + PAGE_SIZE, true, |_| {})
+                .is_err()
+        );
+        assert_eq!(read_byte(&vmar, allocated), 0x72);
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 3);
+    } else {
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 2);
+        assert_eq!(read_byte(&vmar, allocated), 0);
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 3);
+    }
+    write_byte(&vmar, allocated, 0x64);
+    assert_eq!(read_byte(&vmar, allocated), 0x64);
+    assert_eq!(read_byte(&vmar, address), 0xa3);
+    assert_eq!(read_byte(&vmar, address + PAGE_SIZE), 0x5c);
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 3);
+    vmar.remove_mapping(new_range).unwrap();
+    assert_eq!(vmar.get_mappings_total_size(), before + 2 * PAGE_SIZE);
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 2);
+    vmar.remove_mapping(occupied).unwrap();
+    assert_eq!(vmar.get_mappings_total_size(), before);
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before);
+}
+
+#[ktest]
+fn stale_local_hint_preserves_mapping() {
+    stale_hint_preserves_mapping(StaleHint::Local);
+}
+
+#[ktest]
+fn stale_remote_hint_preserves_mapping() {
+    stale_hint_preserves_mapping(StaleHint::Remote);
+}
+
+#[ktest]
+fn stale_covering_remap_hint_preserves_mapping() {
+    stale_hint_preserves_mapping(StaleHint::CoveringRemap);
 }
 
 fn pending_refill_collision(remap: bool) {
