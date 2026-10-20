@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 use core::{ptr::NonNull, sync::atomic::Ordering};
 
-use super::{POST_SCHEDULE_HANDLER, PRE_SCHEDULE_HANDLER, Task};
+use super::{DisabledPreemptGuard, POST_SCHEDULE_HANDLER, PRE_SCHEDULE_HANDLER, Task};
 use crate::{
     arch::task::{context_switch, first_context_switch},
     cpu_local_cell,
@@ -31,21 +31,15 @@ pub(super) fn current_task() -> Option<NonNull<Task>> {
 /// If current task is none, then it will use the default task context and it
 /// will not return to this function again.
 ///
-/// # Panics
-///
-/// This function will panic if called while holding preemption locks or with
-/// local IRQ disabled.
+/// The scheduler must check that sleeping is allowed before selecting the next
+/// task, then retain its sole preemption guard until this function consumes it.
 #[track_caller]
-pub(super) fn switch_to_task(next_task: Arc<Task>) {
-    super::atomic_mode::might_sleep();
-
-    // SAFETY: RCU read-side critical sections disables preemption. By the time
-    // we reach this point, we have already checked that preemption is enabled.
-    unsafe {
-        crate::sync::finish_grace_period();
-    }
-
+pub(super) fn switch_to_task(next_task: Arc<Task>, preempt_guard: DisabledPreemptGuard) {
+    debug_assert_eq!(super::preempt::cpu_local::get_guard_count(), 1);
     let irq_guard = crate::irq::disable_local();
+    // IRQ exclusion now protects the decision. Restore the preemption count
+    // before switching, so the next task inherits no guard from this task.
+    drop(preempt_guard);
 
     before_switching_to(&next_task, &irq_guard);
 

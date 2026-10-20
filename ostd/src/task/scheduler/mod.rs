@@ -568,6 +568,15 @@ fn reschedule<F>(mut f: F)
 where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
+    super::atomic_mode::might_sleep();
+    // SAFETY: RCU readers disable preemption. The atomic-mode check above
+    // excludes any live read-side guard. Process callbacks before changing
+    // the logical current task, since callbacks may themselves reschedule.
+    unsafe { crate::sync::finish_grace_period() };
+
+    // Keep the selected task stable until the processor disables IRQs for
+    // the context switch. IRQs remain available to wake tasks during Retry.
+    let preempt_guard = disable_preempt();
     // Even if the decision below is `DoNothing`, we should clear this flag. Meanwhile, to avoid
     // race conditions, we should do this before making the decision.
     cpu_local::clear_need_preempt();
@@ -577,6 +586,9 @@ where
         scheduler_singleton().mut_local_rq_with(&mut |rq| {
             action = f(rq);
         });
+
+        #[cfg(ktest)]
+        test::after_selection();
 
         match action {
             ReschedAction::DoNothing => {
@@ -594,10 +606,9 @@ where
     // `switch_to_task` will spin if it finds that the next task is still running on some CPU core,
     // which guarantees soundness regardless of the scheduler implementation.
     //
-    // FIXME: The scheduler decision and context switching are not atomic, which can lead to some
-    // strange behavior even if the scheduler is implemented correctly. See "Problem 2" at
-    // <https://github.com/asterinas/asterinas/issues/1633> for details.
-    processor::switch_to_task(next_task);
+    // Transfer the preemption guard so there is no interruptible gap between
+    // selecting this task and installing its context.
+    processor::switch_to_task(next_task, preempt_guard);
 }
 
 /// Possible actions of a rescheduling.
@@ -608,4 +619,38 @@ enum ReschedAction {
     Retry,
     /// Switch to target task.
     SwitchTo(Arc<Task>),
+}
+
+#[cfg(ktest)]
+mod test {
+    use super::*;
+    use crate::prelude::*;
+
+    crate::cpu_local_cell! {
+        static INJECT_PREEMPT: bool = false;
+        static SELECTIONS: usize = 0;
+    }
+
+    pub(super) fn after_selection() {
+        SELECTIONS.add_assign(1);
+        if !INJECT_PREEMPT.load() {
+            return;
+        }
+        INJECT_PREEMPT.store(false);
+        let selections = SELECTIONS.load();
+        // Model an IRQ requesting preemption just after the runqueue lock
+        // has been released, before the selected context is installed.
+        cpu_local::set_need_preempt();
+        might_preempt();
+        assert_eq!(SELECTIONS.load(), selections, "a scheduling decision was reentered before its context switch");
+    }
+
+    #[ktest]
+    fn selection_cannot_be_reentered_by_preemption() {
+        INJECT_PREEMPT.store(true);
+        // A no-switch decision makes the old-code failure independent of
+        // whichever runnable tasks happen to be present in the test queue.
+        reschedule(|_| ReschedAction::DoNothing);
+        assert!(!INJECT_PREEMPT.load());
+    }
 }
