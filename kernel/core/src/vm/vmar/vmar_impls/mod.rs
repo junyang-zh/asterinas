@@ -258,6 +258,11 @@ impl Interval<Vaddr> for PteRangeMeta {
 
 ostd::check_aux_pt_meta_layout!(PerPtMeta);
 impl AuxPageTableMeta for PerPtMeta {
+    #[cfg(feature = "memory_accounting")]
+    fn allocation_snapshot(&self) -> ostd::mm::heap::accounting::AllocationSnapshot {
+        self.inner.allocation_snapshot()
+    }
+
     fn new_root_page_table() -> Self {
         PerPtMeta {
             inner: IntervalSet::new(),
@@ -302,7 +307,15 @@ impl AuxPageTableMeta for PerPtMeta {
 }
 
 impl PerPtMeta {
+    #[cfg(not(feature = "memory_accounting"))]
     const fn new() -> Self {
+        Self {
+            inner: IntervalSet::new(),
+        }
+    }
+
+    #[cfg(feature = "memory_accounting")]
+    fn new() -> Self {
         Self {
             inner: IntervalSet::new(),
         }

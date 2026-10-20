@@ -88,6 +88,12 @@ pub struct VmSpace<A: AuxPageTableMeta = ()> {
 }
 
 impl<A: AuxPageTableMeta> VmSpace<A> {
+    /// Snapshot existing user page tables and their live auxiliary allocations.
+    #[cfg(feature = "memory_accounting")]
+    pub fn memory_accounting(&self) -> crate::mm::MemoryAccounting {
+        self.pt.memory_accounting()
+    }
+
     /// Creates a new VM address space.
     pub fn new() -> Self {
         Self {

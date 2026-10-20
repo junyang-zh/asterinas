@@ -46,6 +46,9 @@ pub use self::{
     page_table::{AuxPageTableMeta, AuxPtMetaLayoutChecked, PageTableFrameMeta},
     vm_space::VmSpace,
 };
+#[cfg(feature = "memory_accounting")]
+pub use page_table::MemoryAccounting;
+
 pub(crate) use self::{
     kspace::paddr_to_vaddr,
     page_prop::{PageTableFlags, PrivilegedPageFlags},

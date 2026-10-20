@@ -118,6 +118,32 @@ pub(crate) type PageTableNodeRef<'a, C> = FrameRef<'a, PageTableFrameMeta<C>>;
 
 #[expect(private_bounds)]
 impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
+    /// Traverse existing user-side child tables without creating PTEs. Locks are
+    /// acquired parent before child. Callers park all target threads for a coherent
+    /// snapshot; concurrent workloads get a traversal, not an atomic global cut.
+    /// Normal lock queue storage is temporary and excluded from the counted objects.
+    #[cfg(feature = "memory_accounting")]
+    pub(super) fn snapshot_memory<'rcu>(
+        self, guard: &'rcu dyn InAtomicMode,
+        result: &mut super::MemoryAccounting, root: bool,
+    ) where 'a: 'rcu {
+        use crate::mm::{AuxPageTableMeta, heap::accounting::charged_size};
+        let locked = self.lock(guard);
+        result.pt_pages += 1;
+        result.node_state_requested_bytes += core::mem::size_of::<NodeState<C>>();
+        result.node_state_charged_bytes += charged_size(core::alloc::Layout::new::<NodeState<C>>());
+        let aux = locked.aux().allocation_snapshot();
+        result.aux_allocations += aux.allocations;
+        result.aux_requested_bytes += aux.requested_bytes;
+        result.aux_charged_bytes += aux.charged_bytes;
+        let range = if root { C::TOP_LEVEL_INDEX_RANGE.clone() } else { 0..nr_subpage_per_huge::<C>() };
+        for index in range {
+            if let PteStateRef::PageTable(child) = locked.entry_state(index) {
+                child.snapshot_memory(guard, result, false);
+            }
+        }
+    }
+
     /// Locks the page table node.
     ///
     /// An atomic mode guard is required to
