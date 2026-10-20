@@ -546,6 +546,104 @@ fn map32_hint_collision_falls_back_below_limit() {
     assert_eq!(read_byte(&vmar, base), 0x53);
 }
 
+// A MAP_32BIT hint is advisory even when it is a valid userspace address above
+// the 2 GiB limit. Exercise the public builder rather than the fit predicate.
+#[cfg(target_arch = "x86_64")]
+#[ktest]
+fn map32_hints_respect_upper_bound() {
+    const LIMIT: usize = 0x8000_0000;
+    let vmar = new_vmar();
+    let before = vmar.get_mappings_total_size();
+    for (hint, pages, exact_hint) in [
+        (0, 1, false),
+        (LIMIT, 1, false),
+        (LIMIT + PAGE_SIZE, 1, false),
+        (LIMIT - PAGE_SIZE, 1, true),
+        (LIMIT - PAGE_SIZE, 2, false),
+    ] {
+        let address = map(&vmar, hint, pages, OffsetType::Map32Bit, VmPerms::READ).unwrap();
+        assert!(address >= VMAR_LOWEST_ADDR);
+        assert!(address <= LIMIT - pages * PAGE_SIZE);
+        if exact_hint {
+            assert_eq!(address, hint);
+        }
+        assert_eq!(vmar.get_mappings_total_size(), before + pages * PAGE_SIZE);
+        vmar.remove_mapping(address..address + pages * PAGE_SIZE)
+            .unwrap();
+        assert_eq!(vmar.get_mappings_total_size(), before);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[ktest]
+fn map32_oversized_request_rejects_without_leaking_mapping() {
+    const LIMIT: usize = 0x8000_0000;
+    let vmar = new_vmar();
+    let before = vmar.get_mappings_total_size();
+    // The usable interval starts above zero, so LIMIT bytes cannot fit. The
+    // anonymous, unpopulated request needs no physical backing allocation.
+    for hint in [0, LIMIT + PAGE_SIZE] {
+        assert_eq!(
+            map(
+                &vmar,
+                hint,
+                LIMIT / PAGE_SIZE,
+                OffsetType::Map32Bit,
+                VmPerms::READ,
+            )
+            .unwrap_err()
+            .error(),
+            Errno::ENOMEM
+        );
+        assert_eq!(vmar.get_mappings_total_size(), before);
+        let address = map(&vmar, 0, 1, OffsetType::Map32Bit, VmPerms::READ).unwrap();
+        assert!(address >= VMAR_LOWEST_ADDR && address <= LIMIT - PAGE_SIZE);
+        vmar.remove_mapping(address..address + PAGE_SIZE).unwrap();
+        assert_eq!(vmar.get_mappings_total_size(), before);
+    }
+}
+
+#[ktest]
+fn hint_success_and_unrestricted_exhaustion_preserve_mappings() {
+    let vmar = new_vmar();
+    let before = vmar.get_mappings_total_size();
+    let hint = 0x800_000;
+    assert_eq!(
+        map(
+            &vmar,
+            hint,
+            1,
+            OffsetType::Hint,
+            VmPerms::READ | VmPerms::WRITE,
+        )
+        .unwrap(),
+        hint
+    );
+    write_byte(&vmar, hint, 0x6b);
+    // No address range can fit this request: the usable space starts at
+    // VMAR_LOWEST_ADDR. All allocator fit checks reject before taking PT locks.
+    assert_eq!(
+        vmar.new_map(NonZeroUsize::new(VMAR_CAP_ADDR).unwrap(), VmPerms::READ)
+            .unwrap()
+            .build()
+            .unwrap_err()
+            .error(),
+        Errno::ENOMEM
+    );
+    assert_eq!(vmar.get_mappings_total_size(), before + PAGE_SIZE);
+    assert_eq!(read_byte(&vmar, hint), 0x6b);
+    let address = vmar
+        .new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_ne!(address, hint);
+    vmar.remove_mapping(address..address + PAGE_SIZE).unwrap();
+    vmar.remove_mapping(hint..hint + PAGE_SIZE).unwrap();
+    assert_eq!(vmar.get_mappings_total_size(), before);
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+}
+
 #[ktest]
 fn alloc_from_free_range_accepts_exact_fit() {
     assert_eq!(
