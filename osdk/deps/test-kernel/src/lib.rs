@@ -33,8 +33,6 @@ pub enum KtestResult {
 /// The entry point of the test runner.
 #[ostd::ktest::main]
 fn main() {
-    use ostd::task::TaskOptions;
-
     let test_task = move || {
         use alloc::string::ToString;
 
@@ -49,7 +47,13 @@ fn main() {
         };
     };
 
-    TaskOptions::new(test_task).data(()).spawn().unwrap();
+    #[cfg(ktest)]
+    ostd::ktest::spawn_test_task(test_task);
+    #[cfg(not(ktest))]
+    ostd::task::TaskOptions::new(test_task)
+        .data(())
+        .spawn()
+        .unwrap();
 }
 
 #[ostd::ktest::panic_handler]

@@ -205,6 +205,30 @@ pub mod ktest {
     //! It is rather discouraged to use the definitions here directly. The
     //! `ktest` attribute is sufficient for all normal use cases.
 
-    pub use ostd_macros::{test_main as main, test_panic_handler as panic_handler};
+    pub use ostd_macros::{
+        test_bootstrap as bootstrap, test_main as main, test_panic_handler as panic_handler,
+    };
     pub use ostd_test::*;
+
+    /// Enqueues the test runner through its registered bootstrap.
+    ///
+    /// OSDK calls this once, before creating any test task. The default keeps
+    /// the original raw OSTD task; a kernel can provide its own task context.
+    #[cfg(ktest)]
+    pub fn spawn_test_task(run_tests: fn()) {
+        __ostd_ktest_bootstrap(run_tests);
+    }
+
+    #[cfg(ktest)]
+    #[inline(never)]
+    #[linkage = "weak"]
+    // SAFETY: This is the unique weak fallback for the test-bootstrap symbol.
+    // The bootstrap macro supplies any strong override with the same signature.
+    #[unsafe(no_mangle)]
+    fn __ostd_ktest_bootstrap(run_tests: fn()) {
+        crate::task::TaskOptions::new(run_tests)
+            .data(())
+            .spawn()
+            .unwrap();
+    }
 }

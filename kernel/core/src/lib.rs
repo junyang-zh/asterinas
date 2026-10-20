@@ -50,6 +50,8 @@ pub mod events;
 pub mod fs;
 mod init;
 mod ipc;
+#[cfg(ktest)]
+mod ktest_bootstrap;
 mod net;
 pub mod power;
 pub mod prelude;
