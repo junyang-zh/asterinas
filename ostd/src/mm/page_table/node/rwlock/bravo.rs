@@ -188,4 +188,163 @@ mod tests {
         lock.inhibit(u64::MAX - 2, 2);
         assert_eq!(lock.inhibit_until.load(Ordering::Relaxed), 47);
     }
+
+    // Run the actual-module host harness with --test-threads=1: its visible
+    // table is global. An external process timeout also bounds a stuck join.
+    use std::{
+        sync::{Arc, atomic::AtomicUsize, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    struct Read<'a> {
+        lock: &'a BravoPfqRwLock,
+        guard: Option<BravoReadGuard>,
+    }
+
+    impl<'a> Read<'a> {
+        fn acquire(lock: &'a BravoPfqRwLock, try_read: bool) -> Self {
+            let guard = if try_read {
+                lock.try_read().expect("uncontended read must succeed")
+            } else {
+                lock.lock_read()
+            };
+            Self { lock, guard: Some(guard) }
+        }
+
+        fn pos(&self) -> Option<usize> {
+            self.guard.as_ref().unwrap().pos
+        }
+    }
+
+    impl Drop for Read<'_> {
+        fn drop(&mut self) {
+            if let Some(guard) = self.guard.take() {
+                self.lock.unlock_read(guard);
+            }
+        }
+    }
+
+    fn collision_fallback_excludes_writers(try_read: bool) {
+        let lock = Arc::new(BravoPfqRwLock::new());
+        let value = Arc::new(AtomicUsize::new(0));
+        // All three acquisitions run on this thread's fixed CPU shim identity.
+        let initial = Read::acquire(&lock, false);
+        assert_eq!(initial.pos(), None);
+        let visible = Read::acquire(&lock, false);
+        assert_eq!(visible.pos(), Some(lock.hash()));
+        let fallback = Read::acquire(&lock, try_read);
+        assert_eq!(fallback.pos(), None, "occupied slot must use PFQ");
+        assert!(lock.rbias.load(Ordering::SeqCst));
+        assert_eq!(VISIBLE_READERS[lock.hash()].load(Ordering::SeqCst), lock.as_ptr());
+        drop(initial);
+        drop(visible);
+        // Only the forced fallback remains; visible ownership cannot mask a
+        // missing underlying read registration in the assertions below.
+        assert!(VISIBLE_READERS[lock.hash()].load(Ordering::SeqCst).is_null());
+
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_lock = lock.clone();
+        let worker_value = value.clone();
+        let writer = thread::spawn(move || {
+            let acquired = worker_lock.try_write();
+            if acquired {
+                worker_lock.unlock_write();
+            }
+            let _ = attempt_tx.send(acquired);
+            worker_lock.lock_write();
+            worker_value.store(73, Ordering::SeqCst);
+            worker_lock.unlock_write();
+            let _ = done_tx.send(());
+        });
+
+        // Save all outcomes until the retained guard is released and the
+        // worker joined, including timeout/error paths. No assertion can leave
+        // the writer waiting on a guard owned by a panicking test thread.
+        let attempted = attempt_rx.recv_timeout(WAIT);
+        let deadline = Instant::now() + WAIT;
+        let mut writer_registered = false;
+        while Instant::now() < deadline {
+            // With no other admitting reader, failure is evidence that the
+            // real PFQ writer has set WRITER (or raced this probe to set it).
+            // A notification sent before lock_write would not prove this.
+            if !lock.underlying.try_read() {
+                writer_registered = true;
+                break;
+            }
+            lock.underlying.unlock_read();
+            thread::yield_now();
+        }
+        let value_while_held = value.load(Ordering::SeqCst);
+        let completion_while_held = done_rx.try_recv();
+        drop(fallback);
+        let completed = done_rx.recv_timeout(WAIT);
+        // A lock bug may prevent join from returning even after release; the
+        // documented external timeout is mandatory for this host harness.
+        let joined = writer.join();
+        assert_eq!(attempted.unwrap(), false, "try-writer passed fallback reader");
+        assert!(writer_registered, "blocking writer never registered with PFQ");
+        assert_eq!(value_while_held, 0, "blocking writer passed fallback reader");
+        assert!(matches!(completion_while_held, Err(mpsc::TryRecvError::Empty)));
+        assert!(completed.is_ok(), "writer did not complete after reader release");
+        assert!(joined.is_ok(), "writer panicked");
+        let after = Read::acquire(&lock, false);
+        assert_eq!(value.load(Ordering::Relaxed), 73);
+        drop(after);
+        assert!(lock.try_write(), "fallback or queued writer leaked ownership");
+        lock.unlock_write();
+    }
+
+    #[test]
+    fn blocking_collision_fallback_excludes_try_and_queued_writers() {
+        collision_fallback_excludes_writers(false);
+    }
+
+    #[test]
+    fn try_collision_fallback_excludes_try_and_queued_writers() {
+        collision_fallback_excludes_writers(true);
+    }
+
+    #[test]
+    fn nearby_allocated_locks_keep_distinct_visible_ownership() {
+        // Real, aligned objects with ordinary Rust lifetimes, in one bounded
+        // allocation. No allocator adjacency or fabricated pointer is needed.
+        #[repr(align(65536))]
+        struct Pair([BravoPfqRwLock; 2]);
+        let pair = Box::new(Pair([BravoPfqRwLock::new(), BravoPfqRwLock::new()]));
+        let first = &pair.0[0];
+        let second = &pair.0[1];
+        let cpu = u32::from(CpuId::current_racy()) as usize;
+        let first_address = first as *const BravoPfqRwLock as usize;
+        let second_address = second as *const BravoPfqRwLock as usize;
+        assert_eq!(first_address % core::mem::align_of::<BravoPfqRwLock>(), 0);
+        assert_eq!(second_address % core::mem::align_of::<BravoPfqRwLock>(), 0);
+        // Check the old CPU-shifted bucket precondition on actual addresses.
+        assert_eq!(first_address.wrapping_add(cpu) >> 16,
+                   second_address.wrapping_add(cpu) >> 16);
+        assert_ne!(first.hash(), second.hash());
+        drop(Read::acquire(first, false));
+        drop(Read::acquire(second, false));
+        for try_read in [false, true] {
+            let first_read = Read::acquire(first, try_read);
+            let second_read = Read::acquire(second, try_read);
+            assert_eq!(first_read.pos(), Some(first.hash()));
+            assert_eq!(second_read.pos(), Some(second.hash()));
+            assert_eq!(VISIBLE_READERS[first.hash()].load(Ordering::SeqCst), first.as_ptr());
+            assert_eq!(VISIBLE_READERS[second.hash()].load(Ordering::SeqCst), second.as_ptr());
+            // Reusing the occupied slot falls back without replacing its owner.
+            let nested = Read::acquire(first, try_read);
+            assert_eq!(nested.pos(), None);
+            assert_eq!(VISIBLE_READERS[first.hash()].load(Ordering::SeqCst), first.as_ptr());
+            drop(nested);
+            drop(second_read);
+            assert!(VISIBLE_READERS[second.hash()].load(Ordering::SeqCst).is_null());
+            assert_eq!(VISIBLE_READERS[first.hash()].load(Ordering::SeqCst), first.as_ptr());
+            drop(first_read);
+            assert!(VISIBLE_READERS[first.hash()].load(Ordering::SeqCst).is_null());
+        }
+    }
 }
