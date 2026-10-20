@@ -5,7 +5,11 @@
 #![warn(unused)]
 
 use alloc::{boxed::Box, sync::Arc};
-use core::{fmt, ops::Bound, sync::atomic::Ordering};
+use core::{
+    fmt,
+    ops::Bound,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use ostd::{
     arch::read_tsc as sched_clock,
@@ -71,6 +75,18 @@ pub(crate) struct ClassScheduler {
     /// the runqueues may be accessed in both the task and interrupt context (L1 and L2).
     rqs: Box<[SpinLock<PerCpuClassRqSet, LocalIrqDisabled>]>,
     last_chosen_cpu: AtomicCpuId,
+    loads: Box<[CpuLoad]>,
+}
+
+// Each CPU publishes only its own line; adjacent CPUs must not false-share.
+#[repr(align(64))]
+struct CpuLoad(AtomicU64);
+
+impl core::ops::Deref for CpuLoad {
+    type Target = AtomicU64;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Represents the run queue for each CPU core. It stores a list of run queues for
@@ -256,6 +272,7 @@ impl Scheduler for ClassScheduler {
 
         thread.sched_attr().set_last_cpu(cpu);
         rq.enqueue_entity((task, thread), Some(flags));
+        self.publish_load(cpu, &rq);
 
         should_preempt.then_some(cpu)
     }
@@ -263,7 +280,8 @@ impl Scheduler for ClassScheduler {
     fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
         let guard = disable_local();
         let mut lock = self.rqs[guard.current_cpu().as_usize()].lock();
-        f(&mut *lock)
+        f(&mut *lock);
+        self.publish_load(guard.current_cpu(), &lock);
     }
 
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
@@ -286,7 +304,18 @@ impl ClassScheduler {
         ClassScheduler {
             rqs: all_cpus().map(class_rq).collect(),
             last_chosen_cpu: AtomicCpuId::default(),
+            loads: all_cpus().map(|_| CpuLoad(AtomicU64::new(0))).collect(),
         }
+    }
+
+    // Published under the owning runqueue lock after every mutation. Readers
+    // use approximate load only for placement/statistics, never for ownership.
+    fn publish_load(&self, cpu: CpuId, rq: &PerCpuClassRqSet) {
+        let PerCpuLoadStats { queue_len, is_idle } = rq.load_stats();
+        self.loads[cpu.as_usize()].store(
+            ((queue_len as u64) << 1) | u64::from(!is_idle),
+            Ordering::Relaxed,
+        );
     }
 
     // TODO: Implement a better algorithm and replace the current naive implementation.
@@ -303,9 +332,8 @@ impl ClassScheduler {
 
         // Set `selected` as `candidate` if the candidate's load is smaller.
         let test_candidate = |candidate: CpuId| {
-            let PerCpuLoadStats { queue_len, .. } =
-                self.rqs[candidate.as_usize()].lock().load_stats();
-            let load = queue_len;
+            let snapshot = self.loads[candidate.as_usize()].load(Ordering::Relaxed);
+            let load = (snapshot >> 1) as u32 + (snapshot & 1) as u32;
             if load < minimum_load {
                 minimum_load = load;
                 selected = candidate;
@@ -437,9 +465,9 @@ struct PerCpuLoadStats {
 
 impl SchedulerStats for ClassScheduler {
     fn nr_queued_and_running(&self) -> (u32, u32) {
-        self.rqs.iter().fold((0, 0), |(queued, running), rq| {
-            let PerCpuLoadStats { queue_len, is_idle } = rq.lock().load_stats();
-            (queued + queue_len, running + u32::from(!is_idle))
+        self.loads.iter().fold((0, 0), |(queued, running), load| {
+            let value = load.load(Ordering::Relaxed);
+            (queued + (value >> 1) as u32, running + (value & 1) as u32)
         })
     }
 }
