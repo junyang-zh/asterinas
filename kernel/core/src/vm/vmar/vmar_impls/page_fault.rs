@@ -6,10 +6,13 @@ use core::{cmp::min, ops::Range};
 
 use align_ext::AlignExt;
 use ostd::{
+    cpu::PinCurrentCpu,
+    cpu_local,
     mm::{
         CachePolicy, Frame, FrameAllocOptions, PageFlags, PageProperty, UFrame,
         io::util::HasVmReaderWriter, page_size_at, tlb::TlbFlushOp, vm_space::VmQueriedItem,
     },
+    sync::SpinLock,
     task::disable_preempt,
 };
 
@@ -51,6 +54,53 @@ struct PendingDeviceFault {
     result: Result<()>,
 }
 
+// Keep an unused zeroed fault frame on each CPU. Allocation and zeroing occur
+// before cursor acquisition; only copying a COW page occurs under its PT lock.
+cpu_local! {
+    static FAULT_FRAME: SpinLock<Option<Frame<()>>> = SpinLock::new(None);
+}
+
+struct PreparedFrame(Option<Frame<()>>);
+
+impl PreparedFrame {
+    fn new() -> Self {
+        let guard = disable_preempt();
+        Self(
+            FAULT_FRAME
+                .get_on_cpu(guard.current_cpu())
+                .disable_irq()
+                .lock()
+                .take(),
+        )
+    }
+
+    fn replenish(&mut self) -> Result<()> {
+        if self.0.is_none() {
+            self.0 = Some(FrameAllocOptions::new().alloc_frame()?);
+        }
+        Ok(())
+    }
+
+    fn take(&mut self) -> Frame<()> {
+        self.0.take().expect("fault frame prepared outside PT lock")
+    }
+}
+
+impl Drop for PreparedFrame {
+    fn drop(&mut self) {
+        if let Some(frame) = self.0.take() {
+            let guard = disable_preempt();
+            let mut slot = FAULT_FRAME
+                .get_on_cpu(guard.current_cpu())
+                .disable_irq()
+                .lock();
+            if slot.is_none() {
+                *slot = Some(frame);
+            }
+        }
+    }
+}
+
 impl Vmar {
     /// Handles a page fault.
     pub(crate) fn handle_page_fault(&self, page_fault_info: &PageFaultInfo) -> Result<()> {
@@ -75,8 +125,10 @@ impl Vmar {
         // conditions when accessing such state.
         let mut range_handled = 0..0;
         let mut device_fault = None;
+        let mut prepared = PreparedFrame::new();
 
         'retry: loop {
+            prepared.replenish()?;
             let preempt_guard = disable_preempt();
             // Faults insert base pages only. Keep the whole fault-around range,
             // but allow disjoint existing leaf tables to be locked independently.
@@ -109,12 +161,19 @@ impl Vmar {
             }
 
             for va in (range_handled.end..range_to_handle.end).step_by(PAGE_SIZE) {
+                if prepared.0.is_none() {
+                    drop(rs_as_delta);
+                    drop(cursor);
+                    drop(preempt_guard);
+                    continue 'retry;
+                }
                 let res = handle_one_page(
                     &mut cursor,
                     va,
                     page_fault_info,
                     &mut rs_as_delta,
                     &mut device_fault,
+                    &mut prepared,
                 );
 
                 match res {
@@ -254,6 +313,7 @@ fn handle_one_page(
     page_fault_info: &PageFaultInfo,
     rs_as_delta: &mut RsAsDelta,
     device_fault: &mut Option<PendingDeviceFault>,
+    prepared: &mut PreparedFrame,
 ) -> core::result::Result<(), PfError> {
     cursor.jump(va).unwrap();
     while cursor.push_level_if_exists().is_some() {}
@@ -375,7 +435,7 @@ fn handle_one_page(
                     .flusher()
                     .issue_tlb_flush(TlbFlushOp::for_range(cur_va_range));
             } else {
-                let new_frame = duplicate_frame(&frame).map_err(PfError::HardError)?;
+                let new_frame = duplicate_frame(&frame, prepared);
                 prop.flags |= new_flags;
                 let _ = cursor.unmap();
                 cursor.map(new_frame.into(), prop);
@@ -397,25 +457,26 @@ fn handle_one_page(
                 unreachable!("`find_one` does not stop at `VmMapping`");
             };
             let page_aligned_addr = va.align_down(PAGE_SIZE);
-            let (frame, is_readonly) = match prepare_page(vm_mapping, page_aligned_addr, is_write) {
-                Ok((frame, is_readonly)) => (frame, is_readonly),
-                Err(VmoCommitError::Err(e)) => return Err(PfError::HardError(e)),
-                Err(
-                    VmoCommitError::NeedIo {
-                        index: vmo_page_index,
+            let (frame, is_readonly) =
+                match prepare_page(vm_mapping, page_aligned_addr, is_write, prepared) {
+                    Ok((frame, is_readonly)) => (frame, is_readonly),
+                    Err(VmoCommitError::Err(e)) => return Err(PfError::HardError(e)),
+                    Err(
+                        VmoCommitError::NeedIo {
+                            index: vmo_page_index,
+                        }
+                        | VmoCommitError::WaitUntilInit {
+                            index: vmo_page_index,
+                            ..
+                        },
+                    ) => {
+                        let how_to = vm_mapping
+                            .vmo()
+                            .unwrap()
+                            .dup_commit(vmo_page_index, vmo_map_mode(vm_mapping, is_write));
+                        return Err(PfError::Retry { va, how_to });
                     }
-                    | VmoCommitError::WaitUntilInit {
-                        index: vmo_page_index,
-                        ..
-                    },
-                ) => {
-                    let how_to = vm_mapping
-                        .vmo()
-                        .unwrap()
-                        .dup_commit(vmo_page_index, vmo_map_mode(vm_mapping, is_write));
-                    return Err(PfError::Retry { va, how_to });
-                }
-            };
+                };
 
             let vm_perms = {
                 let mut perms = vm_mapping.perms();
@@ -452,6 +513,7 @@ fn prepare_page(
     vm_mapping: &VmMapping,
     page_aligned_addr: Vaddr,
     write: bool,
+    prepared: &mut PreparedFrame,
 ) -> core::result::Result<(UFrame, bool), VmoCommitError> {
     let mut is_readonly = false;
 
@@ -459,7 +521,7 @@ fn prepare_page(
         MappedMemory::Vmo(vmo) => vmo,
         MappedMemory::Anonymous => {
             // Anonymous mapping. Allocate a new frame.
-            return Ok((FrameAllocOptions::new().alloc_frame()?.into(), is_readonly));
+            return Ok((prepared.take().into(), is_readonly));
         }
         MappedMemory::Device(_) => {
             // Device memory is populated when the memory mapping is created.
@@ -473,18 +535,13 @@ fn prepare_page(
     let page_offset = page_aligned_addr - vm_mapping.map_to_addr();
     if !vm_mapping.is_shared() && vmo.valid_size().is_none_or(|s| page_offset >= s) {
         // The page index is outside the VMO. This is only allowed in private mapping.
-        return Ok((FrameAllocOptions::new().alloc_frame()?.into(), is_readonly));
+        return Ok((prepared.take().into(), is_readonly));
     }
 
     let (page, mode) = vmo.get_committed_frame(page_offset, vmo_map_mode(vm_mapping, write))?;
     if !vm_mapping.is_shared() && write {
         // Write access to private VMO-backed mapping. Performs COW directly.
-        Ok((
-            duplicate_frame(&page.into())
-                .map_err(VmoCommitError::Err)?
-                .into(),
-            is_readonly,
-        ))
+        Ok((duplicate_frame(&page.into(), prepared).into(), is_readonly))
     } else {
         // Operations to shared mapping or read access to private VMO-backed mapping.
         // If read access to private VMO-backed mapping triggers a page fault,
@@ -505,10 +562,10 @@ fn vmo_map_mode(vm_mapping: &VmMapping, is_write: bool) -> VmoMapMode {
     }
 }
 
-fn duplicate_frame(src: &UFrame) -> Result<Frame<()>> {
-    let new_frame = FrameAllocOptions::new().zeroed(false).alloc_frame()?;
+fn duplicate_frame(src: &UFrame, prepared: &mut PreparedFrame) -> Frame<()> {
+    let new_frame = prepared.take();
     new_frame.writer().write(&mut src.reader());
-    Ok(new_frame)
+    new_frame
 }
 
 #[cfg(ktest)]
