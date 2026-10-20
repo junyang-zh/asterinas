@@ -94,6 +94,14 @@ fn ap_init() {
 // doing more work in the idle task may have negative impact on
 // the latency to switching from the idle task to a useful, runnable one.
 
+fn idle_step() {
+    if crate::sched::steal_a_task() {
+        ostd::task::Task::yield_now();
+        return;
+    }
+    ostd::task::halt_cpu();
+}
+
 fn bsp_idle_loop() {
     ostd::info!("Idle thread for CPU #0 started");
 
@@ -109,12 +117,12 @@ fn bsp_idle_loop() {
             break init_process;
         };
 
-        ostd::task::halt_cpu();
+        idle_step();
     };
 
     // Wait till the init process becomes zombie.
     while !init_process.status().is_zombie() {
-        ostd::task::halt_cpu();
+        idle_step();
     }
 
     panic!(
@@ -131,7 +139,7 @@ fn ap_idle_loop() {
     );
 
     loop {
-        ostd::task::halt_cpu();
+        idle_step();
     }
 }
 

@@ -25,6 +25,7 @@ use ostd::{
     },
     util::id_set::Id,
 };
+use spin::Once;
 
 use super::{
     nice::Nice,
@@ -48,8 +49,79 @@ pub(crate) use self::{
 
 type SchedEntity = (Arc<Task>, Arc<Thread>);
 
+static CLASS_SCHEDULER: Once<&'static ClassScheduler> = Once::new();
+
+/// Attempts one fair-task migration from an idle CPU. The two runqueue locks
+/// are acquired in ascending CPU-ID order, and only with try_lock.
+pub(crate) fn steal_a_task() -> bool {
+    let Some(scheduler) = CLASS_SCHEDULER.get() else {
+        return false;
+    };
+    let guard = disable_local();
+    let cpu = guard.current_cpu();
+    // Idle polling must not scan all CPUs on every iteration. Rotate through a
+    // bounded window so every donor is eventually sampled, even on large hosts.
+    ostd::cpu_local! {
+        static NEXT_DONOR: AtomicU64 = AtomicU64::new(0);
+    }
+    let total = ostd::cpu::num_cpus();
+    let start = NEXT_DONOR.get_on_cpu(cpu).fetch_add(16, Ordering::Relaxed) as usize;
+    let Some(donor) = (0..total.min(16))
+        .map(|i| CpuId::new(((start + i) % total) as u32))
+        .filter(|other| *other != cpu)
+        .max_by_key(|other| scheduler.loads[other.as_usize()].load(Ordering::Relaxed) >> 1)
+    else {
+        return false;
+    };
+    if scheduler.loads[donor.as_usize()].load(Ordering::Relaxed) >> 1 == 0 {
+        return false;
+    }
+    let (first, second) = if cpu.as_usize() < donor.as_usize() {
+        (cpu, donor)
+    } else {
+        (donor, cpu)
+    };
+    let Some(mut first_rq) = scheduler.rqs[first.as_usize()].try_lock() else {
+        return false;
+    };
+    let Some(mut second_rq) = scheduler.rqs[second.as_usize()].try_lock() else {
+        return false;
+    };
+    let (local, remote) = if first == cpu {
+        (&mut *first_rq, &mut *second_rq)
+    } else {
+        (&mut *second_rq, &mut *first_rq)
+    };
+    if local.load_stats().queue_len != 0 || !local.load_stats().is_idle {
+        return false;
+    }
+    // Stop/real-time/idle classes are not migratable through this path.
+    let Some(task) = remote.fair.pick_next() else {
+        return false;
+    };
+    let thread = task.as_thread().unwrap().clone();
+    if !thread
+        .atomic_cpu_affinity()
+        .load(Ordering::Relaxed)
+        .contains(cpu)
+    {
+        remote.fair.enqueue(task, None);
+        scheduler.publish_load(donor, remote);
+        return false;
+    }
+    debug_assert_eq!(task.cpu().get(), Some(donor));
+    task.cpu().set_anyway(cpu);
+    thread.sched_attr().set_last_cpu(cpu);
+    local.enqueue_entity((task, thread), None);
+    scheduler.publish_load(donor, remote);
+    scheduler.publish_load(cpu, local);
+    true
+}
+
 pub(crate) fn init() {
     let scheduler = Box::leak(Box::new(ClassScheduler::new()));
+
+    CLASS_SCHEDULER.call_once(|| &*scheduler);
 
     // Inject the scheduler into the ostd for actual scheduling work.
     inject_scheduler(scheduler);
