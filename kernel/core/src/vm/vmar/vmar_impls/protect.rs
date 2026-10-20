@@ -80,7 +80,13 @@ impl Vmar {
             let taken = split_and_insert_rest(&mut cursor, vm_mapping, intersected_range.clone());
             let next_address = taken.range().end;
 
+            // Protect walks resident PTEs and can finish at another node or
+            // level. Reinsert the mapping into its original metadata owner,
+            // not the node where that PTE traversal happened to finish.
+            let owning_level = cursor.level();
             let taken = taken.protect(&mut cursor, new_perms);
+            cursor.jump(intersected_range.start).unwrap();
+            cursor.adjust_level(owning_level);
             cursor.aux_meta_mut().insert_try_merge(taken);
 
             last_protected_addr = next_address;
