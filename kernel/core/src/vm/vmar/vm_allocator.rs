@@ -97,7 +97,11 @@ impl VirtualAddressAllocator {
         size: usize,
         align: usize,
     ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
-        let cur_cpu = guard.current_cpu();
+        let cur_cpu = if cfg!(feature = "single_vmar_alloc") {
+            CpuId::bsp()
+        } else {
+            guard.current_cpu()
+        };
 
         // Fast path by querying the `must_be_free` range.
         if let Ok(va) = self.alloc_from_cpu_must_free(cur_cpu, size, align) {
@@ -350,6 +354,13 @@ fn find_fit_range_in_cursor(
 ///
 /// The assigned range is firstly searched for free space to allocate.
 fn assigned_range_on_cpu(cpu: CpuId) -> Range<Vaddr> {
+    if cfg!(feature = "single_vmar_alloc") {
+        return if cpu == CpuId::bsp() {
+            VMAR_LOWEST_ADDR..VMAR_CAP_ADDR
+        } else {
+            VMAR_LOWEST_ADDR..VMAR_LOWEST_ADDR
+        };
+    }
     let num_cpus = num_cpus();
     let per_cpu_range_size = assigned_range_size_for(num_cpus);
 
@@ -367,6 +378,9 @@ fn assigned_range_on_cpu(cpu: CpuId) -> Range<Vaddr> {
 /// Returns the range of CPU IDs that the given virtual address belongs to.
 fn cpu_range_for_vaddr_range(range: &Range<Vaddr>) -> Range<usize> {
     debug_assert!(range.start < range.end);
+    if cfg!(feature = "single_vmar_alloc") {
+        return 0..1;
+    }
 
     let num_cpus = num_cpus();
     let per_cpu_range_size = assigned_range_size_for(num_cpus);

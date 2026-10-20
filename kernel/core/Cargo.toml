@@ -76,6 +76,7 @@ riscv.workspace = true
 loongArch64.workspace = true
 
 [features]
+single_vmar_alloc = []
 artifact_busy_poll = []
 default = ["cvm_guest"]
 coverage = ["ostd/coverage"]
