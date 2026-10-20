@@ -18,6 +18,7 @@ aster-uart.workspace = true
 aster-i8042.workspace = true
 
 [features]
+artifact_busy_poll = ["aster-core/artifact_busy_poll"]
 default = ["cvm_guest"]
 coverage = ["aster-core/coverage"]
 cvm_guest = ["aster-core/cvm_guest"]

@@ -99,6 +99,12 @@ fn idle_step() {
         ostd::task::Task::yield_now();
         return;
     }
+    #[cfg(feature = "artifact_busy_poll")]
+    {
+        core::hint::spin_loop();
+        ostd::task::Task::yield_now();
+    }
+    #[cfg(not(feature = "artifact_busy_poll"))]
     ostd::task::halt_cpu();
 }
 

@@ -76,6 +76,7 @@ riscv.workspace = true
 loongArch64.workspace = true
 
 [features]
+artifact_busy_poll = []
 default = ["cvm_guest"]
 coverage = ["ostd/coverage"]
 cvm_guest = ["dep:tdx-guest", "ostd/cvm_guest", "aster-virtio/cvm_guest"]
