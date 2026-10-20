@@ -252,6 +252,11 @@ impl Vmar {
             Ok(remap_op.perform_move_and_extend(&mut cursor))
         })();
 
+        // Moving resident pages revokes their old translations. Complete the
+        // invalidations before returning, including partially completed errors.
+        cursor.flusher().dispatch_tlb_flush();
+        cursor.flusher().sync_tlb_flush();
+
         if let Ok(result) = &operation_result
             && new_addr.is_none()
         {
