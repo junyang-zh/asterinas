@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod access_alien;
+mod as_accounting;
 mod fork;
 pub(super) mod map;
 pub(super) mod page_fault;
@@ -13,14 +14,14 @@ mod unmap;
 use core::{
     array,
     ops::Range,
-    sync::atomic::{AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use as_accounting::MappingSize;
 use aster_util::per_cpu_counter::PerCpuCounter;
 pub(crate) use map::OffsetType;
-use osdk_heap_allocator::{CpuLocalBox, alloc_cpu_local};
 use ostd::{
-    cpu::{CpuId, all_cpus},
+    cpu::CpuId,
     mm::{AuxPageTableMeta, PagingLevel, VmSpace, page_size_at, vm_space::CursorMut},
 };
 pub(crate) use remap::RemapOldMappingAction;
@@ -52,12 +53,8 @@ pub(crate) struct Vmar {
     vm_space: Arc<VmarSpace>,
     /// The allocator for virtual address ranges.
     pub(super) allocator: VirtualAddressAllocator,
-    /// The used quota of address space size on each CPU.
-    ///
-    /// The sum of the values on each CPU is the total number of virtual memory
-    /// bytes mapped. Values on each CPU does not have a specific meaning, but
-    /// it must not exceed the resource limit divided by the number of CPUs.
-    pub(super) mapped_vm_size: CpuLocalBox<AtomicIsize>,
+    /// Exact mapped bytes, with signed CPU-local debt for unlimited updates.
+    mapped_vm_size: MappingSize,
     /// The RSS counters.
     rss_counters: [PerCpuCounter; rs_as_delta::NUM_RSS_COUNTERS],
     /// The process VM.
@@ -75,7 +72,7 @@ impl Vmar {
     pub(super) fn new(process_vm: ProcessVm) -> Result<Arc<Self>> {
         let vm_space = Arc::new(VmSpace::<PerPtMeta>::new());
         let allocator = VirtualAddressAllocator::new()?;
-        let mapped_vm_size = alloc_cpu_local(|_| AtomicIsize::new(0))?;
+        let mapped_vm_size = MappingSize::new(0)?;
         let rss_counters = array::from_fn(|_| PerCpuCounter::new());
         let vmar = Arc::new_cyclic(move |weak_self| Vmar {
             vm_space,
@@ -100,9 +97,7 @@ impl Vmar {
 
     /// Returns the total size of the mappings in bytes.
     pub(crate) fn get_mappings_total_size(&self) -> usize {
-        all_cpus()
-            .map(|cpu| self.mapped_vm_size.get_on_cpu(cpu).load(Ordering::Relaxed))
-            .sum::<isize>() as usize
+        self.mapped_vm_size.total()
     }
 
     /// Returns the attached `VmSpace`.

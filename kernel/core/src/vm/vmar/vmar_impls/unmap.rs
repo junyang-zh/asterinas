@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{ops::Range, sync::atomic::Ordering};
+use core::ops::Range;
 
 use ostd::{
-    cpu::all_cpus,
     mm::{page_size_at, vm_space::VmQueriedItem},
     task::disable_preempt,
 };
@@ -60,11 +59,7 @@ impl Vmar {
             .iter()
             .for_each(|counter| counter.reset_all_zero());
 
-        all_cpus().for_each(|cpu| {
-            self.mapped_vm_size
-                .get_on_cpu(cpu)
-                .store(0, Ordering::Release)
-        });
+        self.mapped_vm_size.clear();
 
         cursor.flusher().dispatch_tlb_flush();
         cursor.flusher().sync_tlb_flush();
