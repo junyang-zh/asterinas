@@ -384,12 +384,14 @@ fn stale_hint_preserves_mapping(kind: StaleHint) {
     vmar.allocator.test_pause.release();
     vmar.allocator.test_pause.arm(current, stage);
     let allocated = if matches!(kind, StaleHint::CoveringRemap) {
+        // Keep cannot expand in place, so it exercises the covering allocator
+        // without a preliminary fixed-path truncation of our stale hint.
         vmar.remap(
             source,
             PAGE_SIZE,
             None,
             2 * PAGE_SIZE,
-            RemapOldMappingAction::Unmap,
+            RemapOldMappingAction::Keep,
         )
         .unwrap()
     } else {
@@ -419,13 +421,27 @@ fn stale_hint_preserves_mapping(kind: StaleHint) {
         );
     }
     assert_mapping_perms(&vmar, new_range.clone(), VmPerms::READ | VmPerms::WRITE);
-    assert_eq!(vmar.get_mappings_total_size(), before + 4 * PAGE_SIZE);
+    assert_eq!(
+        vmar.get_mappings_total_size(),
+        before
+            + if matches!(kind, StaleHint::CoveringRemap) {
+                5
+            } else {
+                4
+            } * PAGE_SIZE
+    );
     if matches!(kind, StaleHint::CoveringRemap) {
-        assert!(
-            vmar.for_each_mapping(source..source + PAGE_SIZE, true, |_| {})
-                .is_err()
+        assert_mapping_perms(
+            &vmar,
+            source..source + PAGE_SIZE,
+            VmPerms::READ | VmPerms::WRITE,
         );
         assert_eq!(read_byte(&vmar, allocated), 0x72);
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 3);
+        assert_eq!(read_byte(&vmar, source), 0);
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 4);
+        vmar.remove_mapping(source..source + PAGE_SIZE).unwrap();
+        assert_eq!(vmar.get_mappings_total_size(), before + 4 * PAGE_SIZE);
         assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 3);
     } else {
         assert_eq!(vmar.get_rss_counter(RssType::Anon), rss_before + 2);
