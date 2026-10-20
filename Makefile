@@ -126,7 +126,12 @@ export OSDK_TARGET_ARCH=$(TARGET_ARCH)
 
 SHELL := /bin/bash
 
-CARGO_OSDK := ~/.cargo/bin/cargo-osdk
+# Local-development OSDK embeds its source tree at compile time. Each kernel
+# variant needs its own executable so generated OSTD dependencies cannot cross.
+CARGO_OSDK_ROOT := $(CURDIR)/target/osdk-tool
+CARGO_OSDK := $(CARGO_OSDK_ROOT)/bin/cargo-osdk
+CARGO_OSDK_LOCATION := $(CARGO_OSDK_ROOT)/source-location
+export PATH := $(CARGO_OSDK_ROOT)/bin:$(PATH)
 
 # Common arguments for `cargo osdk` `build`, `run` and `test` commands.
 CARGO_OSDK_COMMON_ARGS :=
@@ -291,11 +296,21 @@ install_osdk:
 	@# The `OSDK_LOCAL_DEV` environment variable is used for local development
 	@# without the need to publish the changes of OSDK's self-hosted
 	@# dependencies to `crates.io`.
-	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk
+	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk --locked --force \
+		--root "$(CARGO_OSDK_ROOT)" --target-dir "$(CURDIR)/target/osdk-tool-build"
+	@printf '%s\n' "$(CURDIR)" > "$(CARGO_OSDK_LOCATION)"
 
-# This will install and update OSDK automatically
-$(CARGO_OSDK): $(OSDK_SRC_FILES)
-	@$(MAKE) --no-print-directory install_osdk
+# A container mount can move the tree without changing source timestamps.
+# Rebuild in that case because OSDK embeds absolute local dependency paths.
+.PHONY: force_osdk_location_check
+force_osdk_location_check:
+
+$(CARGO_OSDK): $(OSDK_SRC_FILES) force_osdk_location_check
+	@if [ ! -x "$(CARGO_OSDK)" ] || \
+		[ "$$(cat "$(CARGO_OSDK_LOCATION)" 2>/dev/null)" != "$(CURDIR)" ] || \
+		[ -n "$(filter-out force_osdk_location_check,$?)" ]; then \
+		$(MAKE) --no-print-directory install_osdk; \
+	fi
 
 .PHONY: check_osdk
 check_osdk:
