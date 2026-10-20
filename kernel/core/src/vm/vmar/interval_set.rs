@@ -84,19 +84,11 @@ where
     /// If no such item exists, returns [`None`]. Otherwise, returns the
     /// mutable reference to the item that contains the point.
     pub(super) fn find_one_mut(&mut self, point: &K) -> Option<&mut V> {
-        let mut cursor = self
-            .btree
-            .lower_bound_mut(core::ops::Bound::Excluded(point));
-        // There's only one previous element that may contain the point.
-        // If it doesn't, there's no other chances.
-        if let Some((k, v)) = cursor.peek_prev()
-            && v.range().end > *point
-        {
-            let key = k.clone();
-            return self.btree.get_mut(&key);
-        }
-
-        None
+        // Only the last interval starting at or before the point can contain it.
+        self.btree
+            .range_mut((core::ops::Bound::Unbounded, core::ops::Bound::Included(point)))
+            .next_back()
+            .and_then(|(_, value)| (value.range().end > *point).then_some(value))
     }
 
     /// Finds all interval items that intersect with the given range.
