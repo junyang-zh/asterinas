@@ -529,7 +529,7 @@ fn allocate_range<'a>(
                     .allocator
                     .alloc_specific_and_lock(preempt_guard, parent.vm_space(), &range);
 
-            if cursor.find_next_mapped(range.end).is_some() {
+            if cursor.find_next_mapped_with(range.end, |_| ()).is_some() {
                 return_errno_with_message!(Errno::EEXIST, "the specified range is already mapped");
             }
 
@@ -543,7 +543,7 @@ fn allocate_range<'a>(
                     .allocator
                     .alloc_specific_and_lock(preempt_guard, parent.vm_space(), &range);
 
-            if cursor.find_next_mapped(range.end).is_some() {
+            if cursor.find_next_mapped_with(range.end, |_| ()).is_some() {
                 drop(cursor);
                 drop(alloc_guard);
                 parent.allocator.alloc_and_lock(
@@ -571,7 +571,7 @@ fn allocate_range<'a>(
                     &range,
                 );
 
-                if cursor.find_next_mapped(range.end).is_none() {
+                if cursor.find_next_mapped_with(range.end, |_| ()).is_none() {
                     (offset, alloc_guard, cursor)
                 } else {
                     drop(cursor);

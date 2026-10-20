@@ -28,13 +28,22 @@ pub(super) trait CursorExt {
     /// is left at the level of the returned mapping. Its virtual address may
     /// lie inside, rather than at the start of, that mapping.
     fn find_next_mapped(&mut self, end: Vaddr) -> Option<&VmMapping>;
+
+    /// Finds the first mapped [`VmMapping`] before `end` and projects an owned result.
+    ///
+    /// Cursor positioning is the same as [`Self::find_next_mapped`]. The callback
+    /// runs once on a hit and never on a miss; its result cannot borrow the mapping.
+    fn find_next_mapped_with<T>(
+        &mut self,
+        end: Vaddr,
+        project: impl FnOnce(&VmMapping) -> T,
+    ) -> Option<T>;
 }
 
 enum NextMappedStep {
     End,
     PopLevel,
     PushLevel(Range<Vaddr>),
-    ReturnMapping,
 }
 
 macro_rules! impl_cursor_ext {
@@ -46,6 +55,20 @@ macro_rules! impl_cursor_ext {
             }
 
             fn find_next_mapped(&mut self, end: Vaddr) -> Option<&VmMapping> {
+                self.find_next_mapped_with(end, |_| ())?;
+                let Some(PteRangeMeta::VmMapping(mapping)) =
+                    self.aux_meta().inner.find_next(&self.virt_addr())
+                else {
+                    unreachable!();
+                };
+                Some(mapping)
+            }
+
+            fn find_next_mapped_with<T>(
+                &mut self,
+                end: Vaddr,
+                project: impl FnOnce(&VmMapping) -> T,
+            ) -> Option<T> {
                 let mut exhausted_child: Option<*const PerPtMeta> = None;
                 loop {
                     let cur_va = self.virt_addr();
@@ -60,7 +83,9 @@ macro_rules! impl_cursor_ext {
                         Some(PteRangeMeta::ChildPt(range)) => {
                             NextMappedStep::PushLevel(range.clone())
                         }
-                        Some(PteRangeMeta::VmMapping(_)) => NextMappedStep::ReturnMapping,
+                        Some(PteRangeMeta::VmMapping(mapping)) => {
+                            return Some(project(mapping));
+                        }
                     };
 
                     match step {
@@ -88,14 +113,6 @@ macro_rules! impl_cursor_ext {
                                     return None;
                                 }
                             }
-                        }
-                        NextMappedStep::ReturnMapping => {
-                            let Some(PteRangeMeta::VmMapping(vm_mapping)) =
-                                self.aux_meta().inner.find_next(&cur_va)
-                            else {
-                                unreachable!();
-                            };
-                            return Some(vm_mapping);
                         }
                     }
                 }
@@ -216,15 +233,19 @@ pub(super) fn unmap_count_rs_as(
 
     let mut total_frames_unmapped = 0;
 
-    while let Some(vm_mapping) = cursor.find_next_mapped(end) {
-        let vm_mapping_range = vm_mapping.range();
-        let frames_mapped = vm_mapping.frames_mapped();
-        let rss_type = vm_mapping.rss_type();
-
+    while let Some((vm_mapping_range, frames_mapped, rss_type, is_device)) = cursor
+        .find_next_mapped_with(end, |mapping| {
+            (
+                mapping.range(),
+                mapping.frames_mapped(),
+                mapping.rss_type(),
+                matches!(mapping.mapped_mem(), MappedMemory::Device(_)),
+            )
+        })
+    {
         // Device mappings can contain both RAM and I/O pages. I/O pages count
         // towards the cursor's unmap result, but must not affect RSS or the
         // cached number of RAM frames.
-        let is_device = matches!(vm_mapping.mapped_mem(), MappedMemory::Device(_));
         let mut count_pages = || {
             let mut ram_frames = 0;
             let mut io_pages = 0;
@@ -447,8 +468,7 @@ pub(super) use check_range_within_one_mapping;
 #[cfg(any(debug_assertions, ktest))]
 pub(super) fn check_range_not_mapped(cursor: &mut VmarCursorMut, range: Range<Vaddr>) {
     cursor.jump(range.start).unwrap();
-    if let Some(vm_mapping) = cursor.find_next_mapped(range.end) {
-        let mapped_range = vm_mapping.range();
+    if let Some(mapped_range) = cursor.find_next_mapped_with(range.end, |mapping| mapping.range()) {
         panic!(
             "existing VM mapping found in range {:#x?} to clear: {:#x?}",
             range, mapped_range
@@ -460,5 +480,375 @@ pub(super) fn check_range_not_mapped(cursor: &mut VmarCursorMut, range: Range<Va
             "existing page table mapping found in range {:#x?} to clear: {:#x?}",
             range, va
         );
+    }
+}
+
+#[cfg(ktest)]
+mod projection_tests {
+    use alloc::boxed::Box;
+    use core::{cell::Cell, num::NonZeroUsize};
+
+    use ostd::{
+        mm::{HIGHEST_PAGING_LEVEL, PagingLevel, vm_space::VmSpace},
+        prelude::ktest,
+        task::disable_preempt,
+    };
+
+    use super::*;
+    use crate::vm::{perms::VmPerms, vmar::MmapMode};
+
+    // Cover two root entries so both cursor constructors retain the root guard.
+    // This reserves no resident user pages and avoids constructor-driven descent.
+    fn root_range() -> Range<Vaddr> {
+        0..2 * page_size_at(HIGHEST_PAGING_LEVEL)
+    }
+
+    fn insert_mapping(space: &VmSpace<PerPtMeta>, range: Range<Vaddr>, owner: PagingLevel) {
+        let guard = disable_preempt();
+        let mut cursor = space.cursor_mut(&guard, &root_range()).unwrap();
+        assert_eq!(cursor.guard_level(), HIGHEST_PAGING_LEVEL);
+        cursor.jump(range.start).unwrap();
+        cursor.adjust_level(owner);
+        cursor
+            .aux_meta_mut()
+            .insert_without_try_merge(VmMapping::new(
+                NonZeroUsize::new(range.len()).unwrap(),
+                range.start,
+                MappedMemory::Anonymous,
+                None,
+                MmapMode::Private,
+                false,
+                VmPerms::READ,
+            ));
+    }
+
+    fn allocate_child(space: &VmSpace<PerPtMeta>, va: Vaddr) {
+        let guard = disable_preempt();
+        let mut cursor = space.cursor_mut(&guard, &root_range()).unwrap();
+        cursor.jump(va).unwrap();
+        cursor.adjust_level(1);
+    }
+
+    // Each call checks four independent cursor acquisitions. Never hold two
+    // overlapping cursors simultaneously: even immutable cursors lock the tree.
+    // Expected values and positions are explicit, in addition to API agreement.
+    fn check_case(
+        space: &VmSpace<PerPtMeta>,
+        start: Vaddr,
+        end: Vaddr,
+        initial_level: PagingLevel,
+        expected: Option<Range<Vaddr>>,
+        final_state: (Vaddr, PagingLevel),
+    ) {
+        macro_rules! check_cursor_kind {
+            ($constructor:ident) => {
+                for reference_api in [false, true] {
+                    // Returning this Box moves it out of the closure, requiring
+                    // FnOnce rather than merely accepting a Copy/Fn capture.
+                    let owned = Box::new(0xa5usize);
+                    let calls = Cell::new(0);
+                    let guard = disable_preempt();
+                    let mut cursor = space.$constructor(&guard, &root_range()).unwrap();
+                    assert_eq!(cursor.guard_level(), HIGHEST_PAGING_LEVEL);
+                    cursor.jump(start).unwrap();
+                    while cursor.level() > initial_level {
+                        cursor.push_level_if_exists().unwrap();
+                    }
+                    assert_eq!(cursor.level(), initial_level);
+                    let actual = if reference_api {
+                        cursor.find_next_mapped(end).map(|mapping| {
+                            assert_eq!(mapping.perms(), VmPerms::READ);
+                            assert_eq!(mapping.frames_mapped(), Some(0));
+                            mapping.range()
+                        })
+                    } else {
+                        let calls_ref = &calls;
+                        let projected = cursor.find_next_mapped_with(end, move |mapping| {
+                            calls_ref.set(calls_ref.get() + 1);
+                            assert_eq!(mapping.perms(), VmPerms::READ);
+                            assert_eq!(mapping.frames_mapped(), Some(0));
+                            (mapping.range(), owned)
+                        });
+                        assert_eq!(calls.get(), usize::from(expected.is_some()));
+                        projected.map(|(range, token)| {
+                            assert_eq!(*token, 0xa5);
+                            range
+                        })
+                    };
+                    assert_eq!(actual, expected);
+                    assert_eq!((cursor.virt_addr(), cursor.level()), final_state);
+                }
+            };
+        }
+        check_cursor_kind!(cursor);
+        check_cursor_kind!(cursor_mut);
+    }
+
+    #[ktest]
+    fn aux_projection_empty_root() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        check_case(
+            &space,
+            p,
+            8 * p,
+            HIGHEST_PAGING_LEVEL,
+            None,
+            (p, HIGHEST_PAGING_LEVEL),
+        );
+        check_case(
+            &space,
+            p,
+            p,
+            HIGHEST_PAGING_LEVEL,
+            None,
+            (p, HIGHEST_PAGING_LEVEL),
+        );
+    }
+
+    #[ktest]
+    fn aux_projection_start_interior_gap_and_exact_end() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        let mapping = 4 * p..8 * p;
+        insert_mapping(&space, mapping.clone(), HIGHEST_PAGING_LEVEL);
+        for start in [p, mapping.start, mapping.start + p] {
+            // Finding metadata after a same-owner gap does not move the cursor
+            // to mapping.start. Preserve this existing API behavior explicitly.
+            check_case(
+                &space,
+                start,
+                mapping.end,
+                HIGHEST_PAGING_LEVEL,
+                Some(mapping.clone()),
+                (start, HIGHEST_PAGING_LEVEL),
+            );
+        }
+        check_case(
+            &space,
+            mapping.end,
+            9 * p,
+            HIGHEST_PAGING_LEVEL,
+            None,
+            (mapping.end, HIGHEST_PAGING_LEVEL),
+        );
+        check_case(
+            &space,
+            mapping.start,
+            mapping.start,
+            HIGHEST_PAGING_LEVEL,
+            None,
+            (mapping.start, HIGHEST_PAGING_LEVEL),
+        );
+    }
+
+    #[ktest]
+    fn aux_projection_each_mapping_owner_level() {
+        let p = page_size_at(1);
+        for owner in 1..=HIGHEST_PAGING_LEVEL {
+            let space = VmSpace::<PerPtMeta>::new();
+            let mapping = 4 * p..8 * p;
+            insert_mapping(&space, mapping.clone(), owner);
+            for start in [p, mapping.start, mapping.start + p] {
+                check_case(
+                    &space,
+                    start,
+                    mapping.end,
+                    HIGHEST_PAGING_LEVEL,
+                    Some(mapping.clone()),
+                    (start, owner),
+                );
+            }
+            // Also begin already descended to the mapping's owning table.
+            check_case(&space, 5 * p, 8 * p, owner, Some(mapping), (5 * p, owner));
+        }
+    }
+
+    #[ktest]
+    fn aux_projection_end_excludes_next_mapping() {
+        let p = page_size_at(1);
+        let space = VmSpace::<PerPtMeta>::new();
+        insert_mapping(&space, 4 * p..8 * p, HIGHEST_PAGING_LEVEL);
+        for end in [3 * p, 4 * p] {
+            check_case(
+                &space,
+                p,
+                end,
+                HIGHEST_PAGING_LEVEL,
+                None,
+                (p, HIGHEST_PAGING_LEVEL),
+            );
+        }
+        let child_space = VmSpace::<PerPtMeta>::new();
+        let boundary = page_size_at(2);
+        insert_mapping(&child_space, boundary..boundary + p, 1);
+        // Parent metadata finds the next child, but its start equals end.
+        for end in [boundary - p, boundary] {
+            check_case(&child_space, 0, end, HIGHEST_PAGING_LEVEL, None, (0, 2));
+        }
+    }
+
+    #[ktest]
+    fn aux_projection_empty_child_then_sibling() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        let boundary = page_size_at(2);
+        allocate_child(&space, 0);
+        insert_mapping(&space, boundary..boundary + p, 1);
+        check_case(
+            &space,
+            0,
+            boundary + p,
+            HIGHEST_PAGING_LEVEL,
+            Some(boundary..boundary + p),
+            (boundary, 1),
+        );
+        check_case(
+            &space,
+            boundary,
+            boundary + p,
+            HIGHEST_PAGING_LEVEL,
+            Some(boundary..boundary + p),
+            (boundary, 1),
+        );
+    }
+
+    #[ktest]
+    fn aux_projection_exhausted_child_then_sibling() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        let boundary = page_size_at(2);
+        insert_mapping(&space, p..2 * p, 1);
+        insert_mapping(&space, boundary..boundary + p, 1);
+        // Start in an already descended child after its final mapping. The
+        // walker must pop and skip this exact child, then visit its sibling.
+        for initial in [1, HIGHEST_PAGING_LEVEL] {
+            check_case(
+                &space,
+                2 * p,
+                boundary + p,
+                initial,
+                Some(boundary..boundary + p),
+                (boundary, 1),
+            );
+        }
+    }
+
+    #[ktest]
+    fn aux_projection_nested_exhausted_children() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        let boundary = page_size_at(3);
+        allocate_child(&space, 0);
+        insert_mapping(&space, boundary..boundary + p, 1);
+        // Exhaust both the level-1 and level-2 descendants before crossing
+        // the level-3 entry boundary into a different child subtree.
+        for initial in [1, HIGHEST_PAGING_LEVEL] {
+            check_case(
+                &space,
+                p,
+                boundary + p,
+                initial,
+                Some(boundary..boundary + p),
+                (boundary, 1),
+            );
+        }
+    }
+
+    #[ktest]
+    fn aux_projection_end_inside_or_at_empty_child_boundary() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        let boundary = page_size_at(2);
+        allocate_child(&space, 0);
+        insert_mapping(&space, boundary..boundary + p, 1);
+        for end in [p, boundary] {
+            for initial in [1, HIGHEST_PAGING_LEVEL] {
+                check_case(&space, 0, end, initial, None, (0, 2));
+            }
+        }
+    }
+
+    #[ktest]
+    fn aux_projection_exhausted_subtree_reaches_root() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        insert_mapping(&space, p..2 * p, 1);
+        // With no remaining metadata, each exhausted child is skipped. This
+        // is the resulting position, not necessarily the caller's end.
+        check_case(
+            &space,
+            2 * p,
+            root_range().end,
+            1,
+            None,
+            (page_size_at(HIGHEST_PAGING_LEVEL), HIGHEST_PAGING_LEVEL),
+        );
+    }
+
+    #[ktest]
+    fn aux_projection_split_mapping_across_child_boundary() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        let unit = page_size_at(2);
+        let boundary = 2 * unit;
+        let mapping = unit..3 * unit;
+        insert_mapping(&space, mapping.clone(), 2);
+        check_case(
+            &space,
+            boundary,
+            mapping.end,
+            HIGHEST_PAGING_LEVEL,
+            Some(mapping.clone()),
+            (boundary, 2),
+        );
+        // Real Aux allocation splits the original mapping at child boundaries.
+        allocate_child(&space, boundary - p);
+        allocate_child(&space, boundary);
+        check_case(
+            &space,
+            boundary - p,
+            mapping.end,
+            HIGHEST_PAGING_LEVEL,
+            Some(unit..boundary),
+            (boundary - p, 1),
+        );
+        check_case(
+            &space,
+            boundary,
+            mapping.end,
+            HIGHEST_PAGING_LEVEL,
+            Some(boundary..3 * unit),
+            (boundary, 1),
+        );
+    }
+
+    #[ktest]
+    fn aux_projection_result_can_borrow_owned_capture_context() {
+        let space = VmSpace::<PerPtMeta>::new();
+        let p = page_size_at(1);
+        insert_mapping(&space, p..2 * p, HIGHEST_PAGING_LEVEL);
+        let context = Box::new(123usize);
+        macro_rules! check_cursor_kind {
+            ($constructor:ident) => {{
+                let token = Box::new(456usize);
+                let context_ref = &*context;
+                let guard = disable_preempt();
+                let mut cursor = space.$constructor(&guard, &root_range()).unwrap();
+                let (range, owned, borrowed) = cursor
+                    .find_next_mapped_with(2 * p, move |mapping| {
+                        (mapping.range(), token, context_ref)
+                    })
+                    .unwrap();
+                // The result may borrow unrelated captured context, and survives
+                // dropping the cursor; it does not borrow the mapping.
+                drop(cursor);
+                assert_eq!(range, p..2 * p);
+                assert_eq!(*owned, 456);
+                assert_eq!(*borrowed, 123);
+            }};
+        }
+        check_cursor_kind!(cursor);
+        check_cursor_kind!(cursor_mut);
     }
 }

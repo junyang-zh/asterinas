@@ -85,7 +85,10 @@ impl Vmar {
 
         if new_size > old_size {
             cursor.jump(map_addr + old_size).unwrap();
-            if cursor.find_next_mapped(map_addr + new_size).is_some() {
+            if cursor
+                .find_next_mapped_with(map_addr + new_size, |_| ())
+                .is_some()
+            {
                 return_errno_with_message!(
                     Errno::ENOMEM,
                     "resize_mapping: the expanded range overlaps with existing mappings"
@@ -529,9 +532,9 @@ impl MoveRangeOp {
 
         cursor.jump(self.from).unwrap();
 
-        while let Some(vm_mapping_ref) = cursor.find_next_mapped(self.from + self.size) {
-            let vm_mapping_range = vm_mapping_ref.range();
-
+        while let Some(vm_mapping_range) =
+            cursor.find_next_mapped_with(self.from + self.size, |mapping| mapping.range())
+        {
             let intersected_range = get_intersected_range(&from_range, &vm_mapping_range);
 
             cursor.jump(intersected_range.start).unwrap();
@@ -647,7 +650,10 @@ fn lock_range_and_check_empty<'a>(
     );
 
     cursor.jump(check_range.start).unwrap();
-    if cursor.find_next_mapped(check_range.end).is_some() {
+    if cursor
+        .find_next_mapped_with(check_range.end, |_| ())
+        .is_some()
+    {
         return_errno_with_message!(
             Errno::ENOMEM,
             "remap: the new range overlaps with existing mappings"

@@ -40,9 +40,9 @@ impl Vmar {
         let vm_space = self.vm_space();
         let mut cursor = vm_space.cursor_mut(&preempt_guard, &range).unwrap();
 
-        while let Some(vm_mapping) = cursor.find_next_mapped(range.end) {
-            let vm_mapping_range = vm_mapping.range();
-
+        while let Some((vm_mapping_range, mapping_perms)) =
+            cursor.find_next_mapped_with(range.end, |mapping| (mapping.range(), mapping.perms()))
+        {
             if last_protected_addr < vm_mapping_range.start {
                 return_errno_with_message!(
                     Errno::ENOMEM,
@@ -51,7 +51,7 @@ impl Vmar {
             }
 
             // Skip if no actions needed.
-            if perms == vm_mapping.perms() & VmPerms::ALL_PERMS {
+            if perms == mapping_perms & VmPerms::ALL_PERMS {
                 if vm_mapping_range.end >= range.end {
                     last_protected_addr = range.end;
                     break;

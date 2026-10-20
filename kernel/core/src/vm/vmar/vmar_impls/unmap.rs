@@ -37,8 +37,9 @@ impl Vmar {
         // Detached page tables are reclaimed after an RCU grace period. Drop
         // their mappings now so file-close notifications and device teardown
         // are not delayed until some later quiescent state.
-        while let Some(mapping) = cursor.find_next_mapped(full_range.end) {
-            let range = mapping.range();
+        while let Some(range) =
+            cursor.find_next_mapped_with(full_range.end, |mapping| mapping.range())
+        {
             cursor.aux_meta_mut().inner.take_one(&range.start);
             if cursor.jump(range.end).is_err() {
                 break;
@@ -180,14 +181,13 @@ impl Vmar {
         let preempt_guard = disable_preempt();
         let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
 
-        while let Some(vm_mapping) = cursor.find_next_mapped(range.end) {
-            let vm_mapping_range = vm_mapping.range();
-            let rss_type = vm_mapping.rss_type();
-
+        while let Some((vm_mapping_range, rss_type)) =
+            cursor.find_next_mapped_with(range.end, |mapping| (mapping.range(), mapping.rss_type()))
+        {
             // The range may contain pages that are not mapped. According to Linux behavior, this
             // is not a fault. However, an `ENOMEM` should be reported at the end.
-            if last_mapping_end >= vm_mapping.map_to_addr() {
-                last_mapping_end = vm_mapping.map_end();
+            if last_mapping_end >= vm_mapping_range.start {
+                last_mapping_end = vm_mapping_range.end;
             }
 
             let intersected_range = get_intersected_range(&range, &vm_mapping_range);

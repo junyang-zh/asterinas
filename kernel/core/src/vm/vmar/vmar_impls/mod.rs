@@ -158,9 +158,12 @@ impl Vmar {
 
         for range in ranges {
             cursor.jump(range.start).unwrap();
-            while let Some(mapping) = cursor.find_next_mapped(range.end) {
-                let mapping_end = mapping.map_end();
-                if let Some((vmo, entry)) = mapping.rmap_entry_in(range)
+            while let Some((mapping_end, rmap_entry)) = cursor
+                .find_next_mapped_with(range.end, |mapping| {
+                    (mapping.map_end(), mapping.rmap_entry_in(range))
+                })
+            {
+                if let Some((vmo, entry)) = rmap_entry
                     && !entries
                         .iter()
                         .any(|(old_vmo, old_entry): &(Arc<Vmo>, RmapEntry)| {
