@@ -234,6 +234,10 @@ impl Drop for RestoreSigMaskGuard<'_> {
 }
 
 fn dequeue_pending_signal(ctx: &Context) -> Option<(DequeuedSignal, SigAction)> {
+    if ctx.posix_thread.sig_queues().is_empty() && ctx.process.sig_queues().is_empty() {
+        return None;
+    }
+
     let posix_thread = ctx.posix_thread;
 
     let sig_dispositions = ctx.process.sig_dispositions().lock();
