@@ -139,8 +139,9 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         // ends, so it outlives `'rcu`.
         let pt_ref = unsafe { PageTableNodeRef::borrow_paddr(paddr) };
 
-        // Lock before writing the PTE, so no one else can operate on it.
-        let pt_lock_guard = pt_ref.lock(guard);
+        // The exclusive parent guard implicitly owns the new child.
+        // SAFETY: The child is fresh and its parent remains exclusively held.
+        let pt_lock_guard = unsafe { pt_ref.make_guard_unchecked(guard) };
 
         self.pte = PteState::PageTable(new_page).into_pte();
 
@@ -183,8 +184,9 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         // ends, so it outlives `'rcu`.
         let pt_ref = unsafe { PageTableNodeRef::borrow_paddr(paddr) };
 
-        // Lock before writing the PTE, so no one else can operate on it.
-        let mut pt_lock_guard = pt_ref.lock(guard);
+        // The exclusive parent guard implicitly owns the new child.
+        // SAFETY: The child is fresh and its parent remains exclusively held.
+        let mut pt_lock_guard = unsafe { pt_ref.make_guard_unchecked(guard) };
 
         // Prevent double-dropping the small items when panicking (e.g., debug assertion fails).
         let panic_guard = PanicGuard::new();

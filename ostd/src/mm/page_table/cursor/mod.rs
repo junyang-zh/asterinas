@@ -16,16 +16,11 @@
 //! is ordered after another cursor, it will see all the changes made by the
 //! previous cursor.
 //!
-//! The implementation of the lock protocol resembles two-phase locking (2PL).
-//! [`CursorMut::new`] accepts an address range, which indicates the page table
-//! entries that may be visited by this cursor. Then, [`CursorMut::new`] finds
-//! an intermediate page table (not necessarily the last-level or the top-
-//! level) which represents an address range that fully contains the whole
-//! specified address range. Then it locks all the nodes in the sub-tree rooted
-//! at the intermediate page table node, with a pre-order DFS order. The cursor
-//! will only be able to access the page table entries in the locked range.
-//! Upon destruction, the cursor will release the locks in the reverse order of
-//! acquisition.
+//! The cursor holds shared locks on the ancestors of a covering node and an
+//! exclusive lock on that node. Descendants are implicitly exclusive: every
+//! competing traversal must first acquire a shared lock on the covering node.
+//! Destruction releases implicit guards, the covering writer, and shared
+//! ancestors in reverse order. Read-only cursors retain transactional exclusion.
 
 mod locking;
 
@@ -301,7 +296,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
                     if pt_guard.nr_children() != 0 {
                         self.push_level(pt_guard);
                     } else {
-                        let _ = ManuallyDrop::new(pt_guard);
+                        drop(pt_guard); // Implicit descendant.
                         if cur_va_range.end >= end {
                             self.va = end;
                             return None;
@@ -394,7 +389,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
         let taken = self.path[self.level as usize - 1]
             .take()
             .expect("popping a level without a lock");
-        let _ = ManuallyDrop::new(taken);
+        drop(taken); // Implicit descendant; no physical lock is released.
 
         self.level += 1;
     }

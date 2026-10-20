@@ -1304,7 +1304,6 @@ mod boot_pt {
     }
 }
 
-
 #[ktest]
 fn try_cursor_conflict_releases_partial_locks() {
     let pt = PageTable::<UserPtConfig>::empty();
@@ -1312,12 +1311,76 @@ fn try_cursor_conflict_releases_partial_locks() {
     // Materialise two adjacent leaf PTs under the same parent.
     drop(pt.cursor_mut(&preempt, &(0..PAGE_SIZE)).unwrap());
     let second = page_size::<UserPtConfig>(2);
-    drop(pt.cursor_mut(&preempt, &(second..second + PAGE_SIZE)).unwrap());
-    let held = pt.cursor_mut(&preempt, &(second..second + PAGE_SIZE)).unwrap();
-    // The failed broad transaction first acquires the parent and first child,
-    // then encounters the held second child. Both earlier locks must roll back.
-    assert!(pt.try_cursor_mut(&preempt, &(0..second + PAGE_SIZE)).unwrap().is_none());
-    assert!(pt.try_cursor_mut(&preempt, &(0..PAGE_SIZE)).unwrap().is_some());
+    drop(
+        pt.cursor_mut(&preempt, &(second..second + PAGE_SIZE))
+            .unwrap(),
+    );
+    let held = pt
+        .cursor_mut(&preempt, &(second..second + PAGE_SIZE))
+        .unwrap();
+    // The broad transaction acquires shared upper ancestors, then fails to
+    // acquire the covering writer because held owns a reader there. All earlier
+    // shared locks must roll back; the disjoint leaf remains available.
+    assert!(
+        pt.try_cursor_mut(&preempt, &(0..second + PAGE_SIZE))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pt.try_cursor_mut(&preempt, &(0..PAGE_SIZE))
+            .unwrap()
+            .is_some()
+    );
     drop(held);
-    assert!(pt.try_cursor_mut(&preempt, &(0..second + PAGE_SIZE)).unwrap().is_some());
+    assert!(
+        pt.try_cursor_mut(&preempt, &(0..second + PAGE_SIZE))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[ktest]
+fn rw_covering_writer_excludes_implicit_descendants_and_releases_them() {
+    let pt = PageTable::<UserPtConfig>::empty();
+    let preempt = disable_preempt();
+    let second = page_size::<UserPtConfig>(2);
+    let mut broad = pt.cursor_mut(&preempt, &(0..second + PAGE_SIZE)).unwrap();
+    broad.adjust_level(1); // Allocates an implicitly owned child.
+    assert!(
+        pt.try_cursor_mut(&preempt, &(0..PAGE_SIZE))
+            .unwrap()
+            .is_none()
+    );
+    broad.jump(second).unwrap();
+    broad.adjust_level(1);
+    assert!(
+        pt.try_cursor_mut(&preempt, &(second..second + PAGE_SIZE))
+            .unwrap()
+            .is_none()
+    );
+    drop(broad);
+    let first = pt
+        .try_cursor_mut(&preempt, &(0..PAGE_SIZE))
+        .unwrap()
+        .unwrap();
+    let second_cursor = pt
+        .try_cursor_mut(&preempt, &(second..second + PAGE_SIZE))
+        .unwrap()
+        .unwrap();
+    drop(first);
+    drop(second_cursor);
+    assert!(
+        pt.try_cursor_mut(&preempt, &(0..second + PAGE_SIZE))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[ktest]
+#[should_panic(expected = "shared page table mutation")]
+fn rw_shared_guard_rejects_mutable_aux() {
+    let pt = PageTable::<UserPtConfig>::empty();
+    let preempt = disable_preempt();
+    let mut read = pt.root.borrow().lock_read(&preempt);
+    let _ = read.aux_mut();
 }
