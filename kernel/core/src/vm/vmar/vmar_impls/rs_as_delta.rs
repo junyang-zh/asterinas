@@ -10,7 +10,10 @@ use ostd::{
 use super::Vmar;
 use crate::{
     prelude::*,
-    process::{Process, ResourceType, rlimit::RLIM_INFINITY},
+    process::{
+        Process, ResourceType,
+        rlimit::{RLIM_INFINITY, RLimit64},
+    },
 };
 
 impl Vmar {
@@ -22,9 +25,23 @@ impl Vmar {
         preempt_guard: &DisabledPreemptGuard,
         add_size: usize,
     ) -> Result<()> {
+        self.add_mapping_size_with_rlimit_as(preempt_guard, add_size, None)
+    }
+
+    pub(super) fn add_mapping_size_with_rlimit_as(
+        &self,
+        preempt_guard: &DisabledPreemptGuard,
+        add_size: usize,
+        rlimit_as: Option<&RLimit64>,
+    ) -> Result<()> {
         let cur_cpu = preempt_guard.current_cpu();
 
-        let rlimit_as = get_rlimit_as();
+        // Borrow the live object, so changes during mapping preparation or
+        // page-table acquisition are observed at the usual admission point.
+        let rlimit_as = match rlimit_as {
+            Some(limit) => limit.get_cur(),
+            None => get_rlimit_as(),
+        };
 
         self.mapped_vm_size.add(cur_cpu, add_size, rlimit_as)
     }

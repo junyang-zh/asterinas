@@ -14,6 +14,7 @@ use crate::{
         ramfs::memfd::MemfdInode,
     },
     prelude::*,
+    process::rlimit::RLimit64,
     vm::{
         page_cache::{Vmo, VmoMapMode},
         perms::VmPerms,
@@ -118,6 +119,8 @@ pub(crate) struct VmarMapOptions<'a, 'b> {
     handle_page_faults_around: bool,
     // Whether to map all pages immediately instead of on-demand.
     populate: bool,
+    #[cfg(ktest)]
+    before_admission: Option<&'b dyn Fn()>,
 }
 
 impl<'a, 'b> VmarMapOptions<'a, 'b> {
@@ -137,6 +140,8 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_mode: MmapMode::Private,
             handle_page_faults_around: false,
             populate: false,
+            #[cfg(ktest)]
+            before_admission: None,
         }
     }
 
@@ -276,7 +281,29 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
     /// All options will be checked at this point.
     ///
     /// On success, the virtual address of the new mapping is returned.
-    pub(crate) fn build(mut self) -> Result<Vaddr> {
+    pub(crate) fn build(self) -> Result<Vaddr> {
+        self.build_inner(None)
+    }
+
+    /// Creates the mapping using the calling process's address-space limit.
+    ///
+    /// The current limit is read when admitting the mapping, after preparing
+    /// its backing memory and acquiring the page-table range.
+    pub(crate) fn build_with_rlimit_as(self, rlimit_as: &RLimit64) -> Result<Vaddr> {
+        self.build_inner(Some(rlimit_as))
+    }
+
+    /// Installs a per-builder test action immediately before quota admission.
+    ///
+    /// The action runs with preemption disabled and the page-table range
+    /// locked. It must be bounded and must not block or acquire locks.
+    #[cfg(ktest)]
+    pub(crate) fn before_admission(mut self, action: &'b dyn Fn()) -> Self {
+        self.before_admission = Some(action);
+        self
+    }
+
+    fn build_inner(mut self, rlimit_as: Option<&RLimit64>) -> Result<Vaddr> {
         self.check_options()?;
 
         if (self.perms & VmPerms::ALL_PERMS).is_empty() {
@@ -300,6 +327,8 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_mode,
             handle_page_faults_around,
             populate,
+            #[cfg(ktest)]
+            before_admission,
         } = self;
 
         let replaces_existing = matches!(offset, Some((_, OffsetType::Fixed)));
@@ -348,7 +377,14 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             perms | may_perms,
         );
 
-        if let Err(err) = parent.add_mapping_size(&preempt_guard, map_size.get()) {
+        #[cfg(ktest)]
+        if let Some(action) = before_admission {
+            action();
+        }
+
+        if let Err(err) =
+            parent.add_mapping_size_with_rlimit_as(&preempt_guard, map_size.get(), rlimit_as)
+        {
             parent.refresh_rmap_entries(
                 &mut cursor,
                 old_rmap_entries,
