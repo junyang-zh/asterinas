@@ -132,7 +132,9 @@ pub struct IdSet<I> {
 type InnerPart = u64;
 
 const BITS_PER_PART: usize = InnerPart::BITS as usize;
-const NR_PARTS_NO_ALLOC: usize = 2;
+// Six words cover the 384-CPU evaluation host without heap allocation.
+// Larger machines retain the SmallVec heap fallback.
+const NR_PARTS_NO_ALLOC: usize = 6;
 
 fn part_idx<I: Id>(id: I) -> usize {
     (id.into() as usize) / BITS_PER_PART

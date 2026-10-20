@@ -9,6 +9,9 @@ use core::{
 
 use crate::mm::Vaddr;
 
+#[cfg(feature = "memory_accounting")]
+pub mod accounting;
+
 mod slab;
 mod slot;
 mod slot_list;

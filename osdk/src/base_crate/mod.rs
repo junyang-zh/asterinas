@@ -168,6 +168,13 @@ fn do_new_base_crate(
 
     // Create the directory
     fs::create_dir_all(&base_crate_path).unwrap();
+    // Seed dependency resolution with the source workspace's pinned versions.
+    // Cargo may add this generated wrapper package, but must not silently select
+    // newer transitive dependencies on every generated-crate rebuild.
+    let source_lock = workspace_root.join("Cargo.lock");
+    if source_lock.exists() {
+        fs::copy(source_lock, base_crate_path.as_ref().join("Cargo.lock")).unwrap();
+    }
     // Create the src directory
     fs::create_dir_all(base_crate_path.as_ref().join("src")).unwrap();
 

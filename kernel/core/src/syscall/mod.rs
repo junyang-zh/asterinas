@@ -336,7 +336,20 @@ macro_rules! impl_syscall_nums_and_dispatch_fn {
                 $(
                     $num => {
                         $crate::syscall::log_syscall_entry!($name);
-                        $crate::syscall::dispatch_fn_inner!(args, ctx, user_ctx, $handler $args)
+                        #[cfg(feature = "breakdown_counters")]
+                        let mut profile = match stringify!($handler) {
+                            "sys_mmap" => Some(ostd::mm::breakdown::enter(ostd::mm::breakdown::Phase::Mmap)),
+                            "sys_munmap" => Some(ostd::mm::breakdown::enter(ostd::mm::breakdown::Phase::Munmap)),
+                            "sys_madvise" => Some(ostd::mm::breakdown::enter(ostd::mm::breakdown::Phase::Madvise)),
+                            "sys_mprotect" | "sys_pkey_mprotect" => Some(ostd::mm::breakdown::enter(ostd::mm::breakdown::Phase::Mprotect)),
+                            _ => None,
+                        };
+                        let result = $crate::syscall::dispatch_fn_inner!(args, ctx, user_ctx, $handler $args);
+                        #[cfg(feature = "breakdown_counters")]
+                        if result.is_err() {
+                            if let Some(guard) = profile.as_mut() { guard.fail(); }
+                        }
+                        result
                     }
                 )*
                 _ => {

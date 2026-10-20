@@ -70,7 +70,11 @@ pub(crate) fn create_new_user_task(
 
         while !current_thread.is_exited() {
             // Execute the user code
+            #[cfg(feature = "breakdown_counters")]
+            ostd::mm::breakdown::mode(ostd::mm::breakdown::Phase::User);
             let return_reason = user_mode.execute(&ctx);
+            #[cfg(feature = "breakdown_counters")]
+            ostd::mm::breakdown::mode(ostd::mm::breakdown::Phase::OtherKernel);
 
             // Handle user events
             let user_ctx = user_mode.context_mut();

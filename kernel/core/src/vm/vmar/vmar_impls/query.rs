@@ -30,6 +30,7 @@ impl Vmar {
 
         if check_fully_mapped {
             check_range_mapped!(&mut cursor, range_aligned.end)?;
+            cursor.jump(range_aligned.start).unwrap();
         }
 
         while let Some(vm_mapping) = cursor.find_next_mapped(range_aligned.end) {

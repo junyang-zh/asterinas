@@ -26,20 +26,18 @@
 //!
 
 mod entry;
+mod mcs;
 mod pte_state;
 
-use core::{
-    cell::SyncUnsafeCell,
-    ops::Deref,
-    sync::atomic::{AtomicU8, Ordering},
-};
+use alloc::boxed::Box;
+use core::{cell::SyncUnsafeCell, ops::Deref, pin::Pin, sync::atomic::Ordering};
 
 pub(crate) use self::pte_state::PteStateRef;
 pub(in crate::mm) use self::{entry::Entry, pte_state::PteState};
 use super::{PageTableConfig, PteTrait, nr_subpage_per_huge};
 use crate::{
     mm::{
-        FrameAllocOptions, HasPaddr, Infallible, PagingConstsTrait, PagingLevel, Vaddr, VmReader,
+        HasPaddr, Infallible, PagingConstsTrait, PagingLevel, Vaddr, VmReader,
         frame::{Frame, FrameRef, meta::AnyFrameMeta},
         paddr_to_vaddr, page_size,
         page_table::{PteScalar, load_pte, store_pte},
@@ -66,11 +64,7 @@ impl<C: PageTableConfig> PageTableNode<C> {
 
     /// Allocates a new empty page table node.
     pub(super) fn alloc(level: PagingLevel, aux: C::Aux) -> Self {
-        let meta = PageTableFrameMeta::new(level, aux);
-        FrameAllocOptions::new()
-            .zeroed(true)
-            .alloc_frame_with(meta)
-            .expect("Failed to allocate a page table node")
+        super::zeroed_pt_pool::alloc::<C>(level, aux)
     }
 
     /// Activates the page table assuming it is a root page table.
@@ -124,6 +118,32 @@ pub(crate) type PageTableNodeRef<'a, C> = FrameRef<'a, PageTableFrameMeta<C>>;
 
 #[expect(private_bounds)]
 impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
+    /// Traverse existing user-side child tables without creating PTEs. Locks are
+    /// acquired parent before child. Callers park all target threads for a coherent
+    /// snapshot; concurrent workloads get a traversal, not an atomic global cut.
+    /// Normal lock queue storage is temporary and excluded from the counted objects.
+    #[cfg(feature = "memory_accounting")]
+    pub(super) fn snapshot_memory<'rcu>(
+        self, guard: &'rcu dyn InAtomicMode,
+        result: &mut super::MemoryAccounting, root: bool,
+    ) where 'a: 'rcu {
+        use crate::mm::{AuxPageTableMeta, heap::accounting::charged_size};
+        let locked = self.lock(guard);
+        result.pt_pages += 1;
+        result.node_state_requested_bytes += core::mem::size_of::<NodeState<C>>();
+        result.node_state_charged_bytes += charged_size(core::alloc::Layout::new::<NodeState<C>>());
+        let aux = locked.aux().allocation_snapshot();
+        result.aux_allocations += aux.allocations;
+        result.aux_requested_bytes += aux.requested_bytes;
+        result.aux_charged_bytes += aux.charged_bytes;
+        let range = if root { C::TOP_LEVEL_INDEX_RANGE.clone() } else { 0..nr_subpage_per_huge::<C>() };
+        for index in range {
+            if let PteStateRef::PageTable(child) = locked.entry_state(index) {
+                child.snapshot_memory(guard, result, false);
+            }
+        }
+    }
+
     /// Locks the page table node.
     ///
     /// An atomic mode guard is required to
@@ -133,14 +153,12 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     where
         'a: 'rcu,
     {
-        while self
-            .meta()
-            .lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        let node = Box::pin(mcs::Node::new());
+        // SAFETY: This freshly allocated pinned node is not in any queue.
+        unsafe { node.as_ref().lock(&self.meta().state.lock.body) };
+        // SAFETY: Only the lock owner accesses the owner slot. Keeping it in
+        // the frame, rather than the guard, preserves it across DFS forgetting.
+        unsafe { self.meta().state.lock.owner.get().write(Some(node)) };
 
         PageTableGuard::<'rcu, C> { inner: self }
     }
@@ -153,11 +171,14 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     where
         'a: 'rcu,
     {
-        self.meta()
-            .lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| PageTableGuard::<'rcu, C> { inner: self })
+        let node = Box::pin(mcs::Node::new());
+        // SAFETY: The pinned node is fresh; failure does not enqueue it.
+        if !unsafe { node.as_ref().try_lock(&self.meta().state.lock.body) } {
+            return None;
+        }
+        // SAFETY: Successful acquisition gives exclusive ownership of this slot.
+        unsafe { self.meta().state.lock.owner.get().write(Some(node)) };
+        Some(PageTableGuard::<'rcu, C> { inner: self })
     }
 
     /// Creates a new [`PageTableGuard`] without checking if the page table lock is held.
@@ -218,25 +239,25 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// Gets the number of valid PTEs in the node.
     pub(super) fn nr_children(&self) -> u16 {
         // SAFETY: The lock is held so we have an exclusive access.
-        unsafe { (*self.meta().inner.get()).nr_children }
+        unsafe { (*self.meta().state.inner.get()).nr_children }
     }
 
     /// Returns if the page table node is detached from its parent.
     pub(super) fn stray_mut(&mut self) -> &mut bool {
         // SAFETY: The lock is held so we have an exclusive access.
-        unsafe { &mut (*self.meta().inner.get()).stray }
+        unsafe { &mut (*self.meta().state.inner.get()).stray }
     }
 
     /// Returns a reference to the auxiliary data of the page table node.
     pub(super) fn aux_mut(&mut self) -> &mut C::Aux {
         // SAFETY: The lock is held so we have an exclusive access.
-        unsafe { &mut (*self.meta().inner.get()).aux }
+        unsafe { &mut (*self.meta().state.inner.get()).aux }
     }
 
     /// Returns a reference to the auxiliary data of the page table node.
     pub(super) fn aux(&self) -> &C::Aux {
         // SAFETY: The lock is held so we have an exclusive access.
-        unsafe { &(*self.meta().inner.get()).aux }
+        unsafe { &(*self.meta().state.inner.get()).aux }
     }
 
     /// Reads a non-owning PTE at the given index.
@@ -277,7 +298,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// Gets the mutable reference to the number of valid PTEs in the node.
     fn nr_children_mut(&mut self) -> &mut u16 {
         // SAFETY: The lock is held so we have an exclusive access.
-        unsafe { &mut (*self.meta().inner.get()).nr_children }
+        unsafe { &mut (*self.meta().state.inner.get()).nr_children }
     }
 }
 
@@ -291,7 +312,11 @@ impl<'rcu, C: PageTableConfig> Deref for PageTableGuard<'rcu, C> {
 
 impl<C: PageTableConfig> Drop for PageTableGuard<'_, C> {
     fn drop(&mut self) {
-        self.inner.meta().lock.store(0, Ordering::Release);
+        // SAFETY: The guard exclusively owns the lock and its queue node.
+        let node = unsafe { self.meta().state.lock.owner.get().replace(None) }.unwrap();
+        // SAFETY: The pinned node acquired this lock and remains alive until
+        // all queue handoff accesses complete inside unlock.
+        unsafe { node.as_ref().unlock(&self.meta().state.lock.body) };
     }
 }
 
@@ -304,13 +329,23 @@ impl<C: PageTableConfig> Drop for PageTableGuard<'_, C> {
 #[expect(private_bounds)]
 #[expect(rustdoc::private_intra_doc_links)]
 pub struct PageTableFrameMeta<C: PageTableConfig> {
-    /// Mutable parts if the [`Self::lock`] is held.
-    inner: SyncUnsafeCell<PageTableFrameMetaInner<C>>,
-    /// The level of the page table page. A page table frame cannot be
-    /// referenced by page tables of different levels.
+    /// Stable storage for the lock and auxiliary data. Keeping this behind one
+    /// pointer preserves the 64-byte physical-frame metadata geometry even when
+    /// the client's auxiliary metadata fills the slot in the upstream layout.
+    state: Box<NodeState<C>>,
     level: PagingLevel,
-    /// The lock for the page table frame.
-    lock: AtomicU8,
+}
+
+#[derive(Debug)]
+struct NodeState<C: PageTableConfig> {
+    inner: SyncUnsafeCell<PageTableFrameMetaInner<C>>,
+    lock: NodeLock,
+}
+
+#[derive(Debug)]
+struct NodeLock {
+    body: mcs::LockBody,
+    owner: SyncUnsafeCell<Option<Pin<Box<mcs::Node>>>>,
 }
 
 struct PageTableFrameMetaInner<C: PageTableConfig> {
@@ -329,15 +364,20 @@ struct PageTableFrameMetaInner<C: PageTableConfig> {
 #[expect(private_bounds)]
 impl<C: PageTableConfig> PageTableFrameMeta<C> {
     /// Creates a new page table frame metadata.
-    fn new(level: PagingLevel, aux: C::Aux) -> Self {
+    pub(super) fn new(level: PagingLevel, aux: C::Aux) -> Self {
         Self {
-            inner: SyncUnsafeCell::new(PageTableFrameMetaInner {
-                aux,
-                nr_children: 0,
-                stray: false,
+            state: Box::new(NodeState {
+                inner: SyncUnsafeCell::new(PageTableFrameMetaInner {
+                    aux,
+                    nr_children: 0,
+                    stray: false,
+                }),
+                lock: NodeLock {
+                    body: mcs::LockBody::new(),
+                    owner: SyncUnsafeCell::new(None),
+                },
             }),
             level,
-            lock: AtomicU8::new(0),
         }
     }
 }
@@ -348,7 +388,7 @@ impl<C: PageTableConfig> PageTableFrameMeta<C> {
 // be reasoned in conjunction with the `page_table/cursor` implementation.
 unsafe impl<C: PageTableConfig> AnyFrameMeta for PageTableFrameMeta<C> {
     fn on_drop(&mut self, reader: &mut VmReader<Infallible>) {
-        let nr_children = self.inner.get_mut().nr_children;
+        let nr_children = self.state.inner.get_mut().nr_children;
         if nr_children == 0 {
             return;
         }

@@ -7,6 +7,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 #![feature(alloc_io)]
+#![cfg_attr(feature = "memory_accounting", feature(allocator_api, btreemap_alloc))]
 #![feature(array_try_from_fn)]
 #![feature(associated_type_defaults)]
 #![feature(btree_cursors)]
@@ -50,6 +51,8 @@ pub mod events;
 pub mod fs;
 mod init;
 mod ipc;
+#[cfg(ktest)]
+mod ktest_bootstrap;
 mod net;
 pub mod power;
 pub mod prelude;

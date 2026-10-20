@@ -73,13 +73,6 @@ pub(crate) struct RealTimeCoarseClock {
 }
 
 impl RealTimeCoarseClock {
-    /// A reference to the current value of this clock.
-    fn current_ref() -> &'static Once<SpinLock<Duration>> {
-        static CURRENT: Once<SpinLock<Duration>> = Once::new();
-
-        &CURRENT
-    }
-
     /// Get the singleton of this clock.
     pub(crate) fn get() -> &'static Arc<RealTimeCoarseClock> {
         CLOCK_REALTIME_COARSE_INSTANCE.get().unwrap()
@@ -165,7 +158,23 @@ impl Clock for MonotonicClock {
 
 impl Clock for RealTimeCoarseClock {
     fn read_time(&self) -> Duration {
-        *Self::current_ref().get().unwrap().disable_irq().lock()
+        let guard = disable_preempt();
+        let mut cached = COARSE_REALTIME
+            .get_on_cpu(guard.current_cpu())
+            .get()
+            .unwrap()
+            .disable_irq()
+            .lock();
+        let ticks = Jiffies::elapsed();
+        if cached.0 != ticks.as_u64() {
+            // Derive every CPU cache from the same global tick epoch. This
+            // avoids stale AP clocks and backwards time after task migration.
+            *cached = (
+                ticks.as_u64(),
+                *START_TIME_AS_DURATION.get().unwrap() + ticks.as_duration(),
+            );
+        }
+        cached.1
     }
 }
 
@@ -282,16 +291,18 @@ fn init_jiffies_clock_manager() {
     time::softirq::register_callback(callback);
 }
 
-fn update_coarse_clock() {
-    let real_time = RealTimeClock::get().read_time();
-    let current = RealTimeCoarseClock::current_ref().get().unwrap();
-    *current.disable_irq().lock() = real_time;
+cpu_local! {
+    static COARSE_REALTIME: Once<SpinLock<(u64, Duration)>> = Once::new();
 }
 
 fn init_coarse_clock() {
-    let real_time = RealTimeClock::get().read_time();
-    RealTimeCoarseClock::current_ref().call_once(|| SpinLock::new(real_time));
-    time::softirq::register_callback(update_coarse_clock);
+    let ticks = Jiffies::elapsed();
+    let real_time = *START_TIME_AS_DURATION.get().unwrap() + ticks.as_duration();
+    for cpu in ostd::cpu::all_cpus() {
+        COARSE_REALTIME
+            .get_on_cpu(cpu)
+            .call_once(|| SpinLock::new((ticks.as_u64(), real_time)));
+    }
 }
 
 pub(super) fn init() {
@@ -307,6 +318,7 @@ pub(super) fn init() {
 /// TODO: `ktest` may require a feature that allows the registration of initialization functions
 /// to avoid functions like this one.
 pub(crate) fn init_for_ktest() {
+    START_TIME_AS_DURATION.call_once(|| Duration::ZERO);
     // If `spin::Once` has initialized, this closure will not be executed.
     for cpu in ostd::cpu::all_cpus() {
         CLOCK_REALTIME_MANAGER.get_on_cpu(cpu).call_once(|| {
@@ -315,7 +327,11 @@ pub(crate) fn init_for_ktest() {
         });
     }
     CLOCK_REALTIME_COARSE_INSTANCE.call_once(|| Arc::new(RealTimeCoarseClock { _private: () }));
-    RealTimeCoarseClock::current_ref().call_once(|| SpinLock::new(Duration::from_secs(0)));
+    for cpu in ostd::cpu::all_cpus() {
+        COARSE_REALTIME
+            .get_on_cpu(cpu)
+            .call_once(|| SpinLock::new((0, Duration::ZERO)));
+    }
     JIFFIES_TIMER_MANAGER.call_once(|| {
         let clock = JiffiesClock { _private: () };
         TimerManager::new(Arc::new(clock))

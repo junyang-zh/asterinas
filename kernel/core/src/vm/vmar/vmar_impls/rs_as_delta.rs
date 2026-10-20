@@ -2,17 +2,18 @@
 
 //! Address space size and RSS counting/limiting.
 
-use core::sync::atomic::Ordering;
-
 use ostd::{
-    cpu::{CpuId, PinCurrentCpu, all_cpus, num_cpus},
+    cpu::{CpuId, PinCurrentCpu},
     task::DisabledPreemptGuard,
 };
 
 use super::Vmar;
 use crate::{
     prelude::*,
-    process::{Process, ResourceType, rlimit::RLIM_INFINITY},
+    process::{
+        Process, ResourceType,
+        rlimit::{RLIM_INFINITY, RLimit64},
+    },
 };
 
 impl Vmar {
@@ -24,71 +25,25 @@ impl Vmar {
         preempt_guard: &DisabledPreemptGuard,
         add_size: usize,
     ) -> Result<()> {
-        let add_size = add_size as isize;
+        self.add_mapping_size_with_rlimit_as(preempt_guard, add_size, None)
+    }
+
+    pub(super) fn add_mapping_size_with_rlimit_as(
+        &self,
+        preempt_guard: &DisabledPreemptGuard,
+        add_size: usize,
+        rlimit_as: Option<&RLimit64>,
+    ) -> Result<()> {
         let cur_cpu = preempt_guard.current_cpu();
 
-        let rlimit_as = get_rlimit_as();
-
-        // First, try adding directly to this CPU if the quota is sufficient.
-
-        let rlimit_this_cpu = rlimit_as_on_cpu(rlimit_as, cur_cpu);
-
-        if self
-            .mapped_vm_size
-            .get_on_cpu(cur_cpu)
-            .try_update(Ordering::Release, Ordering::Acquire, |old| {
-                if let Some(new) = old.checked_add(add_size)
-                    && new <= rlimit_this_cpu
-                {
-                    Some(new)
-                } else {
-                    None
-                }
-            })
-            .is_ok()
-        {
-            return Ok(());
+        // Borrow the live object, so changes during mapping preparation or
+        // page-table acquisition are observed at the usual admission point.
+        let rlimit_as = match rlimit_as {
+            Some(limit) => limit.get_cur(),
+            None => get_rlimit_as(),
         };
 
-        // Otherwise, add to all CPUs.
-
-        let mut remaining = add_size;
-        for cpu in all_cpus() {
-            let mut crammed = 0;
-            let quota = rlimit_as_on_cpu(rlimit_as, cpu);
-
-            if self
-                .mapped_vm_size
-                .get_on_cpu(cur_cpu)
-                .try_update(Ordering::Release, Ordering::Acquire, |old| {
-                    let new = old + remaining;
-                    if new < quota {
-                        crammed = remaining;
-                        Some(new)
-                    } else {
-                        crammed = quota - old;
-                        Some(quota)
-                    }
-                })
-                .is_ok()
-                && remaining == crammed
-            {
-                return Ok(());
-            };
-
-            remaining -= crammed;
-        }
-
-        // We failed. Revert the added values and return error.
-        debug_assert!(remaining > 0);
-        self.mapped_vm_size
-            .get_on_cpu(cur_cpu)
-            .fetch_sub(add_size - remaining, Ordering::AcqRel);
-
-        Err(Error::with_message(
-            Errno::ENOMEM,
-            "the new mapping size exceeds the limit",
-        ))
+        self.mapped_vm_size.add(cur_cpu, add_size, rlimit_as)
     }
 }
 
@@ -140,8 +95,7 @@ impl Drop for RsAsDelta<'_> {
         debug_assert!(self.as_delta <= 0);
         self.operated_vmar
             .mapped_vm_size
-            .get_on_cpu(CpuId::current_racy())
-            .fetch_add(self.as_delta, Ordering::AcqRel);
+            .subtract(CpuId::current_racy(), self.as_delta);
     }
 }
 
@@ -156,21 +110,4 @@ fn get_rlimit_as() -> u64 {
         .resource_limits()
         .get_rlimit(ResourceType::RLIMIT_AS)
         .get_cur()
-}
-
-const RLIMIT_AS_PER_CPU_INFINITY: isize = isize::MAX;
-
-fn rlimit_as_on_cpu(total_rlimit: u64, cpu: CpuId) -> isize {
-    if total_rlimit == RLIM_INFINITY || total_rlimit > RLIMIT_AS_PER_CPU_INFINITY as u64 {
-        return RLIMIT_AS_PER_CPU_INFINITY;
-    }
-
-    let num_cpus = num_cpus() as u64;
-    let val = if cpu == CpuId::bsp() {
-        total_rlimit / num_cpus + total_rlimit % num_cpus
-    } else {
-        total_rlimit / num_cpus
-    };
-
-    val as isize
 }

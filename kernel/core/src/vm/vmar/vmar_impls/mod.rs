@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod access_alien;
+#[cfg(ktest)]
+mod accounting_tests;
+mod as_accounting;
 mod fork;
 pub(super) mod map;
 pub(super) mod page_fault;
@@ -13,14 +16,14 @@ mod unmap;
 use core::{
     array,
     ops::Range,
-    sync::atomic::{AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use as_accounting::MappingSize;
 use aster_util::per_cpu_counter::PerCpuCounter;
 pub(crate) use map::OffsetType;
-use osdk_heap_allocator::{CpuLocalBox, alloc_cpu_local};
 use ostd::{
-    cpu::{CpuId, all_cpus},
+    cpu::CpuId,
     mm::{AuxPageTableMeta, PagingLevel, VmSpace, page_size_at, vm_space::CursorMut},
 };
 pub(crate) use remap::RemapOldMappingAction;
@@ -52,12 +55,8 @@ pub(crate) struct Vmar {
     vm_space: Arc<VmarSpace>,
     /// The allocator for virtual address ranges.
     pub(super) allocator: VirtualAddressAllocator,
-    /// The used quota of address space size on each CPU.
-    ///
-    /// The sum of the values on each CPU is the total number of virtual memory
-    /// bytes mapped. Values on each CPU does not have a specific meaning, but
-    /// it must not exceed the resource limit divided by the number of CPUs.
-    pub(super) mapped_vm_size: CpuLocalBox<AtomicIsize>,
+    /// Exact mapped bytes, with signed CPU-local debt for unlimited updates.
+    mapped_vm_size: MappingSize,
     /// The RSS counters.
     rss_counters: [PerCpuCounter; rs_as_delta::NUM_RSS_COUNTERS],
     /// The process VM.
@@ -66,6 +65,8 @@ pub(crate) struct Vmar {
     num_handles: AtomicUsize,
     /// Weak self-reference used by VMO reverse mappings.
     weak_self: Weak<Self>,
+    #[cfg(ktest)]
+    accounting_pause: accounting_tests::Pause,
 }
 
 impl Vmar {
@@ -75,7 +76,7 @@ impl Vmar {
     pub(super) fn new(process_vm: ProcessVm) -> Result<Arc<Self>> {
         let vm_space = Arc::new(VmSpace::<PerPtMeta>::new());
         let allocator = VirtualAddressAllocator::new()?;
-        let mapped_vm_size = alloc_cpu_local(|_| AtomicIsize::new(0))?;
+        let mapped_vm_size = MappingSize::new(0)?;
         let rss_counters = array::from_fn(|_| PerCpuCounter::new());
         let vmar = Arc::new_cyclic(move |weak_self| Vmar {
             vm_space,
@@ -85,6 +86,8 @@ impl Vmar {
             process_vm,
             num_handles: AtomicUsize::new(1),
             weak_self: weak_self.clone(),
+            #[cfg(ktest)]
+            accounting_pause: accounting_tests::Pause::new(),
         });
 
         let stack_region = vmar.process_vm.init_stack().reserved_region();
@@ -100,9 +103,7 @@ impl Vmar {
 
     /// Returns the total size of the mappings in bytes.
     pub(crate) fn get_mappings_total_size(&self) -> usize {
-        all_cpus()
-            .map(|cpu| self.mapped_vm_size.get_on_cpu(cpu).load(Ordering::Relaxed))
-            .sum::<isize>() as usize
+        self.mapped_vm_size.total()
     }
 
     /// Returns the attached `VmSpace`.
@@ -158,9 +159,12 @@ impl Vmar {
 
         for range in ranges {
             cursor.jump(range.start).unwrap();
-            while let Some(mapping) = cursor.find_next_mapped(range.end) {
-                let mapping_end = mapping.map_end();
-                if let Some((vmo, entry)) = mapping.rmap_entry_in(range)
+            while let Some((mapping_end, rmap_entry)) = cursor
+                .find_next_mapped_with(range.end, |mapping| {
+                    (mapping.map_end(), mapping.rmap_entry_in(range))
+                })
+            {
+                if let Some((vmo, entry)) = rmap_entry
                     && !entries
                         .iter()
                         .any(|(old_vmo, old_entry): &(Arc<Vmo>, RmapEntry)| {
@@ -254,6 +258,11 @@ impl Interval<Vaddr> for PteRangeMeta {
 
 ostd::check_aux_pt_meta_layout!(PerPtMeta);
 impl AuxPageTableMeta for PerPtMeta {
+    #[cfg(feature = "memory_accounting")]
+    fn allocation_snapshot(&self) -> ostd::mm::heap::accounting::AllocationSnapshot {
+        self.inner.allocation_snapshot()
+    }
+
     fn new_root_page_table() -> Self {
         PerPtMeta {
             inner: IntervalSet::new(),
@@ -298,7 +307,15 @@ impl AuxPageTableMeta for PerPtMeta {
 }
 
 impl PerPtMeta {
+    #[cfg(not(feature = "memory_accounting"))]
     const fn new() -> Self {
+        Self {
+            inner: IntervalSet::new(),
+        }
+    }
+
+    #[cfg(feature = "memory_accounting")]
+    fn new() -> Self {
         Self {
             inner: IntervalSet::new(),
         }

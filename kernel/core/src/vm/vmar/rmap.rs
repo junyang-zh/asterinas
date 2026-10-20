@@ -23,7 +23,7 @@ use ostd::{
 
 use crate::vm::vmar::{
     RssType, Vmar,
-    cursor::{CursorExt, CursorMutExt},
+    cursor::CursorMutExt,
     vmar_impls::{PteRangeMeta, RsAsDelta},
 };
 
@@ -159,8 +159,6 @@ impl Rmap {
             };
             let entries = self.entries.get(&key).unwrap();
 
-            let mut rs_as_delta = RsAsDelta::new(&vmar);
-
             for entry in entries {
                 let vmo_range =
                     entry.offset.max(offset.start)..(entry.offset + entry.size).min(offset.end);
@@ -183,33 +181,27 @@ impl Rmap {
                         addr_range,
                     });
                 };
+                let mut rs_as_delta = RsAsDelta::new(&vmar);
                 let mut num_unmapped = 0;
-                while cursor_mut
-                    .find_next_unmappable_subtree(addr_range.end)
-                    .is_some()
-                {
-                    cursor_mut.split_if_map_exceeds_range(&addr_range);
-                    num_unmapped += cursor_mut.unmap();
+                // The VMA remains valid after file-cache invalidation. Never
+                // detach a subtree: its auxiliary metadata owns those VMAs.
+                // VMO mappings contain tracked base-page RAM frames, so walk
+                // resident leaf PTEs and update each owning metadata fragment.
+                while let Some(va) = cursor_mut.find_next(addr_range.end) {
+                    let unmapped = cursor_mut.unmap();
+                    let Some(PteRangeMeta::VmMapping(mapping)) =
+                        cursor_mut.aux_meta_mut().inner.find_one_mut(&va)
+                    else {
+                        panic!("reverse-mapped RAM page has no owning mapping");
+                    };
+                    mapping.dec_frames_mapped(unmapped);
+                    num_unmapped += unmapped;
                 }
-
-                cursor_mut.jump(addr_range.start).unwrap();
-                let mapping_addr = cursor_mut
-                    .find_next_mapped(addr_range.end)
-                    .expect("reverse mapping points outside a VM mapping")
-                    .map_to_addr();
-                let Some(PteRangeMeta::VmMapping(mapping)) =
-                    cursor_mut.aux_meta_mut().inner.find_one_mut(&mapping_addr)
-                else {
-                    panic!("reverse mapping points outside a VM mapping");
-                };
-                mapping.dec_frames_mapped(num_unmapped);
 
                 rs_as_delta.add_rs(RssType::File, -(num_unmapped as isize));
                 cursor_mut.flusher().dispatch_tlb_flush();
                 cursor_mut.flusher().sync_tlb_flush();
             }
-
-            drop(rs_as_delta);
         }
 
         Ok(())

@@ -5,6 +5,21 @@
 use alloc::collections::btree_map::{BTreeMap, Cursor, CursorMut};
 use core::ops::Range;
 
+#[cfg(feature = "memory_accounting")]
+use ostd::mm::heap::accounting::AccountingAllocator as IntervalAllocator;
+#[cfg(not(feature = "memory_accounting"))]
+type IntervalMap<K, V> = BTreeMap<K, V>;
+#[cfg(feature = "memory_accounting")]
+type IntervalMap<K, V> = BTreeMap<K, V, IntervalAllocator>;
+#[cfg(not(feature = "memory_accounting"))]
+type IntervalCursor<'a, K, V> = Cursor<'a, K, V>;
+#[cfg(feature = "memory_accounting")]
+type IntervalCursor<'a, K, V> = Cursor<'a, K, V>;
+#[cfg(not(feature = "memory_accounting"))]
+type IntervalCursorMut<'a, K, V> = CursorMut<'a, K, V>;
+#[cfg(feature = "memory_accounting")]
+type IntervalCursorMut<'a, K, V> = CursorMut<'a, K, V, IntervalAllocator>;
+
 /// The interval of an item in an interval set.
 ///
 /// All items in the interval set must have a range.
@@ -23,7 +38,9 @@ where
     K: Clone + Ord,
     V: Interval<K>,
 {
-    btree: BTreeMap<K, V>,
+    btree: IntervalMap<K, V>,
+    #[cfg(feature = "memory_accounting")]
+    accounting: IntervalAllocator,
 }
 
 impl<K, V> Default for IntervalSet<K, V>
@@ -42,10 +59,22 @@ where
     V: Interval<K>,
 {
     /// Creates a new interval set.
+    #[cfg(not(feature = "memory_accounting"))]
     pub(crate) const fn new() -> Self {
         Self {
             btree: BTreeMap::new(),
         }
+    }
+
+    #[cfg(feature = "memory_accounting")]
+    pub(crate) fn new() -> Self {
+        let accounting = IntervalAllocator::new();
+        Self { btree: BTreeMap::new_in(accounting.clone()), accounting }
+    }
+
+    #[cfg(feature = "memory_accounting")]
+    pub(crate) fn allocation_snapshot(&self) -> ostd::mm::heap::accounting::AllocationSnapshot {
+        self.accounting.snapshot()
     }
 
     /// Returns the number of elements in the interval set.
@@ -84,19 +113,11 @@ where
     /// If no such item exists, returns [`None`]. Otherwise, returns the
     /// mutable reference to the item that contains the point.
     pub(super) fn find_one_mut(&mut self, point: &K) -> Option<&mut V> {
-        let mut cursor = self
-            .btree
-            .lower_bound_mut(core::ops::Bound::Excluded(point));
-        // There's only one previous element that may contain the point.
-        // If it doesn't, there's no other chances.
-        if let Some((k, v)) = cursor.peek_prev()
-            && v.range().end > *point
-        {
-            let key = k.clone();
-            return self.btree.get_mut(&key);
-        }
-
-        None
+        // Only the last interval starting at or before the point can contain it.
+        self.btree
+            .range_mut((core::ops::Bound::Unbounded, core::ops::Bound::Included(point)))
+            .next_back()
+            .and_then(|(_, value)| (value.range().end > *point).then_some(value))
     }
 
     /// Finds all interval items that intersect with the given range.
@@ -183,7 +204,7 @@ where
     K: Clone + Ord,
     V: Interval<K>,
 {
-    cursor: Cursor<'a, K, V>,
+    cursor: IntervalCursor<'a, K, V>,
     range: Range<K>,
     peeked_prev: bool,
 }
@@ -226,7 +247,7 @@ where
     K: Clone + Ord,
     V: Interval<K>,
 {
-    cursor: CursorMut<'a, K, V>,
+    cursor: IntervalCursorMut<'a, K, V>,
     range: Range<K>,
     drained_prev: bool,
 }
@@ -278,6 +299,27 @@ mod tests {
         fn range(&self) -> Range<i32> {
             self.range.clone()
         }
+    }
+
+    #[cfg(feature = "memory_accounting")]
+    #[ktest]
+    fn btree_allocation_growth_and_clear() {
+        let mut set = IntervalSet::new();
+        assert_eq!(set.allocation_snapshot().allocations, 0);
+        for index in 0..512 {
+            set.insert(TestInterval { range: index * 2..index * 2 + 1 });
+        }
+        let full = set.allocation_snapshot();
+        assert!(full.allocations > 1);
+        assert!(full.requested_bytes > 0);
+        assert!(full.charged_bytes >= full.requested_bytes);
+        for index in 0..256 { set.remove(&(index * 2)); }
+        assert!(set.allocation_snapshot().requested_bytes < full.requested_bytes);
+        set.clear();
+        let empty = set.allocation_snapshot();
+        assert_eq!(empty.allocations, 0);
+        assert_eq!(empty.requested_bytes, 0);
+        assert_eq!(empty.charged_bytes, 0);
     }
 
     #[ktest]

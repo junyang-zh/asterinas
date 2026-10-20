@@ -40,18 +40,17 @@ impl Vmar {
         let vm_space = self.vm_space();
         let mut cursor = vm_space.cursor_mut(&preempt_guard, &range).unwrap();
 
-        while let Some(vm_mapping) = cursor.find_next_mapped(range.end) {
-            let vm_mapping_range = vm_mapping.range();
-
+        while let Some((vm_mapping_range, mapping_perms)) =
+            cursor.find_next_mapped_with(range.end, |mapping| (mapping.range(), mapping.perms()))
+        {
             if last_protected_addr < vm_mapping_range.start {
-                return_errno_with_message!(
-                    Errno::ENOMEM,
-                    "protect: the range covers unmapped pages"
-                );
+                // Earlier mappings may already have lost permissions. Reach
+                // the common synchronization before reporting this hole.
+                break;
             }
 
             // Skip if no actions needed.
-            if perms == vm_mapping.perms() & VmPerms::ALL_PERMS {
+            if perms == mapping_perms & VmPerms::ALL_PERMS {
                 if vm_mapping_range.end >= range.end {
                     last_protected_addr = range.end;
                     break;
@@ -80,7 +79,13 @@ impl Vmar {
             let taken = split_and_insert_rest(&mut cursor, vm_mapping, intersected_range.clone());
             let next_address = taken.range().end;
 
+            // Protect walks resident PTEs and can finish at another node or
+            // level. Reinsert the mapping into its original metadata owner,
+            // not the node where that PTE traversal happened to finish.
+            let owning_level = cursor.level();
             let taken = taken.protect(&mut cursor, new_perms);
+            cursor.jump(intersected_range.start).unwrap();
+            cursor.adjust_level(owning_level);
             cursor.aux_meta_mut().insert_try_merge(taken);
 
             last_protected_addr = next_address;

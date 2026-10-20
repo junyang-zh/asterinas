@@ -28,8 +28,20 @@ use crate::{
     task::{atomic_mode::AsAtomicModeGuard, disable_preempt},
 };
 
+#[cfg(feature = "memory_accounting")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryAccounting {
+    pub pt_pages: usize,
+    pub node_state_requested_bytes: usize,
+    pub node_state_charged_bytes: usize,
+    pub aux_allocations: usize,
+    pub aux_requested_bytes: usize,
+    pub aux_charged_bytes: usize,
+}
+
 mod cursor;
 mod node;
+mod zeroed_pt_pool;
 
 pub(crate) use cursor::{Cursor, CursorMut, PageTableFrag};
 pub use node::PageTableFrameMeta;
@@ -175,6 +187,12 @@ pub(crate) unsafe trait PageTableConfig: Debug + Send + Sync + 'static {
 /// for page table state. The auxiliary metadata will be stored in each page
 /// table frame's metadata.
 pub trait AuxPageTableMeta: AuxPtMetaLayoutChecked + Debug + Send + Sync + 'static {
+    /// Live auxiliary allocations, excluding embedded state and diagnostic trackers.
+    #[cfg(feature = "memory_accounting")]
+    fn allocation_snapshot(&self) -> crate::mm::heap::accounting::AllocationSnapshot {
+        Default::default()
+    }
+
     /// The callback to allocate a new root page table.
     fn new_root_page_table() -> Self;
 
@@ -482,6 +500,15 @@ impl<C: PageTableConfig> PageTable<C> {
         unsafe { self.root.first_activate() };
     }
 
+    /// Account for the live rooted tree without creating page tables.
+    #[cfg(feature = "memory_accounting")]
+    pub(crate) fn memory_accounting(&self) -> MemoryAccounting {
+        let guard = disable_preempt();
+        let mut result = MemoryAccounting::default();
+        self.root.borrow().snapshot_memory(&guard, &mut result, true);
+        result
+    }
+
     /// Returns the physical address of the root page table.
     ///
     /// Obtaining the physical address of the root page table is safe, however, using it or
@@ -707,4 +734,26 @@ unsafe fn store_pte<E: PteTrait>(ptr: *mut E, new_val: E, ordering: Ordering) {
     // SAFETY: The safety is upheld by the caller.
     let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
     atomic.store(new_raw, ordering)
+}
+
+#[cfg(all(ktest, feature = "memory_accounting"))]
+#[crate::prelude::ktest]
+fn memory_snapshot_counts_existing_nodes_without_growing_tree() {
+    use crate::mm::{FrameAllocOptions, PAGE_SIZE, page_prop::{CachePolicy, PageFlags}, vm_space::VmItem};
+    let table = PageTable::<UserPtConfig>::empty();
+    assert_eq!(table.memory_accounting().pt_pages, 1);
+    let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+    let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback);
+    {
+        let guard = disable_preempt();
+        // SAFETY: The fresh page table has no mappings, and this frame is owned.
+        unsafe { table.cursor_mut(&guard, &(PAGE_SIZE..2 * PAGE_SIZE)).unwrap()
+            .map(VmItem::new_tracked(frame.into(), prop)); }
+    }
+    let first = table.memory_accounting();
+    let second = table.memory_accounting();
+    assert_eq!(first.pt_pages, <UserPtConfig as PagingConstsTrait>::NR_LEVELS as usize);
+    assert_eq!(second.pt_pages, first.pt_pages);
+    assert_eq!(second.node_state_charged_bytes, first.node_state_charged_bytes);
+    assert_eq!(first.aux_charged_bytes, 0);
 }

@@ -228,3 +228,205 @@ pub(super) fn new_resource_limits_for_init() -> ResourceLimits {
         .set_raw_rlimit_unchecked(raw_rlimit);
     resource_limits
 }
+
+#[cfg(ktest)]
+mod rlimit_borrow_test {
+    use core::num::NonZeroUsize;
+
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::{
+        fs::pseudofs::SockFs,
+        process::{Process, ProcessVm},
+        vm::{
+            page_cache::VmoOptions,
+            perms::VmPerms,
+            vmar::{OffsetType, Vmar, VmarHandle},
+        },
+    };
+
+    const ADDR: usize = 0x200_000;
+
+    fn new_vmar() -> VmarHandle {
+        crate::time::clocks::init_for_ktest();
+        crate::util::random::init();
+        assert!(Process::current().is_none());
+        VmarHandle::new(ProcessVm::new(SockFs::new_path())).unwrap()
+    }
+
+    fn set_cur(limit: &RLimit64, cur: usize) {
+        limit.set_raw_rlimit_unchecked(RawRLimit64 {
+            cur: cur as u64,
+            max: RLIM_INFINITY,
+        });
+    }
+
+    fn assert_present(vmar: &Vmar, addr: usize, size: usize) {
+        let mut count = 0;
+        vmar.for_each_mapping(addr..addr + size, true, |_| count += 1)
+            .unwrap();
+        assert!(count > 0);
+    }
+
+    fn assert_absent(vmar: &Vmar, addr: usize, size: usize) {
+        let mut count = 0;
+        vmar.for_each_mapping(addr..addr + size, false, |_| count += 1)
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[ktest]
+    fn borrowed_limit_lowered_at_admission_single_cpu() {
+        // Exercise both anonymous and VMO-backed actual mapping paths. The
+        // companion POSIX probe covers file descriptors and syscall selection.
+        for vmo_backed in [false, true] {
+            let vmar = new_vmar();
+            let base_size = vmar.get_mappings_total_size();
+            let limit = RLimit64::new((base_size + PAGE_SIZE) as u64, RLIM_INFINITY);
+            let borrowed_limit = &limit;
+            let lower_limit = || set_cur(&limit, base_size);
+            let mut options = vmar
+                .new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+                .unwrap()
+                .offset(ADDR, OffsetType::FixedNoReplace)
+                .before_admission(&lower_limit);
+            if vmo_backed {
+                options = options.vmo(VmoOptions::new(PAGE_SIZE).alloc().unwrap());
+            }
+            assert_eq!(
+                options
+                    .build_with_rlimit_as(borrowed_limit)
+                    .unwrap_err()
+                    .error(),
+                Errno::ENOMEM
+            );
+            assert_eq!(vmar.get_mappings_total_size(), base_size);
+            assert_absent(&vmar, ADDR, PAGE_SIZE);
+        }
+    }
+
+    #[ktest]
+    fn borrowed_limit_raised_at_admission_single_cpu() {
+        for vmo_backed in [false, true] {
+            let vmar = new_vmar();
+            let base_size = vmar.get_mappings_total_size();
+            let limit = RLimit64::new(base_size as u64, RLIM_INFINITY);
+            let borrowed_limit = &limit;
+            let raise_limit = || set_cur(&limit, base_size + PAGE_SIZE);
+            let mut options = vmar
+                .new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+                .unwrap()
+                .offset(ADDR, OffsetType::FixedNoReplace)
+                .before_admission(&raise_limit);
+            if vmo_backed {
+                options = options.vmo(VmoOptions::new(PAGE_SIZE).alloc().unwrap());
+            }
+            assert_eq!(options.build_with_rlimit_as(borrowed_limit).unwrap(), ADDR);
+            assert_present(&vmar, ADDR, PAGE_SIZE);
+            assert_eq!(vmar.get_mappings_total_size(), base_size + PAGE_SIZE);
+            vmar.remove_mapping(ADDR..ADDR + PAGE_SIZE).unwrap();
+            assert_eq!(vmar.get_mappings_total_size(), base_size);
+        }
+    }
+
+    #[ktest]
+    fn borrowed_limit_fixed_replacement_accounting_single_cpu() {
+        let vmar = new_vmar();
+        let base_size = vmar.get_mappings_total_size();
+        let limit = RLimit64::new((base_size + PAGE_SIZE) as u64, RLIM_INFINITY);
+        for _ in 0..2 {
+            assert_eq!(
+                vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+                    .unwrap()
+                    .offset(ADDR, OffsetType::Fixed)
+                    .build_with_rlimit_as(&limit)
+                    .unwrap(),
+                ADDR
+            );
+            assert_present(&vmar, ADDR, PAGE_SIZE);
+            assert_eq!(vmar.get_mappings_total_size(), base_size + PAGE_SIZE);
+        }
+        // Replacement removes the old mapping before admission, including on
+        // failure. Preserve the baseline's resulting hole and accounting.
+        set_cur(&limit, base_size);
+        assert_eq!(
+            vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+                .unwrap()
+                .offset(ADDR, OffsetType::Fixed)
+                .build_with_rlimit_as(&limit)
+                .unwrap_err()
+                .error(),
+            Errno::ENOMEM
+        );
+        assert_absent(&vmar, ADDR, PAGE_SIZE);
+        assert_eq!(vmar.get_mappings_total_size(), base_size);
+
+        // A successful retry detects leaked quota from the failed admission.
+        set_cur(&limit, base_size + PAGE_SIZE);
+        vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+            .unwrap()
+            .offset(ADDR, OffsetType::FixedNoReplace)
+            .build_with_rlimit_as(&limit)
+            .unwrap();
+        vmar.remove_mapping(ADDR..ADDR + PAGE_SIZE).unwrap();
+        assert_eq!(vmar.get_mappings_total_size(), base_size);
+    }
+
+    #[ktest]
+    fn borrowed_limit_selected_per_call_on_shared_vmar_single_cpu() {
+        let vmar = new_vmar();
+        let shared_vmar = vmar.clone_handle();
+        let base_size = vmar.get_mappings_total_size();
+        let restrictive = RLimit64::new(base_size as u64, RLIM_INFINITY);
+        let permissive = RLimit64::new((base_size + PAGE_SIZE) as u64, RLIM_INFINITY);
+        assert_eq!(
+            vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+                .unwrap()
+                .offset(ADDR, OffsetType::FixedNoReplace)
+                .build_with_rlimit_as(&restrictive)
+                .unwrap_err()
+                .error(),
+            Errno::ENOMEM
+        );
+        shared_vmar
+            .new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+            .unwrap()
+            .offset(ADDR, OffsetType::FixedNoReplace)
+            .build_with_rlimit_as(&permissive)
+            .unwrap();
+        assert_present(&vmar, ADDR, PAGE_SIZE);
+        assert_eq!(vmar.get_mappings_total_size(), base_size + PAGE_SIZE);
+        vmar.remove_mapping(ADDR..ADDR + PAGE_SIZE).unwrap();
+        assert_eq!(shared_vmar.get_mappings_total_size(), base_size);
+    }
+
+    #[ktest]
+    fn default_build_in_kernel_context_uses_infinity() {
+        let vmar = new_vmar();
+        let base_size = vmar.get_mappings_total_size();
+        let addr = vmar
+            .new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_present(&vmar, addr, PAGE_SIZE);
+        assert_eq!(vmar.get_mappings_total_size(), base_size + PAGE_SIZE);
+        vmar.remove_mapping(addr..addr + PAGE_SIZE).unwrap();
+        assert_eq!(vmar.get_mappings_total_size(), base_size);
+    }
+}
+
+#[cfg(ktest)]
+impl RLimit64 {
+    pub(crate) fn new_for_accounting_test(cur: u64) -> Self {
+        Self::new(cur, RLIM_INFINITY)
+    }
+
+    pub(crate) fn set_cur_for_accounting_test(&self, cur: u64) {
+        self.set_raw_rlimit_unchecked(RawRLimit64 {
+            cur,
+            max: RLIM_INFINITY,
+        });
+    }
+}

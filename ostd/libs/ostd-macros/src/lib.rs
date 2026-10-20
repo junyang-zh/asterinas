@@ -116,6 +116,34 @@ pub fn test_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Registers a bootstrap for the kernel test task before any task is spawned.
+///
+/// The callback receives the unchanged test runner entry point. It must enqueue
+/// that entry point in an appropriate task context and then return to OSTD.
+/// Only one bootstrap may be linked into a test kernel. Without one, the runner
+/// uses its original OSTD task and default scheduler.
+#[doc(hidden)]
+#[proc_macro_attribute]
+pub fn test_bootstrap(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let bootstrap_fn = parse_macro_input!(item as ItemFn);
+    let bootstrap_fn_name = &bootstrap_fn.sig.ident;
+
+    quote!(
+        #[cfg(ktest)]
+        // SAFETY: The macro registers the sole strong override of OSTD's weak
+        // test-only bootstrap symbol with the exact required Rust signature.
+        #[unsafe(no_mangle)]
+        extern "Rust" fn __ostd_ktest_bootstrap(run_tests: fn()) {
+            let bootstrap: fn(fn()) = #bootstrap_fn_name;
+            bootstrap(run_tests);
+        }
+
+        #[cfg(ktest)]
+        #bootstrap_fn
+    )
+    .into()
+}
+
 fn ostd_main_body(main_fn_name: &Ident) -> proc_macro2::TokenStream {
     quote! {
         let _: () = #main_fn_name();

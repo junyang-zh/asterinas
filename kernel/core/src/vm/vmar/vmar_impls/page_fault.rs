@@ -6,10 +6,13 @@ use core::{cmp::min, ops::Range};
 
 use align_ext::AlignExt;
 use ostd::{
+    cpu::PinCurrentCpu,
+    cpu_local,
     mm::{
         CachePolicy, Frame, FrameAllocOptions, PageFlags, PageProperty, UFrame,
         io::util::HasVmReaderWriter, page_size_at, tlb::TlbFlushOp, vm_space::VmQueriedItem,
     },
+    sync::SpinLock,
     task::disable_preempt,
 };
 
@@ -51,6 +54,53 @@ struct PendingDeviceFault {
     result: Result<()>,
 }
 
+// Keep an unused zeroed fault frame on each CPU. Allocation and zeroing occur
+// before cursor acquisition; only copying a COW page occurs under its PT lock.
+cpu_local! {
+    static FAULT_FRAME: SpinLock<Option<Frame<()>>> = SpinLock::new(None);
+}
+
+struct PreparedFrame(Option<Frame<()>>);
+
+impl PreparedFrame {
+    fn new() -> Self {
+        let guard = disable_preempt();
+        Self(
+            FAULT_FRAME
+                .get_on_cpu(guard.current_cpu())
+                .disable_irq()
+                .lock()
+                .take(),
+        )
+    }
+
+    fn replenish(&mut self) -> Result<()> {
+        if self.0.is_none() {
+            self.0 = Some(FrameAllocOptions::new().alloc_frame()?);
+        }
+        Ok(())
+    }
+
+    fn take(&mut self) -> Frame<()> {
+        self.0.take().expect("fault frame prepared outside PT lock")
+    }
+}
+
+impl Drop for PreparedFrame {
+    fn drop(&mut self) {
+        if let Some(frame) = self.0.take() {
+            let guard = disable_preempt();
+            let mut slot = FAULT_FRAME
+                .get_on_cpu(guard.current_cpu())
+                .disable_irq()
+                .lock();
+            if slot.is_none() {
+                *slot = Some(frame);
+            }
+        }
+    }
+}
+
 impl Vmar {
     /// Handles a page fault.
     pub(crate) fn handle_page_fault(&self, page_fault_info: &PageFaultInfo) -> Result<()> {
@@ -73,13 +123,19 @@ impl Vmar {
         // Retry is needed if the page fault needs I/O after we locked the page table.
         // Here we declare the state visible across retries. Take care of race
         // conditions when accessing such state.
-        let mut rs_as_delta = RsAsDelta::new(self);
         let mut range_handled = 0..0;
         let mut device_fault = None;
+        let mut prepared = PreparedFrame::new();
 
         'retry: loop {
+            prepared.replenish()?;
             let preempt_guard = disable_preempt();
-            let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range_to_lock)?;
+            // Faults insert base pages only. Keep the whole fault-around range,
+            // but allow disjoint existing leaf tables to be locked independently.
+            let mut cursor = self
+                .vm_space
+                .cursor_mut_base_pages(&preempt_guard, &range_to_lock)?;
+            let mut rs_as_delta = RsAsDelta::new(self);
 
             cursor.jump(address.align_down(PAGE_SIZE)).unwrap();
             while cursor.push_level_if_exists().is_some() {}
@@ -105,17 +161,25 @@ impl Vmar {
             }
 
             for va in (range_handled.end..range_to_handle.end).step_by(PAGE_SIZE) {
+                if prepared.0.is_none() {
+                    drop(rs_as_delta);
+                    drop(cursor);
+                    drop(preempt_guard);
+                    continue 'retry;
+                }
                 let res = handle_one_page(
                     &mut cursor,
                     va,
                     page_fault_info,
                     &mut rs_as_delta,
                     &mut device_fault,
+                    &mut prepared,
                 );
 
                 match res {
                     Ok(_) => {}
                     Err(PfError::Retry { va, how_to }) => {
+                        drop(rs_as_delta);
                         drop(cursor);
                         drop(preempt_guard);
                         let err = how_to.commit();
@@ -131,6 +195,7 @@ impl Vmar {
                         continue 'retry;
                     }
                     Err(PfError::Device { va, range, object }) => {
+                        drop(rs_as_delta);
                         drop(cursor);
                         drop(preempt_guard);
                         // Device callbacks may take sleeping locks. Revalidate
@@ -248,6 +313,7 @@ fn handle_one_page(
     page_fault_info: &PageFaultInfo,
     rs_as_delta: &mut RsAsDelta,
     device_fault: &mut Option<PendingDeviceFault>,
+    prepared: &mut PreparedFrame,
 ) -> core::result::Result<(), PfError> {
     cursor.jump(va).unwrap();
     while cursor.push_level_if_exists().is_some() {}
@@ -305,6 +371,11 @@ fn handle_one_page(
                 object: object.clone(),
             });
         };
+        // Acquisition descends through absent entries to L1. A huge PTE can
+        // stop it earlier, but then this entire aligned fault range is mapped
+        // and map_device_pages skips it. Empty device slots are therefore L1;
+        // its per-slot I/O clipping inserts only base pages with this cursor.
+        debug_assert!(cursor.level() == 1 || !matches!(cursor.query(), VmQueriedItem::None));
         let count = map_device_pages(cursor, &range, perms, pending.pages);
         rs_as_delta.add_rs(MapHandle::DEVICE_RSS_TYPE, count as isize);
         return pending.result.map_err(PfError::HardError);
@@ -364,7 +435,7 @@ fn handle_one_page(
                     .flusher()
                     .issue_tlb_flush(TlbFlushOp::for_range(cur_va_range));
             } else {
-                let new_frame = duplicate_frame(&frame).map_err(PfError::HardError)?;
+                let new_frame = duplicate_frame(&frame, prepared);
                 prop.flags |= new_flags;
                 let _ = cursor.unmap();
                 cursor.map(new_frame.into(), prop);
@@ -386,25 +457,26 @@ fn handle_one_page(
                 unreachable!("`find_one` does not stop at `VmMapping`");
             };
             let page_aligned_addr = va.align_down(PAGE_SIZE);
-            let (frame, is_readonly) = match prepare_page(vm_mapping, page_aligned_addr, is_write) {
-                Ok((frame, is_readonly)) => (frame, is_readonly),
-                Err(VmoCommitError::Err(e)) => return Err(PfError::HardError(e)),
-                Err(
-                    VmoCommitError::NeedIo {
-                        index: vmo_page_index,
+            let (frame, is_readonly) =
+                match prepare_page(vm_mapping, page_aligned_addr, is_write, prepared) {
+                    Ok((frame, is_readonly)) => (frame, is_readonly),
+                    Err(VmoCommitError::Err(e)) => return Err(PfError::HardError(e)),
+                    Err(
+                        VmoCommitError::NeedIo {
+                            index: vmo_page_index,
+                        }
+                        | VmoCommitError::WaitUntilInit {
+                            index: vmo_page_index,
+                            ..
+                        },
+                    ) => {
+                        let how_to = vm_mapping
+                            .vmo()
+                            .unwrap()
+                            .dup_commit(vmo_page_index, vmo_map_mode(vm_mapping, is_write));
+                        return Err(PfError::Retry { va, how_to });
                     }
-                    | VmoCommitError::WaitUntilInit {
-                        index: vmo_page_index,
-                        ..
-                    },
-                ) => {
-                    let how_to = vm_mapping
-                        .vmo()
-                        .unwrap()
-                        .dup_commit(vmo_page_index, vmo_map_mode(vm_mapping, is_write));
-                    return Err(PfError::Retry { va, how_to });
-                }
-            };
+                };
 
             let vm_perms = {
                 let mut perms = vm_mapping.perms();
@@ -441,6 +513,7 @@ fn prepare_page(
     vm_mapping: &VmMapping,
     page_aligned_addr: Vaddr,
     write: bool,
+    prepared: &mut PreparedFrame,
 ) -> core::result::Result<(UFrame, bool), VmoCommitError> {
     let mut is_readonly = false;
 
@@ -448,7 +521,7 @@ fn prepare_page(
         MappedMemory::Vmo(vmo) => vmo,
         MappedMemory::Anonymous => {
             // Anonymous mapping. Allocate a new frame.
-            return Ok((FrameAllocOptions::new().alloc_frame()?.into(), is_readonly));
+            return Ok((prepared.take().into(), is_readonly));
         }
         MappedMemory::Device(_) => {
             // Device memory is populated when the memory mapping is created.
@@ -462,18 +535,13 @@ fn prepare_page(
     let page_offset = page_aligned_addr - vm_mapping.map_to_addr();
     if !vm_mapping.is_shared() && vmo.valid_size().is_none_or(|s| page_offset >= s) {
         // The page index is outside the VMO. This is only allowed in private mapping.
-        return Ok((FrameAllocOptions::new().alloc_frame()?.into(), is_readonly));
+        return Ok((prepared.take().into(), is_readonly));
     }
 
     let (page, mode) = vmo.get_committed_frame(page_offset, vmo_map_mode(vm_mapping, write))?;
     if !vm_mapping.is_shared() && write {
         // Write access to private VMO-backed mapping. Performs COW directly.
-        Ok((
-            duplicate_frame(&page.into())
-                .map_err(VmoCommitError::Err)?
-                .into(),
-            is_readonly,
-        ))
+        Ok((duplicate_frame(&page.into(), prepared).into(), is_readonly))
     } else {
         // Operations to shared mapping or read access to private VMO-backed mapping.
         // If read access to private VMO-backed mapping triggers a page fault,
@@ -494,8 +562,218 @@ fn vmo_map_mode(vm_mapping: &VmMapping, is_write: bool) -> VmoMapMode {
     }
 }
 
-fn duplicate_frame(src: &UFrame) -> Result<Frame<()>> {
-    let new_frame = FrameAllocOptions::new().zeroed(false).alloc_frame()?;
+fn duplicate_frame(src: &UFrame, prepared: &mut PreparedFrame) -> Frame<()> {
+    let new_frame = prepared.take();
     new_frame.writer().write(&mut src.reader());
-    Ok(new_frame)
+    new_frame
+}
+
+#[cfg(ktest)]
+mod test {
+    use core::num::NonZeroUsize;
+
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::{
+        fs::pseudofs::SockFs,
+        process::ProcessVm,
+        vm::vmar::{
+            VmarHandle,
+            vmar_impls::{OffsetType, RssType},
+        },
+    };
+
+    fn new_vmar() -> VmarHandle {
+        crate::time::clocks::init_for_ktest();
+        crate::util::random::init();
+        VmarHandle::new(ProcessVm::new(SockFs::new_path())).unwrap()
+    }
+
+    fn map_anon(vmar: &Vmar, range: Range<Vaddr>, perms: VmPerms) {
+        assert_eq!(
+            vmar.new_map(NonZeroUsize::new(range.len()).unwrap(), perms)
+                .unwrap()
+                .offset(range.start, OffsetType::FixedNoReplace)
+                .build()
+                .unwrap(),
+            range.start
+        );
+    }
+
+    /// Exercise actual metadata delegation, including a missing intermediate PT.
+    #[ktest]
+    fn first_fault_delegates_mapping_and_preserves_outside_fragments() {
+        for owner_level in [2, 3] {
+            let vmar = new_vmar();
+            let unit = page_size_at(owner_level);
+            let range = unit..4 * unit;
+            let fault_addr = 2 * unit;
+            let perms = VmPerms::READ | VmPerms::WRITE;
+            map_anon(&vmar, range.clone(), perms);
+            {
+                let guard = disable_preempt();
+                let mut cursor = vmar.vm_space.cursor_mut(&guard, &range).unwrap();
+                assert_eq!(cursor.level(), owner_level);
+                let Some(PteRangeMeta::VmMapping(mapping)) =
+                    cursor.aux_meta().inner.find_one(&fault_addr)
+                else {
+                    panic!("unfaulted mapping must be owned by the parent");
+                };
+                assert_eq!(mapping.range(), range);
+                assert_eq!(mapping.frames_mapped(), Some(0));
+                cursor.jump(fault_addr).unwrap();
+                assert!(matches!(cursor.query(), VmQueriedItem::None));
+            }
+
+            vmar.handle_page_fault(&PageFaultInfo::new(fault_addr, VmPerms::WRITE))
+                .unwrap();
+            assert_eq!(vmar.get_rss_counter(RssType::Anon), 1);
+            {
+                let guard = disable_preempt();
+                let mut cursor = vmar.vm_space.cursor_mut(&guard, &range).unwrap();
+                assert!(
+                    matches!(cursor.aux_meta().inner.find_one(&fault_addr), Some(PteRangeMeta::ChildPt(child)) if *child == (2 * unit..3 * unit))
+                );
+                for outside in [unit..2 * unit, 3 * unit..4 * unit] {
+                    let Some(PteRangeMeta::VmMapping(mapping)) =
+                        cursor.aux_meta().inner.find_one(&outside.start)
+                    else {
+                        panic!("outside mapping fragment lost during delegation");
+                    };
+                    assert_eq!(mapping.range(), outside);
+                    assert_eq!(mapping.frames_mapped(), Some(0));
+                    assert!(mapping.perms().contains(perms));
+                    assert!(matches!(mapping.mapped_mem(), MappedMemory::Anonymous));
+                }
+                cursor.jump(fault_addr).unwrap();
+                while cursor.push_level_if_exists().is_some() {}
+                assert_eq!(cursor.level(), 1);
+                let Some(PteRangeMeta::VmMapping(mapping)) =
+                    cursor.aux_meta().inner.find_one(&fault_addr)
+                else {
+                    panic!("faulted leaf must own the delegated mapping");
+                };
+                assert_eq!(mapping.range(), fault_addr..fault_addr + page_size_at(2));
+                assert_eq!(mapping.frames_mapped(), Some(1));
+                assert!(mapping.perms().contains(perms));
+                assert!(matches!(mapping.mapped_mem(), MappedMemory::Anonymous));
+                assert!(
+                    matches!(cursor.query(), VmQueriedItem::MappedRam { prop, .. } if prop.flags.contains(PageFlags::RW | PageFlags::ACCESSED | PageFlags::DIRTY))
+                );
+            }
+        }
+    }
+
+    #[ktest]
+    fn fault_cursor_respects_adjacent_permissions_across_leaf_boundary() {
+        let vmar = new_vmar();
+        let boundary = 2 * page_size_at(2);
+        let left = boundary - PAGE_SIZE;
+        map_anon(&vmar, left..boundary, VmPerms::READ | VmPerms::WRITE);
+        map_anon(&vmar, boundary..boundary + PAGE_SIZE, VmPerms::READ);
+        vmar.handle_page_fault(&PageFaultInfo::new(left, VmPerms::WRITE))
+            .unwrap();
+        assert!(
+            vmar.handle_page_fault(&PageFaultInfo::new(boundary, VmPerms::WRITE))
+                .is_err()
+        );
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 1);
+        vmar.handle_page_fault(&PageFaultInfo::new(boundary, VmPerms::READ))
+            .unwrap();
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 2);
+        let guard = disable_preempt();
+        let mut cursor = vmar
+            .vm_space
+            .cursor_mut_base_pages(&guard, &(boundary..boundary + page_size_at(2)))
+            .unwrap();
+        assert_eq!(cursor.guard_level(), 1);
+        assert!(
+            matches!(cursor.query(), VmQueriedItem::MappedRam { prop, .. } if prop.flags.contains(PageFlags::R) && !prop.flags.contains(PageFlags::W))
+        );
+    }
+
+    #[ktest]
+    fn fault_cursor_preserves_forced_permission_rules() {
+        let vmar = new_vmar();
+        let addr = page_size_at(2);
+        map_anon(&vmar, addr..addr + PAGE_SIZE, VmPerms::empty());
+        assert!(
+            vmar.handle_page_fault(&PageFaultInfo::new(addr, VmPerms::READ))
+                .is_err()
+        );
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+        vmar.handle_page_fault(&PageFaultInfo::new(addr, VmPerms::READ).force())
+            .unwrap();
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 1);
+        let guard = disable_preempt();
+        let mut cursor = vmar
+            .vm_space
+            .cursor_mut_base_pages(&guard, &(addr..addr + page_size_at(2)))
+            .unwrap();
+        assert!(
+            matches!(cursor.query(), VmQueriedItem::MappedRam { prop, .. } if !prop.flags.intersects(PageFlags::RW))
+        );
+    }
+
+    #[derive(Debug)]
+    struct FaultDevice;
+
+    impl MappedObject for FaultDevice {
+        fn dup_at_offset(&self, _offset: usize) -> Box<dyn MappedObject> {
+            Box::new(Self)
+        }
+    }
+
+    #[ktest]
+    fn device_fault_fallback_maps_iomem_as_base_pages() {
+        use ostd::io::IoMem;
+
+        use crate::vm::vmar::vmar_impls::{
+            VmarSpace,
+            map::{MmapMode, map_to_page_table},
+        };
+
+        let space = VmarSpace::new();
+        let size = page_size_at(2);
+        let range = size..2 * size;
+        let perms = VmPerms::READ | VmPerms::WRITE;
+        let mapping = VmMapping::new(
+            NonZeroUsize::new(size).unwrap(),
+            range.start,
+            MappedMemory::Device(Arc::new(FaultDevice)),
+            None,
+            MmapMode::Shared,
+            false,
+            perms,
+        );
+        let guard = disable_preempt();
+        {
+            let mut cursor = space.cursor_mut(&guard, &range).unwrap();
+            map_to_page_table(&mut cursor, mapping);
+        }
+        // This is the cursor and helper used after the device callback retries.
+        let mut cursor = space.cursor_mut_base_pages(&guard, &range).unwrap();
+        assert_eq!(cursor.guard_level(), 1);
+        const IO_START: usize = 0x300_000_000_000;
+        let io_mem = IoMem::acquire(IO_START..IO_START + size).unwrap();
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let mut pages = Vec::new();
+        let mut handle = MapHandle::new(size, &mut pages);
+        handle.map_frame(0, frame.into());
+        handle.map_iomem(PAGE_SIZE, io_mem.slice(PAGE_SIZE..size));
+        assert_eq!(map_device_pages(&mut cursor, &range, perms, pages), 1);
+        for offset in (PAGE_SIZE..size).step_by(PAGE_SIZE) {
+            cursor.jump(range.start + offset).unwrap();
+            assert!(
+                matches!(cursor.query(), VmQueriedItem::MappedIoMem { paddr, level: 1, prop } if paddr == IO_START + offset && prop.flags.contains(PageFlags::RW))
+            );
+        }
+        let Some(PteRangeMeta::VmMapping(mapping)) = cursor.aux_meta().inner.find_one(&range.start)
+        else {
+            panic!("device mapping must remain owned by the leaf");
+        };
+        assert_eq!(mapping.frames_mapped(), Some(1));
+        assert_eq!(mapping.range(), range);
+    }
 }

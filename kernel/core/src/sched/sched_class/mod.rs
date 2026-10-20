@@ -5,7 +5,11 @@
 #![warn(unused)]
 
 use alloc::{boxed::Box, sync::Arc};
-use core::{fmt, ops::Bound, sync::atomic::Ordering};
+use core::{
+    fmt,
+    ops::Bound,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use ostd::{
     arch::read_tsc as sched_clock,
@@ -21,6 +25,7 @@ use ostd::{
     },
     util::id_set::Id,
 };
+use spin::Once;
 
 use super::{
     nice::Nice,
@@ -44,8 +49,79 @@ pub(crate) use self::{
 
 type SchedEntity = (Arc<Task>, Arc<Thread>);
 
+static CLASS_SCHEDULER: Once<&'static ClassScheduler> = Once::new();
+
+/// Attempts one fair-task migration from an idle CPU. The two runqueue locks
+/// are acquired in ascending CPU-ID order, and only with try_lock.
+pub(crate) fn steal_a_task() -> bool {
+    let Some(scheduler) = CLASS_SCHEDULER.get() else {
+        return false;
+    };
+    let guard = disable_local();
+    let cpu = guard.current_cpu();
+    // Idle polling must not scan all CPUs on every iteration. Rotate through a
+    // bounded window so every donor is eventually sampled, even on large hosts.
+    ostd::cpu_local! {
+        static NEXT_DONOR: AtomicU64 = AtomicU64::new(0);
+    }
+    let total = ostd::cpu::num_cpus();
+    let start = NEXT_DONOR.get_on_cpu(cpu).fetch_add(16, Ordering::Relaxed) as usize;
+    let Some(donor) = (0..total.min(16))
+        .map(|i| CpuId::new(((start + i) % total) as u32))
+        .filter(|other| *other != cpu)
+        .max_by_key(|other| scheduler.loads[other.as_usize()].load(Ordering::Relaxed) >> 1)
+    else {
+        return false;
+    };
+    if scheduler.loads[donor.as_usize()].load(Ordering::Relaxed) >> 1 == 0 {
+        return false;
+    }
+    let (first, second) = if cpu.as_usize() < donor.as_usize() {
+        (cpu, donor)
+    } else {
+        (donor, cpu)
+    };
+    let Some(mut first_rq) = scheduler.rqs[first.as_usize()].try_lock() else {
+        return false;
+    };
+    let Some(mut second_rq) = scheduler.rqs[second.as_usize()].try_lock() else {
+        return false;
+    };
+    let (local, remote) = if first == cpu {
+        (&mut *first_rq, &mut *second_rq)
+    } else {
+        (&mut *second_rq, &mut *first_rq)
+    };
+    if local.load_stats().queue_len != 0 || !local.load_stats().is_idle {
+        return false;
+    }
+    // Stop/real-time/idle classes are not migratable through this path.
+    let Some(task) = remote.fair.pick_next() else {
+        return false;
+    };
+    let thread = task.as_thread().unwrap().clone();
+    if !thread
+        .atomic_cpu_affinity()
+        .load(Ordering::Relaxed)
+        .contains(cpu)
+    {
+        remote.fair.enqueue(task, None);
+        scheduler.publish_load(donor, remote);
+        return false;
+    }
+    debug_assert_eq!(task.cpu().get(), Some(donor));
+    task.cpu().set_anyway(cpu);
+    thread.sched_attr().set_last_cpu(cpu);
+    local.enqueue_entity((task, thread), None);
+    scheduler.publish_load(donor, remote);
+    scheduler.publish_load(cpu, local);
+    true
+}
+
 pub(crate) fn init() {
     let scheduler = Box::leak(Box::new(ClassScheduler::new()));
+
+    CLASS_SCHEDULER.call_once(|| &*scheduler);
 
     // Inject the scheduler into the ostd for actual scheduling work.
     inject_scheduler(scheduler);
@@ -71,6 +147,18 @@ pub(crate) struct ClassScheduler {
     /// the runqueues may be accessed in both the task and interrupt context (L1 and L2).
     rqs: Box<[SpinLock<PerCpuClassRqSet, LocalIrqDisabled>]>,
     last_chosen_cpu: AtomicCpuId,
+    loads: Box<[CpuLoad]>,
+}
+
+// Each CPU publishes only its own line; adjacent CPUs must not false-share.
+#[repr(align(64))]
+struct CpuLoad(AtomicU64);
+
+impl core::ops::Deref for CpuLoad {
+    type Target = AtomicU64;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Represents the run queue for each CPU core. It stores a list of run queues for
@@ -238,6 +326,14 @@ impl Scheduler for ClassScheduler {
             return None;
         }
 
+        // A wake can be delayed past the task's final dequeue. The successful
+        // CPU reservation acquires that dequeue's terminal-state publication,
+        // even if migration made the initially observed runqueue stale.
+        if task.is_finished() {
+            task.cpu().set_to_none();
+            return None;
+        }
+
         // Preempt if the new task has a higher priority.
         let should_preempt = rq
             .current
@@ -248,6 +344,7 @@ impl Scheduler for ClassScheduler {
 
         thread.sched_attr().set_last_cpu(cpu);
         rq.enqueue_entity((task, thread), Some(flags));
+        self.publish_load(cpu, &rq);
 
         should_preempt.then_some(cpu)
     }
@@ -255,7 +352,8 @@ impl Scheduler for ClassScheduler {
     fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
         let guard = disable_local();
         let mut lock = self.rqs[guard.current_cpu().as_usize()].lock();
-        f(&mut *lock)
+        f(&mut *lock);
+        self.publish_load(guard.current_cpu(), &lock);
     }
 
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
@@ -278,15 +376,29 @@ impl ClassScheduler {
         ClassScheduler {
             rqs: all_cpus().map(class_rq).collect(),
             last_chosen_cpu: AtomicCpuId::default(),
+            loads: all_cpus().map(|_| CpuLoad(AtomicU64::new(0))).collect(),
         }
+    }
+
+    // Published under the owning runqueue lock after every mutation. Readers
+    // use approximate load only for placement/statistics, never for ownership.
+    fn publish_load(&self, cpu: CpuId, rq: &PerCpuClassRqSet) {
+        let PerCpuLoadStats { queue_len, is_idle } = rq.load_stats();
+        self.loads[cpu.as_usize()].store(
+            ((queue_len as u64) << 1) | u64::from(!is_idle),
+            Ordering::Relaxed,
+        );
     }
 
     // TODO: Implement a better algorithm and replace the current naive implementation.
     fn select_cpu(&self, thread: &Thread, flags: EnqueueFlags) -> CpuId {
-        if let Some(last_cpu) = thread.sched_attr().last_cpu() {
+        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
+        if let Some(last_cpu) = thread.sched_attr().last_cpu()
+            && affinity.contains(last_cpu)
+        {
             return last_cpu;
         }
-        debug_assert!(flags == EnqueueFlags::Spawn);
+        let _ = flags;
 
         let guard = disable_local();
 
@@ -295,16 +407,14 @@ impl ClassScheduler {
 
         // Set `selected` as `candidate` if the candidate's load is smaller.
         let test_candidate = |candidate: CpuId| {
-            let PerCpuLoadStats { queue_len, .. } =
-                self.rqs[candidate.as_usize()].lock().load_stats();
-            let load = queue_len;
+            let snapshot = self.loads[candidate.as_usize()].load(Ordering::Relaxed);
+            let load = (snapshot >> 1) as u32 + (snapshot & 1) as u32;
             if load < minimum_load {
                 minimum_load = load;
                 selected = candidate;
             }
         };
 
-        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         match self.last_chosen_cpu.get() {
             Some(cpu) => {
                 // Perform a round-robin selection starting after the last chosen CPU.
@@ -429,9 +539,9 @@ struct PerCpuLoadStats {
 
 impl SchedulerStats for ClassScheduler {
     fn nr_queued_and_running(&self) -> (u32, u32) {
-        self.rqs.iter().fold((0, 0), |(queued, running), rq| {
-            let PerCpuLoadStats { queue_len, is_idle } = rq.lock().load_stats();
-            (queued + queue_len, running + u32::from(!is_idle))
+        self.loads.iter().fold((0, 0), |(queued, running), load| {
+            let value = load.load(Ordering::Relaxed);
+            (queued + (value >> 1) as u32, running + (value & 1) as u32)
         })
     }
 }

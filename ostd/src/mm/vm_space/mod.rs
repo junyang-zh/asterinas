@@ -11,6 +11,8 @@
 #[cfg(ktest)]
 mod test;
 
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+use core::sync::atomic::AtomicU64;
 use core::{ops::Range, sync::atomic::Ordering};
 
 use super::{AnyUFrameMeta, PagingLevel, page_table::PageTableConfig};
@@ -79,9 +81,19 @@ pub struct VmSpace<A: AuxPageTableMeta = ()> {
     pt: PageTable<UserPtConfig<A>>,
     cpus: Arc<AtomicCpuSet>,
     iomems: SpinLock<Vec<IoMem>>,
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    deferred_issued: AtomicU64,
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    deferred_completed: AtomicU64,
 }
 
 impl<A: AuxPageTableMeta> VmSpace<A> {
+    /// Snapshot existing user page tables and their live auxiliary allocations.
+    #[cfg(feature = "memory_accounting")]
+    pub fn memory_accounting(&self) -> crate::mm::MemoryAccounting {
+        self.pt.memory_accounting()
+    }
+
     /// Creates a new VM address space.
     pub fn new() -> Self {
         Self {
@@ -91,6 +103,10 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
                 .create_user_page_table::<A>(),
             cpus: Arc::new(AtomicCpuSet::new(CpuSet::new_empty())),
             iomems: SpinLock::new(Vec::new()),
+            #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+            deferred_issued: AtomicU64::new(0),
+            #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+            deferred_completed: AtomicU64::new(0),
         }
     }
 
@@ -131,6 +147,30 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
                 va,
                 max_page_level::<UserPtConfig<A>>(va.len()),
             )?,
+            flusher: TlbFlusher::new(&self.cpus, disable_preempt()),
+            vmspace: self,
+        })
+    }
+
+    /// Gets a mutable cursor for operations that insert only base pages.
+    ///
+    /// Unlike [`Self::cursor_mut`], this may lock a level-1 page table even
+    /// when `va` covers an entire huge-page range. Missing children are
+    /// allocated with their delegated auxiliary metadata before descending.
+    /// Existing huge mappings still require locking their owning table; use
+    /// [`CursorMut::adjust_level`] to split them before modifying base pages.
+    ///
+    /// Callers must only insert base-page frames, and restrict each
+    /// [`CursorMut::map_iomem`] call to a base page. Use [`Self::cursor_mut`]
+    /// when inserting huge mappings: this cursor may not hold their owner.
+    /// The same range and blocking rules as [`Self::cursor_mut`] apply.
+    pub fn cursor_mut_base_pages<'a, G: AsAtomicModeGuard>(
+        &'a self,
+        guard: &'a G,
+        va: &Range<Vaddr>,
+    ) -> Result<CursorMut<'a, A>> {
+        Ok(CursorMut {
+            pt_cursor: self.pt.cursor_mut(guard, va)?,
             flusher: TlbFlusher::new(&self.cpus, disable_preempt()),
             vmspace: self,
         })
@@ -388,6 +428,50 @@ pub struct CursorMut<'a, A: AuxPageTableMeta = ()> {
 }
 
 impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
+    /// Completes a pure unmap while retaining its base frame in the bounded
+    /// background invalidator. Stale translations to the now-invalid address
+    /// may remain until background invalidation or a publication barrier.
+    ///
+    /// The caller must remove mapping metadata first, then call
+    /// `sync_deferred_unmaps_before_publish` under a covering cursor before
+    /// publishing any new mapping, expansion or move. Replacement, permission
+    /// revocation, discard and file/device invalidation must remain synchronous.
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    pub fn complete_deferred_unmap(&mut self) {
+        if self.flusher.defer_unmap_flush() {
+            // Slots are published before this release, while the covering PT
+            // lock still excludes reuse. Saturation disables barrier elision
+            // permanently rather than permitting a generation wraparound.
+            self.vmspace
+                .deferred_issued
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
+                    Some(value.saturating_add(1))
+                })
+                .unwrap();
+        }
+    }
+
+    /// Synchronizes earlier pure unmaps before new mapping metadata or PTEs
+    /// become observable. The covering PT lock orders overlapping unmaps;
+    /// disjoint unmaps may proceed while this barrier waits for remote CPUs.
+    pub fn sync_deferred_unmaps_before_publish(&mut self) {
+        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+        {
+            let issued = self.vmspace.deferred_issued.load(Ordering::Acquire);
+            if issued != u64::MAX
+                && self.vmspace.deferred_completed.load(Ordering::Acquire) >= issued
+            {
+                return;
+            }
+            self.flusher.sync_all_deferred_unmaps();
+            // Only this captured generation was covered. A newer disjoint
+            // unmap may have published after a remote CPU handled our callback.
+            self.vmspace
+                .deferred_completed
+                .fetch_max(issued, Ordering::Release);
+        }
+    }
+
     /// Queries the mapping at the current virtual address.
     ///
     /// This is the same as [`Cursor::query`].
@@ -625,8 +709,12 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
                         let rcu_frame = RcuDrop::new(old_frame);
                         panic_guard.forget();
                         let rcu_frame = Frame::rcu_from_unsized(rcu_frame);
+                        #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
                         self.flusher
                             .issue_tlb_flush_with(TlbFlushOp::for_single(va), rcu_frame);
+                        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+                        self.flusher
+                            .latr_with(TlbFlushOp::for_single(va), rcu_frame);
 
                         1
                     }
@@ -654,6 +742,8 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
                 len,
                 num_frames,
             } => {
+                // A subtree can retain arbitrarily many data frames. Only
+                // tracked base frames belong in the 64-slot lazy reserve.
                 self.flusher.issue_tlb_flush_with(
                     TlbFlushOp::for_range(va..va + len),
                     Frame::rcu_from_unsized(pt),

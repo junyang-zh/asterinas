@@ -22,6 +22,50 @@ fn create_dummy_frame() -> UFrame {
     uframe
 }
 
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+#[ktest]
+fn deferred_generations_saturate_without_eliding_publication_barriers() {
+    let vmspace = VmSpace::<()>::new();
+    vmspace.cpus.store(&CpuSet::new_full(), Ordering::Release);
+    vmspace
+        .deferred_issued
+        .store(u64::MAX - 1, Ordering::Relaxed);
+    vmspace
+        .deferred_completed
+        .store(u64::MAX - 1, Ordering::Relaxed);
+    let preempt = disable_preempt();
+    let range = 0x1000..0x2000;
+    let prop = PageProperty::new_user(PageFlags::R, CachePolicy::Writeback);
+    let mut cursor = vmspace.cursor_mut(&preempt, &range).unwrap();
+    for _ in 0..3 {
+        cursor.jump(range.start).unwrap();
+        cursor.map(create_dummy_frame(), prop);
+        assert_eq!(cursor.unmap(), 1);
+        cursor.complete_deferred_unmap();
+        assert_eq!(vmspace.deferred_issued.load(Ordering::Acquire), u64::MAX);
+        cursor.sync_deferred_unmaps_before_publish();
+        assert_eq!(vmspace.deferred_completed.load(Ordering::Acquire), u64::MAX);
+        assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
+
+        // At saturation, equal watermarks cannot justify skipping a barrier.
+        // Queue a retained frame without dispatching, preserving the origin's
+        // pending bit until the barrier performs its own local invalidation.
+        let frame = create_dummy_frame();
+        {
+            let _irq = crate::irq::disable_local();
+            cursor.flusher.latr_with(
+                TlbFlushOp::for_single(range.start),
+                Frame::rcu_from_unsized(RcuDrop::new(frame.clone())),
+            );
+            assert!(crate::mm::tlb::latr::pending_cpus_for_test().contains(preempt.current_cpu()));
+        }
+        cursor.sync_deferred_unmaps_before_publish();
+        assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
+        cursor.flusher.dispatch_tlb_flush();
+        cursor.flusher.sync_tlb_flush();
+    }
+}
+
 /// Creates a new `VmSpace` and verifies its initial state.
 #[ktest]
 fn vmspace_creation() {
@@ -508,4 +552,91 @@ fn vmspace_iomem_persistence() {
                 .is_some()
         );
     }
+}
+
+/// A 2 MiB base-page operation must not retain the generic L2 covering writer.
+#[ktest]
+fn base_page_cursor_locks_existing_sibling_leaves_independently() {
+    let vmspace = VmSpace::<()>::new();
+    let leaf_size = page_size_at(2);
+    let first = leaf_size..2 * leaf_size;
+    let sibling = 2 * leaf_size..3 * leaf_size;
+    let guard = disable_preempt();
+    for range in [&first, &sibling] {
+        let mut cursor = vmspace.cursor_mut(&guard, range).unwrap();
+        cursor.adjust_level(1);
+    }
+
+    {
+        let cursor = vmspace.cursor_mut(&guard, &first).unwrap();
+        assert_eq!(cursor.guard_level(), 2);
+        assert!(vmspace.try_cursor_mut(&guard, &first).unwrap().is_none());
+    }
+    {
+        let cursor = vmspace.cursor_mut_base_pages(&guard, &first).unwrap();
+        assert_eq!(cursor.guard_level(), 1);
+        assert_eq!(cursor.guard_va_range(), first);
+        let sibling_cursor = vmspace
+            .try_cursor_mut(&guard, &sibling)
+            .unwrap()
+            .expect("disjoint existing leaf must remain available");
+        assert_eq!(sibling_cursor.guard_level(), 1);
+        assert!(vmspace.try_cursor_mut(&guard, &first).unwrap().is_none());
+    }
+}
+
+/// Huge PTEs still stop acquisition at their owner and can be split safely.
+#[ktest]
+fn base_page_cursor_splits_existing_huge_iomem() {
+    let vmspace = VmSpace::<()>::new();
+    let size = page_size_at(2);
+    let range = size..2 * size;
+    let paddr = IOMEM_PADDR + 4 * size;
+    let iomem = IoMem::acquire(paddr..paddr + size).unwrap();
+    let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Uncacheable);
+    let guard = disable_preempt();
+    vmspace
+        .cursor_mut(&guard, &range)
+        .unwrap()
+        .map_iomem(iomem, prop, size, 0);
+    {
+        let mut cursor = vmspace.cursor_mut_base_pages(&guard, &range).unwrap();
+        assert_eq!(cursor.guard_level(), 2);
+        let VmQueriedItem::MappedIoMem {
+            level: huge_level,
+            paddr: huge_paddr,
+            prop: huge_prop,
+        } = cursor.query()
+        else {
+            panic!("expected huge I/O mapping");
+        };
+        assert_eq!(huge_level, 2);
+        assert_eq!(huge_paddr, paddr);
+        assert_eq!(huge_prop.flags, prop.flags);
+        assert_eq!(huge_prop.cache, prop.cache);
+        cursor.adjust_level(1);
+        assert_eq!(cursor.level(), 1);
+        let VmQueriedItem::MappedIoMem {
+            level: small_level,
+            paddr: small_paddr,
+            prop: small_prop,
+        } = cursor.query()
+        else {
+            panic!("expected split I/O mapping");
+        };
+        crate::early_println!(
+            "I/O split: requested={:?}, huge=({:#x}, {:?}), small=({:#x}, {:?})",
+            prop,
+            huge_paddr,
+            huge_prop,
+            small_paddr,
+            small_prop
+        );
+        assert_eq!(small_level, 1);
+        assert_eq!(small_paddr, huge_paddr);
+        // I/O encoding adds a private tag; splitting must preserve it too.
+        assert_eq!(small_prop, huge_prop);
+    }
+    let cursor = vmspace.cursor_mut_base_pages(&guard, &range).unwrap();
+    assert_eq!(cursor.guard_level(), 1);
 }

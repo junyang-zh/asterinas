@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{ops::Range, sync::atomic::Ordering};
+use core::ops::Range;
 
 use ostd::{
-    cpu::all_cpus,
     mm::{page_size_at, vm_space::VmQueriedItem},
     task::disable_preempt,
 };
+
+#[cfg(ktest)]
+use super::accounting_tests;
 
 use super::{PteRangeMeta, RsAsDelta, Vmar, VmarCursorMut};
 use crate::{
@@ -37,8 +39,9 @@ impl Vmar {
         // Detached page tables are reclaimed after an RCU grace period. Drop
         // their mappings now so file-close notifications and device teardown
         // are not delayed until some later quiescent state.
-        while let Some(mapping) = cursor.find_next_mapped(full_range.end) {
-            let range = mapping.range();
+        while let Some(range) =
+            cursor.find_next_mapped_with(full_range.end, |mapping| mapping.range())
+        {
             cursor.aux_meta_mut().inner.take_one(&range.start);
             if cursor.jump(range.end).is_err() {
                 break;
@@ -59,11 +62,7 @@ impl Vmar {
             .iter()
             .for_each(|counter| counter.reset_all_zero());
 
-        all_cpus().for_each(|cpu| {
-            self.mapped_vm_size
-                .get_on_cpu(cpu)
-                .store(0, Ordering::Release)
-        });
+        self.mapped_vm_size.clear();
 
         cursor.flusher().dispatch_tlb_flush();
         cursor.flusher().sync_tlb_flush();
@@ -86,18 +85,48 @@ impl Vmar {
     /// Mappings may fall partially within the range; only the overlapped
     /// portions of the mappings are unmapped.
     pub(crate) fn remove_mapping(&self, range: Range<usize>) -> Result<()> {
-        let mut rs_as_delta = RsAsDelta::new(self);
-
         let preempt_guard = disable_preempt();
         let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+        let mut rs_as_delta = RsAsDelta::new(self);
+        #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+        if range.len() == PAGE_SIZE {
+            let can_defer = cursor.find_next_mapped(range.end).is_some_and(|mapping| {
+                mapping.map_to_addr() <= range.start
+                    && mapping.map_end() >= range.end
+                    && !mapping.is_shared()
+                    && matches!(mapping.mapped_mem(), super::MappedMemory::Anonymous)
+            });
+            cursor.jump(range.start).unwrap();
+            if can_defer {
+                let mapping = take_next_unmappable(&mut cursor, range.end)
+                    .unwrap()
+                    .unwrap_mapping();
+                mapping.unmap(&mut cursor, &mut rs_as_delta);
+                cursor.complete_deferred_unmap();
+                // Private anonymous mappings have no reverse-map entries.
+                drop(rs_as_delta);
+                drop(cursor);
+                drop(preempt_guard);
+                #[cfg(ktest)]
+                self.accounting_pause.hit(accounting_tests::AFTER_UNMAP_PT);
+                return Ok(());
+            }
+        }
         let old_rmap_entries =
             Self::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&range));
 
         let result = self.remove_mappings(&mut cursor, range.len(), &mut rs_as_delta);
-        self.refresh_rmap_entries(&mut cursor, old_rmap_entries, core::slice::from_ref(&range));
+        // Removal cannot create a reverse mapping. Preserve registration
+        // updates whenever the old snapshot contained any shared mappings.
+        if !old_rmap_entries.is_empty() {
+            self.refresh_rmap_entries(&mut cursor, old_rmap_entries, core::slice::from_ref(&range));
+        }
 
+        drop(rs_as_delta);
         drop(cursor);
         drop(preempt_guard);
+        #[cfg(ktest)]
+        self.accounting_pause.hit(accounting_tests::AFTER_UNMAP_PT);
 
         result
     }
@@ -173,27 +202,24 @@ impl Vmar {
         debug_assert!(range.start.is_multiple_of(PAGE_SIZE));
         debug_assert!(range.end.is_multiple_of(PAGE_SIZE));
 
-        let mut rs_as_delta = RsAsDelta::new(self);
-
         let mut last_mapping_end = range.start;
 
         let preempt_guard = disable_preempt();
         let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+        let mut rs_as_delta = RsAsDelta::new(self);
 
-        while let Some(vm_mapping) = cursor.find_next_mapped(range.end) {
-            let vm_mapping_range = vm_mapping.range();
-            let rss_type = vm_mapping.rss_type();
-
+        while let Some((vm_mapping_range, rss_type)) =
+            cursor.find_next_mapped_with(range.end, |mapping| (mapping.range(), mapping.rss_type()))
+        {
             // The range may contain pages that are not mapped. According to Linux behavior, this
             // is not a fault. However, an `ENOMEM` should be reported at the end.
-            if last_mapping_end >= vm_mapping.map_to_addr() {
-                last_mapping_end = vm_mapping.map_end();
+            if last_mapping_end >= vm_mapping_range.start {
+                last_mapping_end = vm_mapping_range.end;
             }
 
             let intersected_range = get_intersected_range(&range, &vm_mapping_range);
 
             cursor.jump(intersected_range.start).unwrap();
-            let mut num_unmapped_this_mapping = 0;
 
             while let Some(va) = cursor.find_next(intersected_range.end) {
                 propagate_if_needed(&mut cursor, intersected_range.end - va);
@@ -202,7 +228,15 @@ impl Vmar {
                 let num_unmapped = cursor.unmap();
                 if is_ram {
                     rs_as_delta.add_rs(rss_type, -(num_unmapped as isize));
-                    num_unmapped_this_mapping += num_unmapped;
+                    // Propagation can split the original mapping among child
+                    // page tables. Account against the fragment owning this
+                    // PTE while the cursor is still on that fragment.
+                    let Some(PteRangeMeta::VmMapping(mapping)) =
+                        cursor.aux_meta_mut().inner.find_one_mut(&va)
+                    else {
+                        panic!("unmapped RAM page has no owning mapping");
+                    };
+                    mapping.dec_frames_mapped(num_unmapped);
                 }
 
                 if va + page_size < intersected_range.end {
@@ -212,19 +246,15 @@ impl Vmar {
                 }
             }
 
-            let Some(PteRangeMeta::VmMapping(mapping)) = cursor
-                .aux_meta_mut()
-                .inner
-                .find_one_mut(&intersected_range.start)
-            else {
-                panic!("there were mappings but cannot find it the second time");
-            };
-            mapping.dec_frames_mapped(num_unmapped_this_mapping);
-
             if cursor.jump(intersected_range.end).is_err() {
                 break;
             }
         }
+
+        // Discard leaves the VMA present. A subsequent access must fault and
+        // reload clean contents, including when a hole causes ENOMEM below.
+        cursor.flusher().dispatch_tlb_flush();
+        cursor.flusher().sync_tlb_flush();
 
         if last_mapping_end < range.end {
             return_errno_with_message!(

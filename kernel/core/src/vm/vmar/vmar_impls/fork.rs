@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{array, ops::Range, sync::atomic::AtomicIsize};
+use core::{array, ops::Range};
 
 use aster_util::per_cpu_counter::PerCpuCounter;
-use osdk_heap_allocator::alloc_cpu_local;
 use ostd::{
-    cpu::{CpuId, PinCurrentCpu},
+    cpu::PinCurrentCpu,
     mm::{
         CachePolicy, PageFlags, page_size_at,
         tlb::TlbFlushOp,
@@ -14,7 +13,7 @@ use ostd::{
     task::disable_preempt,
 };
 
-use super::{PerPtMeta, Vmar};
+use super::{PerPtMeta, Vmar, as_accounting::MappingSize};
 use crate::{
     prelude::*,
     process::ProcessVm,
@@ -54,14 +53,7 @@ impl Vmar {
                 new.add_on_cpu(cur_cpu, old.sum_all_cpus() as isize);
             });
         let vm_size_total = vmar.get_mappings_total_size();
-        let num_cpus = ostd::cpu::num_cpus();
-        let mapped_vm_size = alloc_cpu_local(|cpu| {
-            if cpu == CpuId::bsp() {
-                AtomicIsize::new((vm_size_total / num_cpus + vm_size_total % num_cpus) as isize)
-            } else {
-                AtomicIsize::new((vm_size_total / num_cpus) as isize)
-            }
-        })?;
+        let mapped_vm_size = MappingSize::new(vm_size_total)?;
         let process_vm = ProcessVm::fork_from(&vmar.process_vm, &heap_guard);
         let new_vmar = Arc::new_cyclic(|weak_self| Vmar {
             vm_space: new_vm_space.clone(),
@@ -71,6 +63,8 @@ impl Vmar {
             process_vm,
             num_handles: core::sync::atomic::AtomicUsize::new(1),
             weak_self: weak_self.clone(),
+            #[cfg(ktest)]
+            accounting_pause: super::accounting_tests::Pause::new(),
         });
 
         // Clone mappings.

@@ -2,7 +2,6 @@
 
 //! Utility functions to allocate and lock an unmapped range.
 
-use alloc::vec::Vec;
 use core::ops::Range;
 
 use align_ext::AlignExt;
@@ -10,7 +9,7 @@ use osdk_heap_allocator::{CpuLocalBox, alloc_cpu_local};
 use ostd::{
     cpu::{CpuId, PinCurrentCpu, all_cpus, num_cpus},
     mm::{HIGHEST_PAGING_LEVEL, PAGE_SIZE, Vaddr, num_subpages_per_huge, page_size_at},
-    sync::{PreemptDisabled, SpinLock, SpinLockGuard},
+    sync::SpinLock,
     task::DisabledPreemptGuard,
     util::id_set::Id,
 };
@@ -29,25 +28,23 @@ use crate::{
 
 /// A virtual address range allocator.
 pub(super) struct VirtualAddressAllocator {
-    /// For each CPU, we maintain a range that must be free for fast allocation.
+    /// Per-CPU hints, which may overlap mappings or pending selections.
+    /// Every cached allocation must revalidate authoritative Aux metadata under PT.
+    /// Lock order: PT -> one cache. Never acquire PT while holding a cache lock.
     must_be_free: CpuLocalBox<SpinLock<Range<Vaddr>>>,
-}
-
-/// A guard over the allocator to avoid races.
-#[derive(Debug)]
-pub(super) struct AllocatorGuard<'a>(GuardInner<'a>);
-
-#[derive(Debug)]
-enum GuardInner<'a> {
-    Single(SpinLockGuard<'a, Range<Vaddr>, PreemptDisabled>),
-    Multi(Vec<SpinLockGuard<'a, Range<Vaddr>, PreemptDisabled>>),
+    #[cfg(ktest)]
+    test_pause: tests::Pause,
 }
 
 impl VirtualAddressAllocator {
     /// Creates a new allocator that covers the entire VM range.
     pub(super) fn new() -> Result<Self> {
         let must_be_free = alloc_cpu_local(|cpu| SpinLock::new(assigned_range_on_cpu(cpu)))?;
-        Ok(Self { must_be_free })
+        Ok(Self {
+            must_be_free,
+            #[cfg(ktest)]
+            test_pause: tests::Pause::new(),
+        })
     }
 
     /// Forks from another allocator and returns the copy.
@@ -56,49 +53,40 @@ impl VirtualAddressAllocator {
     pub(super) fn fork_from(&self) -> Result<Self> {
         let must_be_free =
             alloc_cpu_local(|cpu| SpinLock::new(self.must_be_free.get_on_cpu(cpu).lock().clone()))?;
-        Ok(Self { must_be_free })
+        Ok(Self {
+            must_be_free,
+            #[cfg(ktest)]
+            test_pause: tests::Pause::new(),
+        })
     }
 
-    /// Marks a range as not-free and returns a cursor covering the range.
+    /// Truncates cache hints and returns a cursor covering the range.
     pub(super) fn alloc_specific_and_lock<'a>(
         &self,
         guard: &'a DisabledPreemptGuard,
         vmar_space: &'a VmarSpace,
         range: &Range<Vaddr>,
-    ) -> (AllocatorGuard<'_>, VmarCursorMut<'a>) {
+    ) -> VmarCursorMut<'a> {
         self.alloc_specific_and_lock_larger(guard, vmar_space, range, range)
     }
 
-    /// Marks a range as not-free and returns a cursor covering a larger range.
-    pub(super) fn alloc_specific_and_lock_larger<'s, 'a>(
-        &'s self,
+    /// Truncates cache hints and returns a cursor covering a larger range.
+    pub(super) fn alloc_specific_and_lock_larger<'a>(
+        &self,
         guard: &'a DisabledPreemptGuard,
         vmar_space: &'a VmarSpace,
         range: &Range<Vaddr>,
         lock_range: &Range<Vaddr>,
-    ) -> (AllocatorGuard<'s>, VmarCursorMut<'a>) {
-        let cpu_range = cpu_range_for_vaddr_range(range);
-        let guard_inner = if cpu_range.len() == 1 {
-            let mut must_be_free = self
-                .must_be_free
-                .get_on_cpu(cpu_range.start.try_into().unwrap())
-                .lock();
-            *must_be_free = truncate_get_largest(&must_be_free, range);
-            GuardInner::Single(must_be_free)
-        } else {
-            let mut vec = Vec::with_capacity(cpu_range.len());
-            for cpu in cpu_range {
-                let cpu_id = CpuId::try_from(cpu).unwrap();
-                let mut must_be_free = self.must_be_free.get_on_cpu(cpu_id).lock();
-                *must_be_free = truncate_get_largest(&must_be_free, range);
-                vec.push(must_be_free);
-            }
-            GuardInner::Multi(vec)
-        };
-
+    ) -> VmarCursorMut<'a> {
+        #[cfg(ktest)]
+        self.test_pause.before_pt(tests::FIXED);
         let cursor = vmar_space.cursor_mut(guard, lock_range).unwrap();
-
-        (AllocatorGuard(guard_inner), cursor)
+        // Cache entries are hints; no simultaneous snapshot is required.
+        for cpu in cpu_range_for_vaddr_range(range) {
+            let mut hint = self.must_be_free.get_on_cpu(cpu.try_into().unwrap()).lock();
+            *hint = truncate_get_largest(&hint, range);
+        }
+        cursor
     }
 
     /// Allocates a virtual address range and gets a cursor covering it.
@@ -108,19 +96,24 @@ impl VirtualAddressAllocator {
         vmspace: &'a VmarSpace,
         size: usize,
         align: usize,
-    ) -> Result<(Vaddr, AllocatorGuard<'_>, VmarCursorMut<'a>)> {
-        let cur_cpu = guard.current_cpu();
+    ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
+        let cur_cpu = if cfg!(feature = "single_vmar_alloc") {
+            CpuId::bsp()
+        } else {
+            guard.current_cpu()
+        };
 
         // Fast path by querying the `must_be_free` range.
-        if let Ok((va, alloc_guard)) = self.alloc_from_cpu_must_free(cur_cpu, size, align) {
+        if let Ok(va) = self.alloc_from_cpu_must_free(cur_cpu, size, align) {
+            #[cfg(ktest)]
+            self.test_pause.before_pt(tests::CACHED);
             let mut cursor = vmspace.cursor_mut(guard, &(va..va + size))?;
-            if cursor.find_next_mapped(va + size).is_none() {
-                return Ok((va, alloc_guard, cursor));
+            if cursor.find_next_mapped_with(va + size, |_| ()).is_none() {
+                return Ok((va, cursor));
             }
             // The per-CPU range is only a cache. Keep its conservative
             // truncation and retry using authoritative page-table metadata.
             drop(cursor);
-            drop(alloc_guard);
         }
 
         // Try other CPUs' fast path.
@@ -128,13 +121,14 @@ impl VirtualAddressAllocator {
             if cpu_id == cur_cpu {
                 continue;
             }
-            if let Ok((va, alloc_guard)) = self.alloc_from_cpu_must_free(cpu_id, size, align) {
+            if let Ok(va) = self.alloc_from_cpu_must_free(cpu_id, size, align) {
+                #[cfg(ktest)]
+                self.test_pause.before_pt(tests::CACHED);
                 let mut cursor = vmspace.cursor_mut(guard, &(va..va + size))?;
-                if cursor.find_next_mapped(va + size).is_none() {
-                    return Ok((va, alloc_guard, cursor));
+                if cursor.find_next_mapped_with(va + size, |_| ()).is_none() {
+                    return Ok((va, cursor));
                 }
                 drop(cursor);
-                drop(alloc_guard);
             }
         }
 
@@ -179,7 +173,7 @@ impl VirtualAddressAllocator {
         range: &Range<Vaddr>,
         size: usize,
         align: usize,
-    ) -> Result<(Vaddr, AllocatorGuard<'_>, VmarCursorMut<'a>)> {
+    ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
         self.try_lock_and_alloc_from(guard, vmspace, range, size, align)
     }
 
@@ -194,26 +188,27 @@ impl VirtualAddressAllocator {
         range: Range<Vaddr>,
         size: usize,
         align: usize,
-    ) -> Result<(Vaddr, AllocatorGuard<'_>, VmarCursorMut<'a>)> {
+    ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
         let cpu_range = cpu_range_for_vaddr_range(&range);
 
         // Fast path.
         if cpu_range.len() == 1
-            && let Ok((va, alloc_guard)) = self.alloc_from_cpu_must_free(
+            && let Ok(va) = self.alloc_from_cpu_must_free(
                 CpuId::try_from(cpu_range.start).unwrap(),
                 size,
                 align,
             )
         {
             let lock_range = range.start.min(va)..range.end.max(va + size);
+            #[cfg(ktest)]
+            self.test_pause.before_pt(tests::REMAP_CACHED);
             let mut cursor = vmspace.cursor_mut(guard, &lock_range)?;
             cursor.jump(va).unwrap();
-            if cursor.find_next_mapped(va + size).is_none() {
+            if cursor.find_next_mapped_with(va + size, |_| ()).is_none() {
                 cursor.jump(lock_range.start).unwrap();
-                return Ok((va, alloc_guard, cursor));
+                return Ok((va, cursor));
             }
             drop(cursor);
-            drop(alloc_guard);
         }
 
         // Slow path: allocate from the assigned ranges.
@@ -232,17 +227,12 @@ impl VirtualAddressAllocator {
         self.try_lock_and_alloc_from(guard, vmspace, &full_range, size, align)
     }
 
-    fn alloc_from_cpu_must_free(
-        &self,
-        cpu: CpuId,
-        size: usize,
-        align: usize,
-    ) -> Result<(Vaddr, AllocatorGuard<'_>)> {
+    fn alloc_from_cpu_must_free(&self, cpu: CpuId, size: usize, align: usize) -> Result<Vaddr> {
         let mut must_be_free = self.must_be_free.get_on_cpu(cpu).lock();
 
         alloc_from_free_range(must_be_free.clone(), size, align).map(|va| {
             *must_be_free = truncate_get_largest(&must_be_free, &(va..va + size));
-            (va, AllocatorGuard(GuardInner::Single(must_be_free)))
+            va
         })
     }
 
@@ -253,7 +243,7 @@ impl VirtualAddressAllocator {
         range: &Range<Vaddr>,
         size: usize,
         align: usize,
-    ) -> Result<(Vaddr, AllocatorGuard<'_>, VmarCursorMut<'a>)> {
+    ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
         if !can_alloc_from_free_range(range, size, align) {
             return Err(Error::with_message(
                 Errno::ENOMEM,
@@ -261,52 +251,26 @@ impl VirtualAddressAllocator {
             ));
         }
 
-        // Lock the relevant `must_be_free`s before the cursor otherwise
-        // `remove_free_range` does not guarantee free of allocations from it.
-
-        let cpu_range = cpu_range_for_vaddr_range(range);
-        let mut alloc_guard = AllocatorGuard(if cpu_range.len() == 1 {
-            GuardInner::Single(
-                self.must_be_free
-                    .get_on_cpu(cpu_range.start.try_into().unwrap())
-                    .lock(),
-            )
-        } else {
-            let mut vec = Vec::with_capacity(cpu_range.len());
-            for cpu in cpu_range.clone() {
-                vec.push(self.must_be_free.get_on_cpu(cpu.try_into().unwrap()).lock());
-            }
-            GuardInner::Multi(vec)
-        });
-
+        // Search under PT, then briefly refill individual hints. A pending cached
+        // selection may be reintroduced here; its later Aux check resolves races.
+        #[cfg(ktest)]
+        self.test_pause.before_pt(tests::SLOW);
         let mut cursor = vmspace.cursor_mut(guard, range)?;
         let (va, range) = find_fit_range_in_cursor(&mut cursor, size, align)?;
 
-        // Maintain the must be free ranges.
         let remain = truncate_get_largest(&range, &(va..va + size));
         if !remain.is_empty() {
-            match &mut alloc_guard {
-                AllocatorGuard(GuardInner::Single(must_be_empty)) => {
-                    if remain.len() > must_be_empty.len() {
-                        **must_be_empty = remain;
-                    }
-                }
-                AllocatorGuard(GuardInner::Multi(vec)) => {
-                    for (cpu, must_be_empty) in cpu_range.zip(vec.iter_mut()) {
-                        let cpu_id = CpuId::try_from(cpu).unwrap();
-                        let assigned_range = assigned_range_on_cpu(cpu_id);
-                        if is_intersected(&remain, &assigned_range) {
-                            let free_remain = get_intersected_range(&remain, &assigned_range);
-                            if free_remain.len() > must_be_empty.len() {
-                                **must_be_empty = free_remain;
-                            }
-                        }
-                    }
+            for cpu in cpu_range_for_vaddr_range(&remain) {
+                let cpu_id = CpuId::try_from(cpu).unwrap();
+                let free_remain = get_intersected_range(&remain, &assigned_range_on_cpu(cpu_id));
+                let mut hint = self.must_be_free.get_on_cpu(cpu_id).lock();
+                if free_remain.len() > hint.len() {
+                    *hint = free_remain;
                 }
             }
         }
 
-        Ok((va, alloc_guard, cursor))
+        Ok((va, cursor))
     }
 }
 
@@ -390,6 +354,13 @@ fn find_fit_range_in_cursor(
 ///
 /// The assigned range is firstly searched for free space to allocate.
 fn assigned_range_on_cpu(cpu: CpuId) -> Range<Vaddr> {
+    if cfg!(feature = "single_vmar_alloc") {
+        return if cpu == CpuId::bsp() {
+            VMAR_LOWEST_ADDR..VMAR_CAP_ADDR
+        } else {
+            VMAR_LOWEST_ADDR..VMAR_LOWEST_ADDR
+        };
+    }
     let num_cpus = num_cpus();
     let per_cpu_range_size = assigned_range_size_for(num_cpus);
 
@@ -407,6 +378,9 @@ fn assigned_range_on_cpu(cpu: CpuId) -> Range<Vaddr> {
 /// Returns the range of CPU IDs that the given virtual address belongs to.
 fn cpu_range_for_vaddr_range(range: &Range<Vaddr>) -> Range<usize> {
     debug_assert!(range.start < range.end);
+    if cfg!(feature = "single_vmar_alloc") {
+        return 0..1;
+    }
 
     let num_cpus = num_cpus();
     let per_cpu_range_size = assigned_range_size_for(num_cpus);
@@ -472,21 +446,4 @@ fn truncate_get_largest(range: &Range<Vaddr>, cut: &Range<Vaddr>) -> Range<Vaddr
 }
 
 #[cfg(ktest)]
-mod tests {
-    use ostd::prelude::ktest;
-
-    use super::*;
-
-    #[ktest]
-    fn alloc_from_free_range_accepts_exact_fit() {
-        assert_eq!(
-            alloc_from_free_range(0x4000..0x8000, 0x4000, PAGE_SIZE).unwrap(),
-            0x4000
-        );
-    }
-
-    #[ktest]
-    fn alloc_from_free_range_rejects_too_small_range() {
-        assert!(alloc_from_free_range(0x4000..0x7000, 0x4000, PAGE_SIZE).is_err());
-    }
-}
+mod tests;

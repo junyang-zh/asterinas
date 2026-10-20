@@ -76,6 +76,11 @@ riscv.workspace = true
 loongArch64.workspace = true
 
 [features]
+single_vmar_alloc = []
+lazy_tlb_flush_on_unmap = ["ostd/lazy_tlb_flush_on_unmap"]
+artifact_busy_poll = []
+breakdown_counters = ["ostd/breakdown_counters"]
+memory_accounting = ["ostd/memory_accounting"]
 default = ["cvm_guest"]
 coverage = ["ostd/coverage"]
 cvm_guest = ["dep:tdx-guest", "ostd/cvm_guest", "aster-virtio/cvm_guest"]

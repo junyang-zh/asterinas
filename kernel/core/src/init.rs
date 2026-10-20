@@ -94,7 +94,23 @@ fn ap_init() {
 // doing more work in the idle task may have negative impact on
 // the latency to switching from the idle task to a useful, runnable one.
 
+fn idle_step() {
+    if crate::sched::steal_a_task() {
+        ostd::task::Task::yield_now();
+        return;
+    }
+    #[cfg(feature = "artifact_busy_poll")]
+    {
+        core::hint::spin_loop();
+        ostd::task::Task::yield_now();
+    }
+    #[cfg(not(feature = "artifact_busy_poll"))]
+    ostd::task::halt_cpu();
+}
+
 fn bsp_idle_loop() {
+    #[cfg(feature = "breakdown_counters")]
+    ostd::mm::breakdown::mark_idle();
     ostd::info!("Idle thread for CPU #0 started");
 
     // Spawn the first non-idle kernel thread on BSP.
@@ -109,12 +125,12 @@ fn bsp_idle_loop() {
             break init_process;
         };
 
-        ostd::task::halt_cpu();
+        idle_step();
     };
 
     // Wait till the init process becomes zombie.
     while !init_process.status().is_zombie() {
-        ostd::task::halt_cpu();
+        idle_step();
     }
 
     panic!(
@@ -124,6 +140,8 @@ fn bsp_idle_loop() {
 }
 
 fn ap_idle_loop() {
+    #[cfg(feature = "breakdown_counters")]
+    ostd::mm::breakdown::mark_idle();
     ostd::info!(
         "Idle thread for CPU #{} started",
         // No races because this function runs on a certain AP.
@@ -131,7 +149,7 @@ fn ap_idle_loop() {
     );
 
     loop {
-        ostd::task::halt_cpu();
+        idle_step();
     }
 }
 

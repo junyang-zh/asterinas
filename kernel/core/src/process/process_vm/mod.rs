@@ -96,6 +96,16 @@ impl ProcessVm {
         }
     }
 
+    /// Maps a real heap for VMAR tests that bypass the ELF loader.
+    #[cfg(ktest)]
+    pub(crate) fn map_and_init_heap_for_ktest(&self, vmar: &Vmar) -> Result<()> {
+        // Keep the heap above MAP_32BIT and the fixtures' fixed low mappings.
+        // The normal initializer adds at most 255 padding pages and maps one
+        // unfaulted page, whose charge is included in each fixture's baseline.
+        const HEAP_BASE: Vaddr = 0x1_0000_0000;
+        self.map_and_init_heap(vmar, 0, HEAP_BASE)
+    }
+
     /// Creates a new `ProcessVm` with identical contents of an existing one.
     pub(crate) fn fork_from(process_vm: &Self, heap_guard: &LockedHeap) -> Self {
         Self {

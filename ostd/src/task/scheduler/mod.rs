@@ -110,6 +110,8 @@ pub fn inject_scheduler(scheduler: &'static dyn Scheduler<Task>) {
 /// by an OSTD-based kernel during its initialization phase,
 /// after it has injected its scheduler via [`inject_scheduler`].
 pub fn enable_preemption_on_cpu() {
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    timer::register_callback_on_cpu(crate::mm::tlb::latr::timer_flush);
     timer::register_callback_on_cpu(|| {
         scheduler_singleton().mut_local_rq_with(&mut |local_rq| {
             let should_pick_next = local_rq.update_current(UpdateFlags::Tick);
@@ -143,6 +145,11 @@ fn scheduler_singleton() -> &'static dyn Scheduler<Task> {
 /// A SMP-aware task scheduler.
 pub trait Scheduler<T = Task>: Sync + Send {
     /// Enqueues a runnable task.
+    ///
+    /// A wake may arrive after a task finishes. Reject terminal tasks after
+    /// reserving their CPU, under the target runqueue lock. The reservation must
+    /// acquire the terminal state published before the final CPU clear.
+    /// An early terminal-state check alone does not close the exit/enqueue race.
     ///
     /// The scheduler implementer can perform load-balancing or some time accounting work here.
     ///
@@ -523,12 +530,22 @@ fn set_need_preempt(cpu_id: CpuId) {
 /// This should only be called if the current is to exit.
 #[track_caller]
 pub(super) fn exit_current() -> ! {
+    #[cfg(feature = "breakdown_counters")]
+    crate::mm::breakdown::exit_task(crate::mm::breakdown::current_task_id());
     let mut is_first_try = true;
 
     reschedule(|local_rq: &mut dyn LocalRunQueue| {
         let next_task_opt = if is_first_try {
             is_first_try = false;
             let should_pick_next = local_rq.update_current(UpdateFlags::Exit);
+            // A delayed wake must not resurrect this task. The runqueue lock
+            // serializes this publication with enqueue; the CPU clear below
+            // releases it to enqueues that reserve a different runqueue.
+            local_rq
+                .current()
+                .unwrap()
+                .is_finished
+                .store(true, core::sync::atomic::Ordering::Relaxed);
             let _current = local_rq.dequeue_current();
             should_pick_next.then(|| local_rq.pick_next())
         } else {
@@ -568,6 +585,18 @@ fn reschedule<F>(mut f: F)
 where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
+    #[cfg(feature = "breakdown_counters")]
+    let _profile = crate::mm::breakdown::enter(crate::mm::breakdown::Phase::Scheduler);
+
+    super::atomic_mode::might_sleep();
+    // SAFETY: RCU readers disable preemption. The atomic-mode check above
+    // excludes any live read-side guard. Process callbacks before changing
+    // the logical current task, since callbacks may themselves reschedule.
+    unsafe { crate::sync::finish_grace_period() };
+
+    // Keep the selected task stable until the processor disables IRQs for
+    // the context switch. IRQs remain available to wake tasks during Retry.
+    let preempt_guard = disable_preempt();
     // Even if the decision below is `DoNothing`, we should clear this flag. Meanwhile, to avoid
     // race conditions, we should do this before making the decision.
     cpu_local::clear_need_preempt();
@@ -577,6 +606,9 @@ where
         scheduler_singleton().mut_local_rq_with(&mut |rq| {
             action = f(rq);
         });
+
+        #[cfg(ktest)]
+        test::after_selection();
 
         match action {
             ReschedAction::DoNothing => {
@@ -594,10 +626,9 @@ where
     // `switch_to_task` will spin if it finds that the next task is still running on some CPU core,
     // which guarantees soundness regardless of the scheduler implementation.
     //
-    // FIXME: The scheduler decision and context switching are not atomic, which can lead to some
-    // strange behavior even if the scheduler is implemented correctly. See "Problem 2" at
-    // <https://github.com/asterinas/asterinas/issues/1633> for details.
-    processor::switch_to_task(next_task);
+    // Transfer the preemption guard so there is no interruptible gap between
+    // selecting this task and installing its context.
+    processor::switch_to_task(next_task, preempt_guard);
 }
 
 /// Possible actions of a rescheduling.
@@ -608,4 +639,38 @@ enum ReschedAction {
     Retry,
     /// Switch to target task.
     SwitchTo(Arc<Task>),
+}
+
+#[cfg(ktest)]
+mod test {
+    use super::*;
+    use crate::prelude::*;
+
+    crate::cpu_local_cell! {
+        static INJECT_PREEMPT: bool = false;
+        static SELECTIONS: usize = 0;
+    }
+
+    pub(super) fn after_selection() {
+        SELECTIONS.add_assign(1);
+        if !INJECT_PREEMPT.load() {
+            return;
+        }
+        INJECT_PREEMPT.store(false);
+        let selections = SELECTIONS.load();
+        // Model an IRQ requesting preemption just after the runqueue lock
+        // has been released, before the selected context is installed.
+        cpu_local::set_need_preempt();
+        might_preempt();
+        assert_eq!(SELECTIONS.load(), selections, "a scheduling decision was reentered before its context switch");
+    }
+
+    #[ktest]
+    fn selection_cannot_be_reentered_by_preemption() {
+        INJECT_PREEMPT.store(true);
+        // A no-switch decision makes the old-code failure independent of
+        // whichever runnable tasks happen to be present in the test queue.
+        reschedule(|_| ReschedAction::DoNothing);
+        assert!(!INJECT_PREEMPT.load());
+    }
 }

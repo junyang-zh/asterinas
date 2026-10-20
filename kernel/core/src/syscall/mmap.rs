@@ -8,6 +8,7 @@ use super::SyscallReturn;
 use crate::{
     fs::file::file_table::{RawFileDesc, get_file_fast},
     prelude::*,
+    process::ResourceType,
     vm::{
         page_cache::VmoOptions,
         perms::VmPerms,
@@ -127,7 +128,11 @@ fn do_sys_mmap(
                 options = options.vmo(shared_vmo);
             }
 
-            options.build()?
+            options.build_with_rlimit_as(
+                ctx.process
+                    .resource_limits()
+                    .get_rlimit(ResourceType::RLIMIT_AS),
+            )?
         } else {
             let mut file_table = ctx.thread_local.borrow_file_table_mut();
             let file = get_file_fast!(&mut file_table, raw_fd.try_into()?).into_owned();
@@ -149,7 +154,11 @@ fn do_sys_mmap(
                 .vmo_offset(offset)
                 .handle_page_faults_around();
 
-            options.build()?
+            options.build_with_rlimit_as(
+                ctx.process
+                    .resource_limits()
+                    .get_rlimit(ResourceType::RLIMIT_AS),
+            )?
         }
     };
 

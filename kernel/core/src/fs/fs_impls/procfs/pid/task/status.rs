@@ -155,6 +155,17 @@ impl ProcFileOps for StatusFileOps {
         )?;
 
         if let Some(vmar_ref) = process.lock_vmar().as_ref() {
+            #[cfg(feature = "memory_accounting")]
+            {
+                let memory = vmar_ref.vm_space().memory_accounting();
+                writeln!(printer, "CortenPtPages: {}", memory.pt_pages)?;
+                writeln!(printer, "CortenPtBytes: {} B", memory.pt_pages * PAGE_SIZE)?;
+                writeln!(printer, "CortenNodeRequested: {} B", memory.node_state_requested_bytes)?;
+                writeln!(printer, "CortenNodeCharged: {} B", memory.node_state_charged_bytes)?;
+                writeln!(printer, "CortenAuxAllocations: {}", memory.aux_allocations)?;
+                writeln!(printer, "CortenAuxRequested: {} B", memory.aux_requested_bytes)?;
+                writeln!(printer, "CortenAuxCharged: {} B", memory.aux_charged_bytes)?;
+            }
             let vsize = vmar_ref.get_mappings_total_size();
             let anon = vmar_ref.get_rss_counter(RssType::Anon) * (PAGE_SIZE / 1024);
             let file = vmar_ref.get_rss_counter(RssType::File) * (PAGE_SIZE / 1024);
@@ -162,7 +173,7 @@ impl ProcFileOps for StatusFileOps {
             writeln!(
                 printer,
                 "VmSize:\t{} kB\nVmRSS:\t{} kB\nRssAnon:\t{} kB\nRssFile:\t{} kB",
-                vsize, rss, anon, file
+                vsize / 1024, rss, anon, file
             )?;
         }
 

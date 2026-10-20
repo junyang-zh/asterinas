@@ -40,7 +40,7 @@ impl ProcFileOps for CpuInfoFileOps {
         let mut printer = VmPrinter::new_skip(writer, offset);
 
         for cpu in all_cpus() {
-            let cpu_info = CPU_INFORMATION.get_on_cpu(cpu).get().unwrap().to_string();
+            let cpu_info = CPU_INFORMATION.get_on_cpu(cpu).get().unwrap();
             writeln!(printer, "{}", cpu_info)?;
         }
 
@@ -49,12 +49,12 @@ impl ProcFileOps for CpuInfoFileOps {
 }
 
 cpu_local! {
-    static CPU_INFORMATION: Once<CpuInformation> = Once::new();
+    static CPU_INFORMATION: Once<String> = Once::new();
 }
 
 pub(super) fn init_on_each_cpu() {
     let guard = disable_preempt();
     CPU_INFORMATION
         .get_on_cpu(guard.current_cpu())
-        .call_once(|| CpuInformation::new(&guard));
+        .call_once(|| CpuInformation::new(&guard).to_string());
 }
