@@ -426,9 +426,6 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             );
         }
 
-        drop(cursor);
-        drop(preempt_guard);
-
         Ok(map_to_addr)
     }
 
@@ -553,13 +550,13 @@ fn allocate_range<'a>(
 ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
     let map_size_bytes = map_size.get();
 
-    let (map_to_addr, cursor) = match offset {
+    match offset {
         None => parent.allocator.alloc_and_lock(
             preempt_guard,
             parent.vm_space(),
             map_size_bytes,
             align,
-        )?,
+        ),
         Some((offset, OffsetType::Fixed)) => {
             let range = offset..offset + map_size_bytes;
 
@@ -568,7 +565,7 @@ fn allocate_range<'a>(
                     .allocator
                     .alloc_specific_and_lock(preempt_guard, parent.vm_space(), &range);
 
-            (offset, cursor)
+            Ok((offset, cursor))
         }
         Some((offset, OffsetType::FixedNoReplace)) => {
             let range = offset..offset + map_size_bytes;
@@ -582,7 +579,7 @@ fn allocate_range<'a>(
                 return_errno_with_message!(Errno::EEXIST, "the specified range is already mapped");
             }
 
-            (offset, cursor)
+            Ok((offset, cursor))
         }
         Some((offset, OffsetType::Hint)) => {
             let range = offset..offset + map_size_bytes;
@@ -599,9 +596,9 @@ fn allocate_range<'a>(
                     parent.vm_space(),
                     map_size_bytes,
                     align,
-                )?
+                )
             } else {
-                (offset, cursor)
+                Ok((offset, cursor))
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -610,6 +607,7 @@ fn allocate_range<'a>(
 
             if offset != 0
                 && offset >= allocation_range.start
+                && offset < allocation_range.end
                 && map_size_bytes <= allocation_range.end - offset
             {
                 let range = offset..offset + map_size_bytes;
@@ -620,7 +618,7 @@ fn allocate_range<'a>(
                 );
 
                 if cursor.find_next_mapped_with(range.end, |_| ()).is_none() {
-                    (offset, cursor)
+                    Ok((offset, cursor))
                 } else {
                     drop(cursor);
                     parent.allocator.alloc_and_lock_in_range(
@@ -629,7 +627,7 @@ fn allocate_range<'a>(
                         &allocation_range,
                         map_size_bytes,
                         align,
-                    )?
+                    )
                 }
             } else {
                 parent.allocator.alloc_and_lock_in_range(
@@ -638,12 +636,10 @@ fn allocate_range<'a>(
                     &allocation_range,
                     map_size_bytes,
                     align,
-                )?
+                )
             }
         }
-    };
-
-    Ok((map_to_addr, cursor))
+    }
 }
 
 fn readahead_for_populate(vmo: Arc<Vmo>, vmo_offset: usize, map_size: NonZeroUsize) {
