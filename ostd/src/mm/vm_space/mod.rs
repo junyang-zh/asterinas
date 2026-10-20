@@ -136,6 +136,30 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
         })
     }
 
+    /// Gets a mutable cursor for operations that insert only base pages.
+    ///
+    /// Unlike [`Self::cursor_mut`], this may lock a level-1 page table even
+    /// when `va` covers an entire huge-page range. Missing children are
+    /// allocated with their delegated auxiliary metadata before descending.
+    /// Existing huge mappings still require locking their owning table; use
+    /// [`CursorMut::adjust_level`] to split them before modifying base pages.
+    ///
+    /// Callers must only insert base-page frames, and restrict each
+    /// [`CursorMut::map_iomem`] call to a base page. Use [`Self::cursor_mut`]
+    /// when inserting huge mappings: this cursor may not hold their owner.
+    /// The same range and blocking rules as [`Self::cursor_mut`] apply.
+    pub fn cursor_mut_base_pages<'a, G: AsAtomicModeGuard>(
+        &'a self,
+        guard: &'a G,
+        va: &Range<Vaddr>,
+    ) -> Result<CursorMut<'a, A>> {
+        Ok(CursorMut {
+            pt_cursor: self.pt.cursor_mut(guard, va)?,
+            flusher: TlbFlusher::new(&self.cpus, disable_preempt()),
+            vmspace: self,
+        })
+    }
+
     /// Tries to get a mutable cursor without waiting for an overlapping cursor.
     ///
     /// Returns `Ok(None)` if the requested range is currently locked.
