@@ -7,6 +7,9 @@ use ostd::{
     task::disable_preempt,
 };
 
+#[cfg(ktest)]
+use super::accounting_tests;
+
 use super::{PteRangeMeta, RsAsDelta, Vmar, VmarCursorMut};
 use crate::{
     prelude::*,
@@ -82,18 +85,20 @@ impl Vmar {
     /// Mappings may fall partially within the range; only the overlapped
     /// portions of the mappings are unmapped.
     pub(crate) fn remove_mapping(&self, range: Range<usize>) -> Result<()> {
-        let mut rs_as_delta = RsAsDelta::new(self);
-
         let preempt_guard = disable_preempt();
         let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+        let mut rs_as_delta = RsAsDelta::new(self);
         let old_rmap_entries =
             Self::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&range));
 
         let result = self.remove_mappings(&mut cursor, range.len(), &mut rs_as_delta);
         self.refresh_rmap_entries(&mut cursor, old_rmap_entries, core::slice::from_ref(&range));
 
+        drop(rs_as_delta);
         drop(cursor);
         drop(preempt_guard);
+        #[cfg(ktest)]
+        self.accounting_pause.hit(accounting_tests::AFTER_UNMAP_PT);
 
         result
     }
@@ -169,12 +174,11 @@ impl Vmar {
         debug_assert!(range.start.is_multiple_of(PAGE_SIZE));
         debug_assert!(range.end.is_multiple_of(PAGE_SIZE));
 
-        let mut rs_as_delta = RsAsDelta::new(self);
-
         let mut last_mapping_end = range.start;
 
         let preempt_guard = disable_preempt();
         let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+        let mut rs_as_delta = RsAsDelta::new(self);
 
         while let Some((vm_mapping_range, rss_type)) =
             cursor.find_next_mapped_with(range.end, |mapping| (mapping.range(), mapping.rss_type()))

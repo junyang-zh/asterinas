@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod access_alien;
+#[cfg(ktest)]
+mod accounting_tests;
 mod as_accounting;
 mod fork;
 pub(super) mod map;
@@ -63,6 +65,8 @@ pub(crate) struct Vmar {
     num_handles: AtomicUsize,
     /// Weak self-reference used by VMO reverse mappings.
     weak_self: Weak<Self>,
+    #[cfg(ktest)]
+    accounting_pause: accounting_tests::Pause,
 }
 
 impl Vmar {
@@ -82,6 +86,8 @@ impl Vmar {
             process_vm,
             num_handles: AtomicUsize::new(1),
             weak_self: weak_self.clone(),
+            #[cfg(ktest)]
+            accounting_pause: accounting_tests::Pause::new(),
         });
 
         let stack_region = vmar.process_vm.init_stack().reserved_region();

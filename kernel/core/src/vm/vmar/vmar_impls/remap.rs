@@ -71,8 +71,6 @@ impl Vmar {
 
         let affected_range = map_addr..range_end;
 
-        let mut rs_as_delta = RsAsDelta::new(self);
-
         let preempt_guard = disable_preempt();
 
         let range_to_lock = affected_range.clone();
@@ -80,6 +78,7 @@ impl Vmar {
         let (alloc_guard, mut cursor) =
             self.allocator
                 .alloc_specific_and_lock(&preempt_guard, self.vm_space(), &range_to_lock);
+        let mut rs_as_delta = RsAsDelta::new(self);
         let old_rmap_entries =
             Self::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&affected_range));
 
@@ -117,9 +116,13 @@ impl Vmar {
                 old_rmap_entries,
                 core::slice::from_ref(&affected_range),
             );
+            drop(rs_as_delta);
             drop(cursor);
             drop(alloc_guard);
             drop(preempt_guard);
+            #[cfg(ktest)]
+            self.accounting_pause
+                .hit(super::accounting_tests::AFTER_SHRINK_PT);
             return result;
         }
 
@@ -160,6 +163,7 @@ impl Vmar {
             core::slice::from_ref(&affected_range),
         );
 
+        drop(rs_as_delta);
         drop(cursor);
         drop(alloc_guard);
         drop(preempt_guard);

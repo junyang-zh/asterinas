@@ -63,6 +63,8 @@ impl Vmar {
             process_vm,
             num_handles: core::sync::atomic::AtomicUsize::new(1),
             weak_self: weak_self.clone(),
+            #[cfg(ktest)]
+            accounting_pause: super::accounting_tests::Pause::new(),
         });
 
         // Clone mappings.

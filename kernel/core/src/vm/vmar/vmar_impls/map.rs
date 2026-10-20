@@ -335,6 +335,11 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
 
         let preempt_guard = disable_preempt();
 
+        #[cfg(ktest)]
+        parent
+            .accounting_pause
+            .hit(super::accounting_tests::BEFORE_MAP_PT);
+
         let (map_to_addr, alloc_guard, mut cursor) =
             allocate_range(&preempt_guard, parent, offset, align, map_size)?;
 

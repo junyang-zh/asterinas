@@ -73,13 +73,13 @@ impl Vmar {
         // Retry is needed if the page fault needs I/O after we locked the page table.
         // Here we declare the state visible across retries. Take care of race
         // conditions when accessing such state.
-        let mut rs_as_delta = RsAsDelta::new(self);
         let mut range_handled = 0..0;
         let mut device_fault = None;
 
         'retry: loop {
             let preempt_guard = disable_preempt();
             let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range_to_lock)?;
+            let mut rs_as_delta = RsAsDelta::new(self);
 
             cursor.jump(address.align_down(PAGE_SIZE)).unwrap();
             while cursor.push_level_if_exists().is_some() {}
@@ -116,6 +116,7 @@ impl Vmar {
                 match res {
                     Ok(_) => {}
                     Err(PfError::Retry { va, how_to }) => {
+                        drop(rs_as_delta);
                         drop(cursor);
                         drop(preempt_guard);
                         let err = how_to.commit();
@@ -131,6 +132,7 @@ impl Vmar {
                         continue 'retry;
                     }
                     Err(PfError::Device { va, range, object }) => {
+                        drop(rs_as_delta);
                         drop(cursor);
                         drop(preempt_guard);
                         // Device callbacks may take sleeping locks. Revalidate
