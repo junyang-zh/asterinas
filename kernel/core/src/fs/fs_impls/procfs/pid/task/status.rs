@@ -173,7 +173,7 @@ impl ProcFileOps for StatusFileOps {
             writeln!(
                 printer,
                 "VmSize:\t{} kB\nVmRSS:\t{} kB\nRssAnon:\t{} kB\nRssFile:\t{} kB",
-                vsize, rss, anon, file
+                vsize / 1024, rss, anon, file
             )?;
         }
 
