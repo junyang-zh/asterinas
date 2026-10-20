@@ -24,7 +24,6 @@ use crate::{
             interval_set::Interval,
             is_userspace_vaddr_range,
             util::is_intersected,
-            vm_allocator::AllocatorGuard,
             vm_mapping::{DeviceMapping, map_device_pages},
             vmar_impls::{PteRangeMeta, VmarCursorMut},
         },
@@ -340,7 +339,7 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             .accounting_pause
             .hit(super::accounting_tests::BEFORE_MAP_PT);
 
-        let (map_to_addr, alloc_guard, mut cursor) =
+        let (map_to_addr, mut cursor) =
             allocate_range(&preempt_guard, parent, offset, align, map_size)?;
 
         let affected_range = map_to_addr..map_to_addr + map_size.get();
@@ -418,7 +417,6 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
         );
 
         drop(cursor);
-        drop(alloc_guard);
         drop(preempt_guard);
 
         Ok(map_to_addr)
@@ -542,10 +540,10 @@ fn allocate_range<'a>(
     offset: Option<(usize, OffsetType)>,
     align: usize,
     map_size: NonZeroUsize,
-) -> Result<(Vaddr, AllocatorGuard<'a>, VmarCursorMut<'a>)> {
+) -> Result<(Vaddr, VmarCursorMut<'a>)> {
     let map_size_bytes = map_size.get();
 
-    let (map_to_addr, alloc_guard, cursor) = match offset {
+    let (map_to_addr, cursor) = match offset {
         None => parent.allocator.alloc_and_lock(
             preempt_guard,
             parent.vm_space(),
@@ -555,17 +553,17 @@ fn allocate_range<'a>(
         Some((offset, OffsetType::Fixed)) => {
             let range = offset..offset + map_size_bytes;
 
-            let (alloc_guard, cursor) =
+            let cursor =
                 parent
                     .allocator
                     .alloc_specific_and_lock(preempt_guard, parent.vm_space(), &range);
 
-            (offset, alloc_guard, cursor)
+            (offset, cursor)
         }
         Some((offset, OffsetType::FixedNoReplace)) => {
             let range = offset..offset + map_size_bytes;
 
-            let (alloc_guard, mut cursor) =
+            let mut cursor =
                 parent
                     .allocator
                     .alloc_specific_and_lock(preempt_guard, parent.vm_space(), &range);
@@ -574,19 +572,18 @@ fn allocate_range<'a>(
                 return_errno_with_message!(Errno::EEXIST, "the specified range is already mapped");
             }
 
-            (offset, alloc_guard, cursor)
+            (offset, cursor)
         }
         Some((offset, OffsetType::Hint)) => {
             let range = offset..offset + map_size_bytes;
 
-            let (alloc_guard, mut cursor) =
+            let mut cursor =
                 parent
                     .allocator
                     .alloc_specific_and_lock(preempt_guard, parent.vm_space(), &range);
 
             if cursor.find_next_mapped_with(range.end, |_| ()).is_some() {
                 drop(cursor);
-                drop(alloc_guard);
                 parent.allocator.alloc_and_lock(
                     preempt_guard,
                     parent.vm_space(),
@@ -594,7 +591,7 @@ fn allocate_range<'a>(
                     align,
                 )?
             } else {
-                (offset, alloc_guard, cursor)
+                (offset, cursor)
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -606,17 +603,16 @@ fn allocate_range<'a>(
                 && map_size_bytes <= allocation_range.end - offset
             {
                 let range = offset..offset + map_size_bytes;
-                let (alloc_guard, mut cursor) = parent.allocator.alloc_specific_and_lock(
+                let mut cursor = parent.allocator.alloc_specific_and_lock(
                     preempt_guard,
                     parent.vm_space(),
                     &range,
                 );
 
                 if cursor.find_next_mapped_with(range.end, |_| ()).is_none() {
-                    (offset, alloc_guard, cursor)
+                    (offset, cursor)
                 } else {
                     drop(cursor);
-                    drop(alloc_guard);
                     parent.allocator.alloc_and_lock_in_range(
                         preempt_guard,
                         parent.vm_space(),
@@ -637,7 +633,7 @@ fn allocate_range<'a>(
         }
     };
 
-    Ok((map_to_addr, alloc_guard, cursor))
+    Ok((map_to_addr, cursor))
 }
 
 fn readahead_for_populate(vmo: Arc<Vmo>, vmo_offset: usize, map_size: NonZeroUsize) {

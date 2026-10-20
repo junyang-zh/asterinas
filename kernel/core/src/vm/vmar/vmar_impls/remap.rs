@@ -18,7 +18,6 @@ use crate::{
         interval_set::Interval,
         is_userspace_vaddr_range,
         util::{get_intersected_range, is_intersected},
-        vm_allocator::AllocatorGuard,
         vmar_impls::map::map_to_page_table,
     },
 };
@@ -75,7 +74,7 @@ impl Vmar {
 
         let range_to_lock = affected_range.clone();
 
-        let (alloc_guard, mut cursor) =
+        let mut cursor =
             self.allocator
                 .alloc_specific_and_lock(&preempt_guard, self.vm_space(), &range_to_lock);
         let mut rs_as_delta = RsAsDelta::new(self);
@@ -118,7 +117,6 @@ impl Vmar {
             );
             drop(rs_as_delta);
             drop(cursor);
-            drop(alloc_guard);
             drop(preempt_guard);
             #[cfg(ktest)]
             self.accounting_pause
@@ -165,7 +163,6 @@ impl Vmar {
 
         drop(rs_as_delta);
         drop(cursor);
-        drop(alloc_guard);
         drop(preempt_guard);
 
         Ok(())
@@ -285,11 +282,9 @@ impl Vmar {
 
 /// The operations needed for remapping a mapping.
 #[derive(Debug)]
-struct AllocatedRemapOp<'a> {
+struct AllocatedRemapOp {
     resize_op: Option<ResizeOp>,
     move_op: Option<MoveRangeOp>,
-    #[expect(dead_code)]
-    alloc_guard: AllocatorGuard<'a>,
 }
 
 #[derive(Debug)]
@@ -313,14 +308,14 @@ struct MoveRangeOp {
     keep_source: bool,
 }
 
-impl<'a> AllocatedRemapOp<'a> {
+impl AllocatedRemapOp {
     /// Calculate the required operations and allocate new regions if needed.
     ///
     /// This function does not deallocate any old regions.
     ///
     /// Returns [`Errno::ENOMEM`] if the new range overlaps with existing
     /// mappings when `new_addr` is `Some`.
-    fn alloc_from(
+    fn alloc_from<'a>(
         guard: &'a DisabledPreemptGuard,
         parent: &'a Vmar,
         old_addr: Vaddr,
@@ -336,7 +331,7 @@ impl<'a> AllocatedRemapOp<'a> {
             None
         };
 
-        let (move_op, alloc_guard, cursor) = if let Some(new_addr) = new_addr {
+        let (move_op, cursor) = if let Some(new_addr) = new_addr {
             if !new_addr.is_multiple_of(PAGE_SIZE) || !is_userspace_vaddr_range(new_addr, new_size)
             {
                 return_errno_with_message!(
@@ -362,7 +357,7 @@ impl<'a> AllocatedRemapOp<'a> {
                 .ok_or(Errno::EINVAL)?
                 .max(new_end);
 
-            let (alloc_guard, cursor) = parent.allocator.alloc_specific_and_lock_larger(
+            let cursor = parent.allocator.alloc_specific_and_lock_larger(
                 guard,
                 parent.vm_space(),
                 &new_range,
@@ -382,7 +377,6 @@ impl<'a> AllocatedRemapOp<'a> {
                     need_to_clear_dest: true,
                     keep_source: action == RemapOldMappingAction::Keep,
                 }),
-                alloc_guard,
                 cursor,
             )
         } else {
@@ -395,7 +389,7 @@ impl<'a> AllocatedRemapOp<'a> {
             let new_end_if_expand = old_addr.checked_add(new_size);
             if action == RemapOldMappingAction::Unmap
                 && let Some(new_end) = new_end_if_expand
-                && let Ok((alloc_guard, cursor)) = lock_range_and_check_empty(
+                && let Ok(cursor) = lock_range_and_check_empty(
                     guard,
                     parent,
                     &(old_addr..new_end),
@@ -404,16 +398,15 @@ impl<'a> AllocatedRemapOp<'a> {
             {
                 // Fast path: expand in place.
                 resize = Some(ResizeOp::Extend(old_end..new_end, false));
-                (None, alloc_guard, cursor)
+                (None, cursor)
             } else {
-                let (new_addr, alloc_guard, cursor) =
-                    parent.allocator.alloc_and_lock_covering_another(
-                        guard,
-                        parent.vm_space(),
-                        old_addr..old_end,
-                        new_size,
-                        PAGE_SIZE,
-                    )?;
+                let (new_addr, cursor) = parent.allocator.alloc_and_lock_covering_another(
+                    guard,
+                    parent.vm_space(),
+                    old_addr..old_end,
+                    new_size,
+                    PAGE_SIZE,
+                )?;
 
                 resize = (new_size > old_size).then_some(ResizeOp::Extend(
                     new_addr + old_size..new_addr + new_size,
@@ -427,7 +420,6 @@ impl<'a> AllocatedRemapOp<'a> {
                         need_to_clear_dest: false,
                         keep_source: action == RemapOldMappingAction::Keep,
                     }),
-                    alloc_guard,
                     cursor,
                 )
             }
@@ -436,7 +428,6 @@ impl<'a> AllocatedRemapOp<'a> {
         let remap_op = AllocatedRemapOp {
             resize_op: resize,
             move_op,
-            alloc_guard,
         };
 
         Ok((remap_op, cursor))
@@ -653,12 +644,12 @@ fn lock_range_and_check_empty<'a>(
     parent: &'a Vmar,
     lock_range: &Range<Vaddr>,
     check_range: &Range<Vaddr>,
-) -> Result<(AllocatorGuard<'a>, VmarCursorMut<'a>)> {
+) -> Result<VmarCursorMut<'a>> {
     debug_assert!(check_range.start < check_range.end);
     debug_assert!(lock_range.contains(&check_range.start));
     debug_assert!(lock_range.contains(&(check_range.end - 1)));
 
-    let (alloc_guard, mut cursor) = parent.allocator.alloc_specific_and_lock_larger(
+    let mut cursor = parent.allocator.alloc_specific_and_lock_larger(
         guard,
         parent.vm_space(),
         check_range,
@@ -676,5 +667,5 @@ fn lock_range_and_check_empty<'a>(
         );
     }
 
-    Ok((alloc_guard, cursor))
+    Ok(cursor)
 }
