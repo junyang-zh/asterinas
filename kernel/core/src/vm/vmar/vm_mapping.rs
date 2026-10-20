@@ -699,9 +699,9 @@ impl VmMapping {
 
             let va = cursor.cur_va_range();
 
-            cursor
-                .flusher()
-                .issue_tlb_flush(TlbFlushOp::for_range(va.clone()));
+            // `unmap` already queues invalidation for the removed RAM, I/O,
+            // or subtree fragment and retains its frames until completion.
+            // The caller dispatches and synchronizes these requests.
             debug_assert!(va.end <= range.end);
             if cursor.jump(va.end).is_err() {
                 break;
