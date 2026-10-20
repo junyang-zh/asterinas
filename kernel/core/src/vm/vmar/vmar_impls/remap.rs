@@ -245,8 +245,15 @@ impl Vmar {
             }
 
             drop(rs_as_delta);
-            if let Some(range) = remap_op.new_mapping_range() {
-                self.add_mapping_size(&preempt_guard, range.len())?;
+            // Overwrite and shrink deltas have already committed. Moving the
+            // surviving source retains its charge; Keep adds a full new copy.
+            let growth = if action == RemapOldMappingAction::Keep {
+                new_size
+            } else {
+                new_size.saturating_sub(old_size)
+            };
+            if growth != 0 {
+                self.add_mapping_size(&preempt_guard, growth)?;
             }
 
             Ok(remap_op.perform_move_and_extend(&mut cursor))
