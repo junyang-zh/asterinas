@@ -60,7 +60,7 @@ impl VirtualAddressAllocator {
         })
     }
 
-    /// Truncates cache hints and returns a cursor covering the range.
+    /// Opportunistically truncates cache hints and returns a covering cursor.
     pub(super) fn alloc_specific_and_lock<'a>(
         &self,
         guard: &'a DisabledPreemptGuard,
@@ -70,7 +70,7 @@ impl VirtualAddressAllocator {
         self.alloc_specific_and_lock_larger(guard, vmar_space, range, range)
     }
 
-    /// Truncates cache hints and returns a cursor covering a larger range.
+    /// Opportunistically truncates hints and returns a cursor covering a larger range.
     pub(super) fn alloc_specific_and_lock_larger<'a>(
         &self,
         guard: &'a DisabledPreemptGuard,
@@ -81,10 +81,17 @@ impl VirtualAddressAllocator {
         #[cfg(ktest)]
         self.test_pause.before_pt(tests::FIXED);
         let cursor = vmar_space.cursor_mut(guard, lock_range).unwrap();
-        // Cache entries are hints; no simultaneous snapshot is required.
+        // Fixed mappings may concentrate on one CPU's hint. Do not wait for
+        // hint maintenance: cached selections revalidate Aux under PT even
+        // when a busy hint retains an overlap with this mapping.
         for cpu in cpu_range_for_vaddr_range(range) {
-            let mut hint = self.must_be_free.get_on_cpu(cpu.try_into().unwrap()).lock();
-            *hint = truncate_get_largest(&hint, range);
+            if let Some(mut hint) = self
+                .must_be_free
+                .get_on_cpu(cpu.try_into().unwrap())
+                .try_lock()
+            {
+                *hint = truncate_get_largest(&hint, range);
+            }
         }
         cursor
     }
