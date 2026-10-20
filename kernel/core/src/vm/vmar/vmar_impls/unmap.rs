@@ -193,7 +193,6 @@ impl Vmar {
             let intersected_range = get_intersected_range(&range, &vm_mapping_range);
 
             cursor.jump(intersected_range.start).unwrap();
-            let mut num_unmapped_this_mapping = 0;
 
             while let Some(va) = cursor.find_next(intersected_range.end) {
                 propagate_if_needed(&mut cursor, intersected_range.end - va);
@@ -202,7 +201,15 @@ impl Vmar {
                 let num_unmapped = cursor.unmap();
                 if is_ram {
                     rs_as_delta.add_rs(rss_type, -(num_unmapped as isize));
-                    num_unmapped_this_mapping += num_unmapped;
+                    // Propagation can split the original mapping among child
+                    // page tables. Account against the fragment owning this
+                    // PTE while the cursor is still on that fragment.
+                    let Some(PteRangeMeta::VmMapping(mapping)) =
+                        cursor.aux_meta_mut().inner.find_one_mut(&va)
+                    else {
+                        panic!("unmapped RAM page has no owning mapping");
+                    };
+                    mapping.dec_frames_mapped(num_unmapped);
                 }
 
                 if va + page_size < intersected_range.end {
@@ -212,19 +219,15 @@ impl Vmar {
                 }
             }
 
-            let Some(PteRangeMeta::VmMapping(mapping)) = cursor
-                .aux_meta_mut()
-                .inner
-                .find_one_mut(&intersected_range.start)
-            else {
-                panic!("there were mappings but cannot find it the second time");
-            };
-            mapping.dec_frames_mapped(num_unmapped_this_mapping);
-
             if cursor.jump(intersected_range.end).is_err() {
                 break;
             }
         }
+
+        // Discard leaves the VMA present. A subsequent access must fault and
+        // reload clean contents, including when a hole causes ENOMEM below.
+        cursor.flusher().dispatch_tlb_flush();
+        cursor.flusher().sync_tlb_flush();
 
         if last_mapping_end < range.end {
             return_errno_with_message!(
