@@ -28,9 +28,10 @@
 mod entry;
 mod mcs;
 mod pte_state;
+mod rwlock;
 
 use alloc::boxed::Box;
-use core::{cell::SyncUnsafeCell, ops::Deref, pin::Pin, sync::atomic::Ordering};
+use core::{cell::SyncUnsafeCell, ops::Deref, sync::atomic::Ordering};
 
 pub(crate) use self::pte_state::PteStateRef;
 pub(in crate::mm) use self::{entry::Entry, pte_state::PteState};
@@ -144,6 +145,11 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         }
     }
 
+    pub(super) fn clone_ref(&self) -> Self {
+        // SAFETY: The existing reference guarantees the same node lives for 'a.
+        unsafe { Self::borrow_paddr(self.paddr()) }
+    }
+
     /// Locks the page table node.
     ///
     /// An atomic mode guard is required to
@@ -153,17 +159,14 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     where
         'a: 'rcu,
     {
-        let node = Box::pin(mcs::Node::new());
-        // SAFETY: This freshly allocated pinned node is not in any queue.
-        unsafe { node.as_ref().lock(&self.meta().state.lock.body) };
-        // SAFETY: Only the lock owner accesses the owner slot. Keeping it in
-        // the frame, rather than the guard, preserves it across DFS forgetting.
-        unsafe { self.meta().state.lock.owner.get().write(Some(node)) };
-
-        PageTableGuard::<'rcu, C> { inner: self }
+        self.meta().state.lock.lock_write();
+        PageTableGuard {
+            inner: self,
+            kind: GuardKind::Write,
+        }
     }
 
-    /// Tries to lock the page table node without waiting.
+    /// Tries to acquire exclusive ownership without waiting or queuing.
     pub(super) fn try_lock<'rcu>(
         self,
         _guard: &'rcu dyn InAtomicMode,
@@ -171,14 +174,39 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     where
         'a: 'rcu,
     {
-        let node = Box::pin(mcs::Node::new());
-        // SAFETY: The pinned node is fresh; failure does not enqueue it.
-        if !unsafe { node.as_ref().try_lock(&self.meta().state.lock.body) } {
+        if !self.meta().state.lock.try_write() {
             return None;
         }
-        // SAFETY: Successful acquisition gives exclusive ownership of this slot.
-        unsafe { self.meta().state.lock.owner.get().write(Some(node)) };
-        Some(PageTableGuard::<'rcu, C> { inner: self })
+        Some(PageTableGuard {
+            inner: self,
+            kind: GuardKind::Write,
+        })
+    }
+
+    /// Acquires a shared ancestor guard. Mutation methods reject this state.
+    pub(super) fn lock_read<'rcu>(self, _guard: &'rcu dyn InAtomicMode) -> PageTableGuard<'rcu, C>
+    where
+        'a: 'rcu,
+    {
+        let read = self.meta().state.lock.lock_read();
+        PageTableGuard {
+            inner: self,
+            kind: GuardKind::Read(Some(read)),
+        }
+    }
+
+    pub(super) fn try_read<'rcu>(
+        self,
+        _guard: &'rcu dyn InAtomicMode,
+    ) -> Option<PageTableGuard<'rcu, C>>
+    where
+        'a: 'rcu,
+    {
+        let read = self.meta().state.lock.try_read()?;
+        Some(PageTableGuard {
+            inner: self,
+            kind: GuardKind::Read(Some(read)),
+        })
     }
 
     /// Creates a new [`PageTableGuard`] without checking if the page table lock is held.
@@ -196,7 +224,10 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     where
         'a: 'rcu,
     {
-        PageTableGuard { inner: self }
+        PageTableGuard {
+            inner: self,
+            kind: GuardKind::ImplicitWrite,
+        }
     }
 }
 
@@ -204,9 +235,33 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
 #[derive(Debug)]
 pub(super) struct PageTableGuard<'rcu, C: PageTableConfig> {
     inner: PageTableNodeRef<'rcu, C>,
+    kind: GuardKind,
+}
+
+/// Shared guards never expose mutable Aux or an entry accessor. Implicit
+/// guards are valid only while an ancestor's writer guard remains alive.
+#[derive(Debug)]
+enum GuardKind {
+    Read(Option<rwlock::bravo::BravoReadGuard>),
+    Write,
+    ImplicitWrite,
 }
 
 impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
+    /// Atomically turns the covering writer into a shared ancestor.
+    pub(super) fn downgrade(mut self) -> Self {
+        assert!(matches!(self.kind, GuardKind::Write));
+        self.kind = GuardKind::Read(Some(self.meta().state.lock.downgrade()));
+        self
+    }
+
+    fn assert_exclusive(&self) {
+        assert!(
+            !matches!(self.kind, GuardKind::Read(_)),
+            "shared page table mutation"
+        );
+    }
+
     /// Borrows an entry in the node.
     ///
     /// The page table entry is specified by its corresponding virtual address.
@@ -221,6 +276,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// Panics if the virtual address is not aligned to the page size at the
     /// current level.
     pub(super) fn entry(&mut self, pte_vaddr: Vaddr) -> Entry<'_, 'rcu, C> {
+        self.assert_exclusive();
         assert_eq!(pte_vaddr % page_size::<C>(self.level()), 0);
         Entry::new_at(self, pte_vaddr)
     }
@@ -244,12 +300,14 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 
     /// Returns if the page table node is detached from its parent.
     pub(super) fn stray_mut(&mut self) -> &mut bool {
+        self.assert_exclusive();
         // SAFETY: The lock is held so we have an exclusive access.
         unsafe { &mut (*self.meta().state.inner.get()).stray }
     }
 
     /// Returns a reference to the auxiliary data of the page table node.
     pub(super) fn aux_mut(&mut self) -> &mut C::Aux {
+        self.assert_exclusive();
         // SAFETY: The lock is held so we have an exclusive access.
         unsafe { &mut (*self.meta().state.inner.get()).aux }
     }
@@ -287,6 +345,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     ///  3. The page table node will have the ownership of the [`PteState`]
     ///     after this method.
     pub(super) unsafe fn write_pte(&mut self, idx: usize, pte: C::E) {
+        self.assert_exclusive();
         debug_assert!(idx < nr_subpage_per_huge::<C>());
         let ptr = paddr_to_vaddr(self.paddr()) as *mut C::E;
         // SAFETY:
@@ -297,6 +356,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 
     /// Gets the mutable reference to the number of valid PTEs in the node.
     fn nr_children_mut(&mut self) -> &mut u16 {
+        self.assert_exclusive();
         // SAFETY: The lock is held so we have an exclusive access.
         unsafe { &mut (*self.meta().state.inner.get()).nr_children }
     }
@@ -312,11 +372,16 @@ impl<'rcu, C: PageTableConfig> Deref for PageTableGuard<'rcu, C> {
 
 impl<C: PageTableConfig> Drop for PageTableGuard<'_, C> {
     fn drop(&mut self) {
-        // SAFETY: The guard exclusively owns the lock and its queue node.
-        let node = unsafe { self.meta().state.lock.owner.get().replace(None) }.unwrap();
-        // SAFETY: The pinned node acquired this lock and remains alive until
-        // all queue handoff accesses complete inside unlock.
-        unsafe { node.as_ref().unlock(&self.meta().state.lock.body) };
+        match &mut self.kind {
+            GuardKind::Read(read) => self
+                .inner
+                .meta()
+                .state
+                .lock
+                .unlock_read(read.take().unwrap()),
+            GuardKind::Write => self.inner.meta().state.lock.unlock_write(),
+            GuardKind::ImplicitWrite => {}
+        }
     }
 }
 
@@ -339,13 +404,7 @@ pub struct PageTableFrameMeta<C: PageTableConfig> {
 #[derive(Debug)]
 struct NodeState<C: PageTableConfig> {
     inner: SyncUnsafeCell<PageTableFrameMetaInner<C>>,
-    lock: NodeLock,
-}
-
-#[derive(Debug)]
-struct NodeLock {
-    body: mcs::LockBody,
-    owner: SyncUnsafeCell<Option<Pin<Box<mcs::Node>>>>,
+    lock: rwlock::bravo::BravoPfqRwLock,
 }
 
 struct PageTableFrameMetaInner<C: PageTableConfig> {
@@ -372,10 +431,7 @@ impl<C: PageTableConfig> PageTableFrameMeta<C> {
                     nr_children: 0,
                     stray: false,
                 }),
-                lock: NodeLock {
-                    body: mcs::LockBody::new(),
-                    owner: SyncUnsafeCell::new(None),
-                },
+                lock: rwlock::bravo::BravoPfqRwLock::new(),
             }),
             level,
         }
