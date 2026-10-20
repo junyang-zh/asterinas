@@ -426,6 +426,9 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             );
         }
 
+        drop(cursor);
+        drop(preempt_guard);
+
         Ok(map_to_addr)
     }
 
