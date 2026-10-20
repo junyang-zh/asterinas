@@ -37,7 +37,7 @@ pub(in crate::mm) use self::{entry::Entry, pte_state::PteState};
 use super::{PageTableConfig, PteTrait, nr_subpage_per_huge};
 use crate::{
     mm::{
-        FrameAllocOptions, HasPaddr, Infallible, PagingConstsTrait, PagingLevel, Vaddr, VmReader,
+        HasPaddr, Infallible, PagingConstsTrait, PagingLevel, Vaddr, VmReader,
         frame::{Frame, FrameRef, meta::AnyFrameMeta},
         paddr_to_vaddr, page_size,
         page_table::{PteScalar, load_pte, store_pte},
@@ -64,11 +64,7 @@ impl<C: PageTableConfig> PageTableNode<C> {
 
     /// Allocates a new empty page table node.
     pub(super) fn alloc(level: PagingLevel, aux: C::Aux) -> Self {
-        let meta = PageTableFrameMeta::new(level, aux);
-        FrameAllocOptions::new()
-            .zeroed(true)
-            .alloc_frame_with(meta)
-            .expect("Failed to allocate a page table node")
+        super::zeroed_pt_pool::alloc::<C>(level, aux)
     }
 
     /// Activates the page table assuming it is a root page table.
@@ -342,7 +338,7 @@ struct PageTableFrameMetaInner<C: PageTableConfig> {
 #[expect(private_bounds)]
 impl<C: PageTableConfig> PageTableFrameMeta<C> {
     /// Creates a new page table frame metadata.
-    fn new(level: PagingLevel, aux: C::Aux) -> Self {
+    pub(super) fn new(level: PagingLevel, aux: C::Aux) -> Self {
         Self {
             state: Box::new(NodeState {
                 inner: SyncUnsafeCell::new(PageTableFrameMetaInner {
