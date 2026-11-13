@@ -110,6 +110,11 @@ pub(super) fn handle_irq(trap_frame: &TrapFrame, interrupt: Interrupt, priv_leve
             }
         }
         Interrupt::SupervisorSoft => {
+            // Clear before dispatch so a concurrent sender cannot have its
+            // new IPI erased after the queued callbacks have been drained.
+            // SAFETY: We are handling this hart's software interrupt with
+            // local IRQs disabled; the callback queue preserves pending work.
+            unsafe { riscv::register::sip::clear_ssoft() };
             let ipi_irq_num = super::irq::ipi::IPI_IRQ.get().unwrap().num();
             call_irq_callback_functions(
                 trap_frame,

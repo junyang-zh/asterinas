@@ -57,11 +57,8 @@ impl HwIrqLine {
                     *interrupt_source_on_chip,
                 );
             }
-            InterruptSource::Software => {
-                // SAFETY: We have already handled the IPI. So clearing the
-                // software interrupt pending bit is safe.
-                unsafe { riscv::register::sip::clear_ssoft() };
-            }
+            // Software interrupts are cleared before callback dispatch.
+            InterruptSource::Software => {}
         }
     }
 }
