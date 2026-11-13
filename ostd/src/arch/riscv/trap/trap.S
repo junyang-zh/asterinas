@@ -92,7 +92,8 @@ _end_trap_from_kernel:
     mv a0, sp                                # first arg is TrapFrame
     lla ra, _trap_return                     # set return address
 .extern trap_handler
-    j trap_handler
+    # The Rust handler may be outside JAL range; preserve the prepared ra.
+    tail trap_handler
 
 _end_trap_from_user:
     # load callee-saved registers
