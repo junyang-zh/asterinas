@@ -51,7 +51,17 @@ pub(super) fn switch_to_task(next_task: Arc<Task>, preempt_guard: DisabledPreemp
 
     let current_task_ptr = CURRENT_TASK_PTR.load();
     #[cfg(feature = "breakdown_counters")]
-    crate::mm::breakdown::switch(crate::mm::breakdown::current_task_id(), crate::mm::breakdown::task_id(&next_task));
+    {
+        // Record termination after the final scheduler scope and pre-switch
+        // callbacks have completed, while the old task is still current.
+        if Task::current().is_some_and(|task| task.is_finished()) {
+            crate::mm::breakdown::exit_task(crate::mm::breakdown::current_task_id());
+        }
+        crate::mm::breakdown::switch(
+            crate::mm::breakdown::current_task_id(),
+            crate::mm::breakdown::task_id(&next_task),
+        );
+    }
     CURRENT_TASK_PTR.store(Arc::into_raw(next_task));
     debug_assert!(PREVIOUS_TASK_PTR.load().is_null());
     PREVIOUS_TASK_PTR.store(current_task_ptr);
