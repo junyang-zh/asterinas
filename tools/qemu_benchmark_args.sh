@@ -4,8 +4,16 @@ set -euo pipefail
 : "${ARTIFACT_EXT2_IMAGE:?}" "${ARTIFACT_EXFAT_IMAGE:?}" "${BENCH_DATA_IMAGE:?}"
 # Preserve legacy vda/vdb/vdc ordering; no forwarding or graphical console.
 # QMP is local-only and used by the measurement runner for vCPU affinity.
+benchmark_cpu=host
+if [[ -n ${CORTEN_GUEST_TSC_HZ:-} ]]; then
+    [[ $CORTEN_GUEST_TSC_HZ =~ ^[1-9][0-9]*$ ]] || {
+        echo "CORTEN_GUEST_TSC_HZ must be a positive integer in Hz" >&2
+        exit 2
+    }
+    benchmark_cpu+=",tsc-frequency=$CORTEN_GUEST_TSC_HZ"
+fi
 cat <<EOF
--cpu host -machine q35,kernel-irqchip=split -smp ${SMP:-1} -m ${MEM:-8G}
+-cpu $benchmark_cpu -machine q35,kernel-irqchip=split -smp ${SMP:-1} -m ${MEM:-8G}
 -no-reboot -display none -serial stdio -monitor none -nic none
 -qmp tcp:127.0.0.1:${QMP_PORT:-4444},server=on,wait=off
 -device isa-debug-exit,iobase=0xf4,iosize=0x04
