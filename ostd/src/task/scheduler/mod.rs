@@ -530,8 +530,6 @@ fn set_need_preempt(cpu_id: CpuId) {
 /// This should only be called if the current is to exit.
 #[track_caller]
 pub(super) fn exit_current() -> ! {
-    #[cfg(feature = "breakdown_counters")]
-    crate::mm::breakdown::exit_task(crate::mm::breakdown::current_task_id());
     let mut is_first_try = true;
 
     reschedule(|local_rq: &mut dyn LocalRunQueue| {
@@ -586,7 +584,9 @@ where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
     #[cfg(feature = "breakdown_counters")]
-    let _profile = crate::mm::breakdown::enter(crate::mm::breakdown::Phase::Scheduler);
+    let mut profile = Some(crate::mm::breakdown::enter(
+        crate::mm::breakdown::Phase::Scheduler,
+    ));
 
     super::atomic_mode::might_sleep();
     // SAFETY: RCU readers disable preemption. The atomic-mode check above
@@ -628,6 +628,12 @@ where
     //
     // Transfer the preemption guard so there is no interruptible gap between
     // selecting this task and installing its context.
+    #[cfg(feature = "breakdown_counters")]
+    if Task::current().is_some_and(|task| task.is_finished()) {
+        // The exiting task never returns here, so its stack will not drop this
+        // guard. Close the scheduler scope before the final task-exit record.
+        drop(profile.take());
+    }
     processor::switch_to_task(next_task, preempt_guard);
 }
 
@@ -672,5 +678,35 @@ mod test {
         // whichever runnable tasks happen to be present in the test queue.
         reschedule(|_| ReschedAction::DoNothing);
         assert!(!INJECT_PREEMPT.load());
+    }
+
+    #[cfg(feature = "breakdown_counters")]
+    #[ktest]
+    fn exiting_tasks_leave_no_open_profile_scopes() {
+        use core::sync::atomic::Ordering;
+
+        use crate::{mm::breakdown, task::TaskOptions};
+
+        fn clock_ns() -> u64 {
+            timer::Jiffies::elapsed()
+                .as_u64()
+                .saturating_mul(1_000_000_000 / timer::TIMER_FREQ)
+        }
+
+        breakdown::start_online(clock_ns).unwrap();
+        for _ in 0..16 {
+            let task = TaskOptions::new(|| {}).data(()).spawn().unwrap();
+            // is_finished precedes the actual switch. Wait until the next task
+            // releases the CPU reservation before inspecting the final epoch.
+            while !task.is_finished() || task.switched_to_cpu.load(Ordering::Acquire) {
+                Task::yield_now();
+            }
+        }
+        breakdown::stop().unwrap();
+        let snapshot = breakdown::snapshot().unwrap();
+        assert!(snapshot.contains("\"open_stack_entries\":0}"));
+        for cpu in snapshot.lines().filter(|line| line.contains("aggregate_cpu")) {
+            assert!(cpu.contains("\"invalid\":0,"));
+        }
     }
 }
