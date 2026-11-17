@@ -107,13 +107,14 @@ fn write_cpu_set_to(
     cpuset_size: usize,
     cpu_set_ptr: Vaddr,
 ) -> Result<usize> {
-    if cpuset_size == 0 {
-        return_errno_with_message!(Errno::EINVAL, "invalid cpuset size");
-    }
-
     let num_cpus = num_cpus();
 
-    let nr_parts_to_write = cmp::min(cpuset_size / SIZE_OF_PART, num_cpus.div_ceil(CPUS_IN_PART));
+    let nr_parts_to_write = num_cpus.div_ceil(CPUS_IN_PART);
+    // Callers such as Python grow their affinity buffer after EINVAL. Returning
+    // a truncated mask instead makes CPUs beyond that buffer disappear.
+    if cpuset_size % SIZE_OF_PART != 0 || cpuset_size / SIZE_OF_PART < nr_parts_to_write {
+        return_errno_with_message!(Errno::EINVAL, "invalid cpuset size");
+    }
     let mut user_part: Part = 0;
     let mut part_idx = 0;
     for cpu_id in cpu_set.iter() {
