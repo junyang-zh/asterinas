@@ -5,6 +5,8 @@
 //!
 //! Reference: <https://man7.org/linux/man-pages/man5/proc_stat.5.html>
 
+use core::fmt::Write;
+
 use aster_softirq::{
     iter_irq_counts_across_all_cpus, iter_softirq_counts_across_all_cpus, softirq_id::*,
 };
@@ -12,13 +14,17 @@ use aster_util::printer::VmPrinter;
 use ostd::util::id_set::Id;
 
 use crate::{
+    events::IoEvents,
     fs::{
-        file::mkmod,
-        procfs::template::{ProcFile, ProcFileOps},
-        vfs::inode::Inode,
+        file::{AccessMode, PerOpenFileOps, StatusFlags, mkmod},
+        procfs::template::{ProcFile, ProcFileOpsByHandle},
+        vfs::inode::{FileOps, Inode},
     },
     prelude::*,
-    process::collect_process_creation_count,
+    process::{
+        collect_process_creation_count,
+        signal::{PollHandle, Pollable},
+    },
     sched::nr_queued_and_running,
     thread::collect_context_switch_count,
     time::{START_TIME, SystemTime, cpu_time_stats::CpuTimeStatsManager},
@@ -35,7 +41,7 @@ impl StatFileOps {
         ProcFile::new(Self, parent, mkmod!(a+r))
     }
 
-    fn print_stats(printer: &mut VmPrinter) -> Result<()> {
+    fn print_stats(printer: &mut impl Write) -> core::fmt::Result {
         let stats_manager = CpuTimeStatsManager::singleton();
 
         // Global CPU statistics:
@@ -143,12 +149,67 @@ impl StatFileOps {
     }
 }
 
-impl ProcFileOps for StatFileOps {
-    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
-        let mut printer = VmPrinter::new_skip(writer, offset);
+impl ProcFileOpsByHandle for StatFileOps {
+    fn open(
+        &self,
+        _access_mode: AccessMode,
+        _status_flags: StatusFlags,
+    ) -> Result<Box<dyn PerOpenFileOps>> {
+        Ok(Box::new(StatFileHandle(Mutex::new(None))))
+    }
+}
 
-        Self::print_stats(&mut printer)?;
+/// Keep byte offsets stable while counters grow between consecutive reads.
+/// Starting again at offset zero refreshes the snapshot, as does a new open.
+struct StatFileHandle(Mutex<Option<String>>);
+
+impl Pollable for StatFileHandle {
+    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
+        (IoEvents::IN | IoEvents::OUT) & mask
+    }
+}
+
+impl FileOps for StatFileHandle {
+    fn read_at(
+        &self,
+        offset: usize,
+        writer: &mut VmWriter,
+        _status_flags: StatusFlags,
+    ) -> Result<usize> {
+        if writer.avail() == 0 {
+            return Ok(0);
+        }
+
+        let mut snapshot = self.0.lock();
+        if offset == 0 || snapshot.is_none() {
+            let mut text = String::new();
+            StatFileOps::print_stats(&mut text)
+                .expect("formatting statistics into a String cannot fail");
+            *snapshot = Some(text);
+        }
+
+        let mut printer = VmPrinter::new_skip(writer, offset);
+        printer.write_bytes(snapshot.as_ref().unwrap().as_bytes())?;
 
         Ok(printer.bytes_written())
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _reader: &mut VmReader,
+        _status_flags: StatusFlags,
+    ) -> Result<usize> {
+        return_errno_with_message!(Errno::EPERM, "the file is not writable");
+    }
+}
+
+impl PerOpenFileOps for StatFileHandle {
+    fn check_seekable(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_offset_aware(&self) -> bool {
+        true
     }
 }
