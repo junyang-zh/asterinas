@@ -408,9 +408,12 @@ fn handle_one_page(
     match item {
         VmQueriedItem::MappedRam { frame, mut prop } => {
             if VmPerms::from(prop.flags).contains(required_perms) {
-                // The page fault is already handled maybe by other threads.
-                // Just flush the TLB and return.
-                TlbFlushOp::for_range(cur_va_range).perform_on_current();
+                // Another thread may have resolved the fault. Invalidate the
+                // faulting address before retrying it. Already-present neighbors
+                // are only visited for fault-around and their PTEs are unchanged.
+                if va == page_fault_info.address.align_down(PAGE_SIZE) {
+                    TlbFlushOp::for_range(cur_va_range).perform_on_current();
+                }
                 return Ok(());
             }
             assert!(is_write);
