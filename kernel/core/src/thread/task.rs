@@ -96,6 +96,7 @@ pub(crate) fn create_new_user_task(
                     }
                 }
                 ReturnReason::KernelEvent => {
+                    ctx.thread.apply_current_affinity();
                     ctx.thread_local.set_orig_syscall_ret(None);
                 }
             };
@@ -142,6 +143,10 @@ pub(crate) fn create_new_user_task(
 impl UserModeHooks for Context<'_> {
     fn has_kernel_event(&self) -> bool {
         self.has_pending()
+    }
+
+    fn may_enter_user(&self, guard: &DisabledLocalIrqGuard) -> bool {
+        self.thread.may_enter_user(guard)
     }
 
     fn pre_user_run(&self, guard: &DisabledLocalIrqGuard) {

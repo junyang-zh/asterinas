@@ -70,6 +70,7 @@ fdt.workspace = true
 unwinding = { workspace = true, features = ["fde-static"] }
 
 [features]
+idle_shootdown_hint = []
 lazy_tlb_flush_on_unmap = []
 breakdown_counters = []
 memory_accounting = []

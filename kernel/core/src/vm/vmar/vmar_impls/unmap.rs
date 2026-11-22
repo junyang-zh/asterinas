@@ -225,7 +225,7 @@ impl Vmar {
                 propagate_if_needed(&mut cursor, intersected_range.end - va);
                 let page_size = page_size_at(cursor.level());
                 let is_ram = matches!(cursor.query(), VmQueriedItem::MappedRam { .. });
-                let num_unmapped = cursor.unmap();
+                let num_unmapped = cursor.unmap_for_synchronous_flush();
                 if is_ram {
                     rs_as_delta.add_rs(rss_type, -(num_unmapped as isize));
                     // Propagation can split the original mapping among child
@@ -253,8 +253,7 @@ impl Vmar {
 
         // Discard leaves the VMA present. A subsequent access must fault and
         // reload clean contents, including when a hole causes ENOMEM below.
-        cursor.flusher().dispatch_tlb_flush();
-        cursor.flusher().sync_tlb_flush();
+        cursor.finish_synchronous_discard();
 
         if last_mapping_end < range.end {
             return_errno_with_message!(

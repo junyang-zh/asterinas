@@ -127,7 +127,7 @@ fn inversion_probe(stage: usize) {
                 true
             }
             CACHED => worker_allocator
-                .alloc_and_lock(&guard, &worker_space, PAGE_SIZE, PAGE_SIZE)
+                .alloc_and_lock(&guard, &worker_space, PAGE_SIZE, PAGE_SIZE, false)
                 .is_ok(),
             SLOW => worker_allocator
                 .try_lock_and_alloc_from(
@@ -882,6 +882,20 @@ fn hint_success_and_unrestricted_exhaustion_preserve_mappings() {
     vmar.remove_mapping(hint..hint + PAGE_SIZE).unwrap();
     assert_eq!(vmar.get_mappings_total_size(), before);
     assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+}
+
+#[ktest]
+fn cached_leaf_preference_preserves_alignment_and_tight_holes() {
+    let span = page_size_at(2);
+    let size = span / 8;
+    let va = span - PAGE_SIZE;
+    assert_eq!(leaf_contained_start(va, size, 0), span - size);
+    assert_eq!(leaf_contained_start(va, size, va), va);
+    assert_eq!(leaf_contained_start(span, size, 0), span);
+    assert_eq!(leaf_contained_start(va, 3 * PAGE_SIZE, 0), va);
+    assert_eq!(leaf_contained_start(va, 2 * span, 0), va);
+    assert_eq!(leaf_contained_start(va, PAGE_SIZE, 0), va);
+    assert_eq!(leaf_contained_start(va, span, 0), 0);
 }
 
 #[ktest]

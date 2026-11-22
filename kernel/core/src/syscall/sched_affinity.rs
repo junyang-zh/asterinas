@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{cmp, sync::atomic::Ordering};
-
-use ostd::{
-    cpu::{CpuId, CpuSet, num_cpus},
-    mm::VmIo,
-    util::id_set::Id,
-};
+use ostd::{cpu::CpuSet, mm::VmIo};
 
 use super::SyscallReturn;
 use crate::{prelude::*, process::pid_table, thread::Tid};
@@ -18,9 +12,9 @@ pub(super) fn sys_sched_getaffinity(
     ctx: &Context,
 ) -> Result<SyscallReturn> {
     let cpu_set = match tid {
-        0 => ctx.thread.atomic_cpu_affinity().load(Ordering::Relaxed),
+        0 => ctx.thread.cpu_affinity(),
         _ => match pid_table::pid_table_mut().get_thread(tid) {
-            Some(thread) => thread.atomic_cpu_affinity().load(Ordering::Relaxed),
+            Some(thread) => thread.cpu_affinity(),
             None => return_errno_with_message!(Errno::ESRCH, "the target thread does not exist"),
         },
     };
@@ -30,10 +24,6 @@ pub(super) fn sys_sched_getaffinity(
     Ok(SyscallReturn::Return(bytes_written as isize))
 }
 
-// TODO: The manual page of `sched_setaffinity` says that if the thread is not
-// running on the CPU specified in the affinity mask, it would be migrated to
-// one of the CPUs specified in the mask. We currently do not support this
-// feature as the scheduler is not ready for migration yet.
 pub(super) fn sys_sched_setaffinity(
     tid: Tid,
     cpuset_size: usize,
@@ -42,19 +32,12 @@ pub(super) fn sys_sched_setaffinity(
 ) -> Result<SyscallReturn> {
     let user_cpu_set = read_cpu_set_from(ctx.user_space(), cpuset_size, cpu_set_ptr)?;
 
-    match tid {
-        0 => ctx
-            .thread
-            .atomic_cpu_affinity()
-            .store(&user_cpu_set, Ordering::Relaxed),
-        _ => match pid_table::pid_table_mut().get_thread(tid) {
-            Some(thread) => {
-                thread
-                    .atomic_cpu_affinity()
-                    .store(&user_cpu_set, Ordering::Relaxed);
-            }
-            None => return_errno_with_message!(Errno::ESRCH, "the target thread does not exist"),
-        },
+    if tid == 0 {
+        ctx.thread.set_cpu_affinity(user_cpu_set, ctx.thread);
+    } else {
+        let target = pid_table::pid_table_mut().get_thread(tid)
+            .ok_or_else(|| Error::with_message(Errno::ESRCH, "the target thread does not exist"))?;
+        target.set_cpu_affinity(user_cpu_set, ctx.thread);
     }
 
     Ok(SyscallReturn::Return(0))
@@ -64,7 +47,6 @@ pub(super) fn sys_sched_setaffinity(
 // `long`. We use the same scheme to ensure byte endianness compatibility.
 type Part = u64;
 const SIZE_OF_PART: usize = size_of::<Part>();
-const CPUS_IN_PART: usize = SIZE_OF_PART * 8;
 
 fn read_cpu_set_from(
     user_space: CurrentUserSpace,
@@ -75,23 +57,11 @@ fn read_cpu_set_from(
         return_errno_with_message!(Errno::EINVAL, "invalid cpuset size");
     }
 
-    let num_cpus = num_cpus();
-
-    let mut ret_set = CpuSet::new_empty();
-
-    let nr_parts_to_read = cmp::min(cpuset_size / SIZE_OF_PART, num_cpus.div_ceil(CPUS_IN_PART));
-    for part_id in 0..nr_parts_to_read {
-        let user_part: Part = user_space.read_val(cpu_set_ptr + part_id * SIZE_OF_PART)?;
-        for bit_id in 0..CPUS_IN_PART {
-            if user_part & (1 << bit_id) != 0 {
-                // If the CPU ID is invalid, just ignore it.
-                let Ok(cpu_id) = CpuId::try_from(part_id * CPUS_IN_PART + bit_id) else {
-                    continue;
-                };
-                ret_set.add(cpu_id);
-            }
-        }
-    }
+    let ret_set = CpuSet::try_from_words(|words| {
+        let bytes = words.as_mut_bytes();
+        let len = cpuset_size.min(bytes.len());
+        user_space.read_bytes(cpu_set_ptr, &mut bytes[..len])
+    })?;
 
     if ret_set.is_empty() {
         return_errno_with_message!(Errno::EINVAL, "empty cpuset");
@@ -107,34 +77,11 @@ fn write_cpu_set_to(
     cpuset_size: usize,
     cpu_set_ptr: Vaddr,
 ) -> Result<usize> {
-    let num_cpus = num_cpus();
-
-    let nr_parts_to_write = num_cpus.div_ceil(CPUS_IN_PART);
-    // Callers such as Python grow their affinity buffer after EINVAL. Returning
-    // a truncated mask instead makes CPUs beyond that buffer disappear.
-    if cpuset_size % SIZE_OF_PART != 0 || cpuset_size / SIZE_OF_PART < nr_parts_to_write {
+    let words = cpu_set.as_words();
+    if cpuset_size % SIZE_OF_PART != 0 || cpuset_size / SIZE_OF_PART < words.len() {
         return_errno_with_message!(Errno::EINVAL, "invalid cpuset size");
     }
-    let mut user_part: Part = 0;
-    let mut part_idx = 0;
-    for cpu_id in cpu_set.iter() {
-        let id = cpu_id.as_usize();
-        while part_idx < cmp::min(id / CPUS_IN_PART, nr_parts_to_write) {
-            user_space.write_val(cpu_set_ptr + part_idx * SIZE_OF_PART, &user_part)?;
-            user_part = 0;
-            part_idx += 1;
-        }
-        if part_idx >= nr_parts_to_write {
-            break;
-        }
-        user_part |= 1 << (id % CPUS_IN_PART);
-    }
 
-    while part_idx < nr_parts_to_write {
-        user_space.write_val(cpu_set_ptr + part_idx * SIZE_OF_PART, &user_part)?;
-        user_part = 0;
-        part_idx += 1;
-    }
-
-    Ok(nr_parts_to_write * SIZE_OF_PART)
+    user_space.write_slice(cpu_set_ptr, words)?;
+    Ok(size_of_val(words))
 }

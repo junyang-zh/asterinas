@@ -159,6 +159,17 @@ impl<I: Id> IdSet<I> {
         }
     }
 
+    /// Initializes the bitmap from native words. The supplied buffer is zeroed,
+    /// and bits past the cardinality of the ID type are discarded.
+    pub fn try_from_words<E>(
+        fill: impl FnOnce(&mut [u64]) -> core::result::Result<(), E>,
+    ) -> core::result::Result<Self, E> {
+        let mut set = Self::new_empty();
+        fill(&mut set.bits)?;
+        Self::clear_invalid_id_bits(&mut set.bits);
+        Ok(set)
+    }
+
     /// Creates a new `IdSet` with no IDs in the system.
     pub fn new_empty() -> Self {
         let bits = Self::with_bit_pattern(0);
@@ -211,6 +222,13 @@ impl<I: Id> IdSet<I> {
         let part_idx = part_idx(id);
         let bit_idx = bit_idx(id);
         part_idx < self.bits.len() && (self.bits[part_idx] & (1 << bit_idx)) != 0
+    }
+
+    /// Returns the bitmap in ascending 64-bit words.
+    ///
+    /// Bit zero of the first word represents ID zero. Unused high bits are clear.
+    pub fn as_words(&self) -> &[u64] {
+        &self.bits
     }
 
     /// Returns the number of IDs in the set.
@@ -423,6 +441,18 @@ impl<I: Id> AtomicIdSet<I> {
         }
     }
 
+    /// Samples the membership words until observing an ID other than the one
+    /// supplied. This advisory check does not synchronize with page tables.
+    #[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+    pub(crate) fn has_other_than(&self, id: I) -> bool {
+        let index = part_idx(id);
+        let bit = 1u64 << bit_idx(id);
+        self.bits.iter().enumerate().any(|(i, part)| {
+            let mask = if i == index { !bit } else { u64::MAX };
+            part.load(Ordering::Relaxed) & mask != 0
+        })
+    }
+
     /// Atomically checks if the set contains the specified ID.
     pub fn contains(&self, id: I, ordering: Ordering) -> bool {
         let part_idx = part_idx(id);
@@ -456,6 +486,24 @@ mod id_set_tests {
     impl<const C: u32> From<MockId<C>> for u32 {
         fn from(id: MockId<C>) -> u32 {
             id.0
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[ktest]
+    fn remote_membership_hint_handles_multiple_words() {
+        type TestId = MockId<192>;
+        let active = AtomicIdSet::<TestId>::new(IdSet::new_empty());
+        let caller = TestId::new(64);
+        assert!(!active.has_other_than(caller));
+        active.add(caller, Ordering::Relaxed);
+        assert!(!active.has_other_than(caller));
+        for other in [0, 63, 65, 128, 191] {
+            let peer = TestId::new(other);
+            active.add(peer, Ordering::Relaxed);
+            assert!(active.has_other_than(caller));
+            active.remove(peer, Ordering::Relaxed);
+            assert!(!active.has_other_than(caller));
         }
     }
 
@@ -544,6 +592,20 @@ mod id_set_tests {
         set.remove(TestId::new(64));
         assert!(!set.contains(TestId::new(64)));
         assert_eq!(set.count(), 2);
+    }
+
+    #[ktest]
+    fn id_set_from_words_masks_tail_and_propagates_errors() {
+        type Set = IdSet<MockId<70>>;
+        let set = Set::try_from_words(|words| {
+            assert_eq!(words, &[0, 0]);
+            words[1] = u64::MAX;
+            Ok::<_, ()>(())
+        }).unwrap();
+        assert_eq!(set.as_words(), &[0, 63]);
+        assert_eq!(set.count(), 6);
+        let failure = Set::try_from_words(|_| Err(7));
+        assert!(matches!(failure, Err(7)));
     }
 
     #[ktest]

@@ -103,6 +103,7 @@ impl VirtualAddressAllocator {
         vmspace: &'a VmarSpace,
         size: usize,
         align: usize,
+        prefer_single_leaf: bool,
     ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
         let cur_cpu = if cfg!(feature = "single_vmar_alloc") {
             CpuId::bsp()
@@ -111,7 +112,7 @@ impl VirtualAddressAllocator {
         };
 
         // Fast path by querying the `must_be_free` range.
-        if let Ok(va) = self.alloc_from_cpu_must_free(cur_cpu, size, align) {
+        if let Ok(va) = self.alloc_from_cpu_must_free(cur_cpu, size, align, prefer_single_leaf) {
             #[cfg(ktest)]
             self.test_pause.before_pt(tests::CACHED);
             let mut cursor = vmspace.cursor_mut(guard, &(va..va + size))?;
@@ -128,7 +129,7 @@ impl VirtualAddressAllocator {
             if cpu_id == cur_cpu {
                 continue;
             }
-            if let Ok(va) = self.alloc_from_cpu_must_free(cpu_id, size, align) {
+            if let Ok(va) = self.alloc_from_cpu_must_free(cpu_id, size, align, prefer_single_leaf) {
                 #[cfg(ktest)]
                 self.test_pause.before_pt(tests::CACHED);
                 let mut cursor = vmspace.cursor_mut(guard, &(va..va + size))?;
@@ -204,6 +205,7 @@ impl VirtualAddressAllocator {
                 CpuId::try_from(cpu_range.start).unwrap(),
                 size,
                 align,
+                false,
             )
         {
             let lock_range = range.start.min(va)..range.end.max(va + size);
@@ -234,10 +236,21 @@ impl VirtualAddressAllocator {
         self.try_lock_and_alloc_from(guard, vmspace, &full_range, size, align)
     }
 
-    fn alloc_from_cpu_must_free(&self, cpu: CpuId, size: usize, align: usize) -> Result<Vaddr> {
+    fn alloc_from_cpu_must_free(
+        &self,
+        cpu: CpuId,
+        size: usize,
+        align: usize,
+        prefer_single_leaf: bool,
+    ) -> Result<Vaddr> {
         let mut must_be_free = self.must_be_free.get_on_cpu(cpu).lock();
 
         alloc_from_free_range(must_be_free.clone(), size, align).map(|va| {
+            let va = if prefer_single_leaf {
+                leaf_contained_start(va, size, must_be_free.start)
+            } else {
+                va
+            };
             *must_be_free = truncate_get_largest(&must_be_free, &(va..va + size));
             va
         })
@@ -415,6 +428,19 @@ const fn assigned_range_size_for(num_cpus: usize) -> usize {
     let align_to = page_size_at(align_to_paging_level);
 
     (VMAR_CAP_ADDR / num_cpus) & !(align_to - 1)
+}
+
+/// Keep naturally sized allocations inside one leaf page table when the cache
+/// has room. Successive equal sizes then pack downwards to the same boundary.
+fn leaf_contained_start(va: Vaddr, size: usize, free_start: Vaddr) -> Vaddr {
+    let leaf_span = page_size_at(2);
+    if size.is_power_of_two() && size <= leaf_span && (va ^ (va + size - 1)) >= leaf_span {
+        let start = va.align_down(size);
+        if start >= free_start {
+            return start;
+        }
+    }
+    va
 }
 
 /// Allocates a virtual address range from the given free range.

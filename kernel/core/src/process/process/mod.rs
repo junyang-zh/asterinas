@@ -83,6 +83,8 @@ pub(super) fn init_on_each_cpu() {
 }
 
 /// Process stands for a set of threads that shares the same userspace.
+// Keep the shared Arc ownership counters off the first line of process data.
+#[repr(align(64))]
 pub struct Process {
     // Immutable Part
     pid: Pid,
@@ -643,6 +645,7 @@ impl Process {
             return;
         }
 
+        let signum = signal.num();
         self.sig_queues.enqueue(signal);
 
         for task in self.tasks.lock().as_slice() {
@@ -650,9 +653,9 @@ impl Process {
             // FIXME: This behavior differs a bit from Linux.
             // Linux wakes up a single thread that neither blocks the signal
             // nor already has the same pending signal;
-            // for simplicity we wake up all threads.
+            // for simplicity, notify every eligible waiter.
             // Reference: <https://elixir.bootlin.com/linux/v6.17/source/kernel/signal.c#L969>.
-            posix_thread.wake_signalled_waker();
+            posix_thread.wake_for_queued_signal(signum);
         }
     }
 

@@ -16,6 +16,8 @@ fi
 ./clone3/clone_process
 
 ./cpu_affinity/cpu_affinity
+./cpu_affinity/short_affinity_mask
+./cpu_affinity/affinity_inherit
 
 ./execve/execve
 ./execve/execve_comm
@@ -43,6 +45,8 @@ fi
 ./prctl/thread_name
 
 ./pthread/pthread_signal_test
+./pthread/futex_blocked_signal
+./pthread/futex_requeue
 ./pthread/pthread_test
 
 ./ptrace/ptrace

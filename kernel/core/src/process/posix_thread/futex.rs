@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use int_to_c_enum::TryFromInt;
 use ostd::{
     cpu::num_cpus,
@@ -16,6 +18,8 @@ use crate::{
 };
 
 type FutexBitSet = u32;
+
+const FUTEX_WOKEN: usize = usize::MAX;
 
 const FUTEX_BITSET_MATCH_ANY: FutexBitSet = 0xFFFF_FFFF;
 
@@ -75,9 +79,22 @@ pub(crate) fn futex_wait_bitset(
     }
 
     let user_space = ctx.user_space();
+    // A mismatched value cannot block. Avoid allocating a waiter in this
+    // common race with a private mutex unlock. A matching value must still
+    // be checked under the bucket lock before the waiter is enqueued.
+    if visibility == FutexVisibility::Private
+        && futex_addr.is_multiple_of(align_of::<u32>())
+        && user_space.atomic_load::<u32>(futex_addr)? != futex_val.cast_unsigned()
+    {
+        return_errno_with_message!(
+            Errno::EAGAIN,
+            "the futex word does not contain the expected value"
+        );
+    }
     let futex_key = FutexKey::new(futex_addr, bitset, &user_space, visibility)?;
-    let (_, futex_bucket_ref) = get_futex_bucket(&futex_key);
-    let (futex_item, waiter) = FutexItem::create(futex_key);
+    let (bucket_index, futex_bucket_ref) = get_futex_bucket(&futex_key);
+    let (futex_item, waiter) = FutexItem::create(futex_key, bucket_index);
+    let location = futex_item.location.clone();
 
     let (mut futex_bucket, val) = loop {
         // Lock the futex bucket first to avoid race conditions.
@@ -118,15 +135,10 @@ pub(crate) fn futex_wait_bitset(
 
     let result = waiter.pause_timeout(&timeout.into());
 
-    // If the futex wait operation was interrupted by a signal or timed out, the
-    // `FutexItem` must be dequeued and dropped. Otherwise, malicious user programs
-    // could repeatedly issue futex wait operations to exhaust kernel memory.
-    let item = futex_bucket_ref.lock().remove_by_waker(&waiter.waker());
-    if item.is_none() {
-        // The futex item will be removed asynchronously if and only if it has been woken up. In
-        // that case, we should report success to the user.
-        // FIXME: `pause_timeout` should return `Ok(())` in this case, but it currently may return
-        // errors due to race conditions.
+    // Wake and requeue publish the current location while holding the bucket
+    // lock. A successful wake needs no second queue scan. An interrupted
+    // wait must cancel from the bucket to which it was most recently moved.
+    if !FUTEX_BUCKETS.get().unwrap().cancel_wait(&location, &waiter) {
         Ok(())
     } else if let Err(err) = result {
         Err(err)
@@ -350,10 +362,6 @@ pub(crate) fn futex_requeue(
     ctx: &Context,
     visibility: FutexVisibility,
 ) -> Result<usize> {
-    if futex_new_addr == futex_addr {
-        return futex_wake(futex_addr, max_nwakes, visibility);
-    }
-
     let user_space = ctx.user_space();
     let futex_key = FutexKey::new(futex_addr, FUTEX_BITSET_MATCH_ANY, &user_space, visibility)?;
     let futex_new_key = FutexKey::new(
@@ -367,18 +375,19 @@ pub(crate) fn futex_requeue(
 
     let nwakes = futex_bucket.remove_and_wake_items(&futex_key, max_nwakes);
 
-    if let Some(mut futex_new_bucket) = futex_new_bucket {
+    let moved = if let Some(mut futex_new_bucket) = futex_new_bucket {
         futex_bucket.requeue_items_to_another_bucket(
             &futex_key,
             &mut futex_new_bucket,
             &futex_new_key,
+            get_futex_bucket(&futex_new_key).0,
             max_nrequeues,
-        );
+        )
     } else {
-        futex_bucket.update_item_keys(&futex_key, &futex_new_key, max_nrequeues);
-    }
+        futex_bucket.update_item_keys(&futex_key, &futex_new_key, max_nrequeues)
+    };
 
-    Ok(nwakes)
+    Ok(nwakes + moved)
 }
 
 static FUTEX_BUCKETS: Once<FutexBucketVec> = Once::new();
@@ -454,6 +463,21 @@ impl FutexBucketVec {
         (index, &self.vec[index])
     }
 
+    fn cancel_wait(&self, location: &AtomicUsize, waiter: &Waiter) -> bool {
+        loop {
+            let index = location.load(Ordering::Acquire);
+            if index == FUTEX_WOKEN {
+                return false;
+            }
+            let mut bucket = self.vec[index].lock();
+            if location.load(Ordering::Relaxed) != index {
+                continue;
+            }
+            // Both requeue and successful wake require this same lock.
+            return bucket.remove_by_waker(&waiter.waker()).is_some();
+        }
+    }
+
     pub(self) fn size(&self) -> usize {
         self.vec.len()
     }
@@ -497,17 +521,23 @@ impl FutexBucket {
         count
     }
 
-    pub(self) fn update_item_keys(&mut self, key: &FutexKey, new_key: &FutexKey, max_count: usize) {
-        let mut count = 0;
-        for item in self.items.iter_mut() {
-            if item.key.match_up(key) {
-                item.key = new_key.clone();
-                count += 1;
-            }
-            if count >= max_count {
-                break;
-            }
+    pub(self) fn update_item_keys(
+        &mut self,
+        key: &FutexKey,
+        new_key: &FutexKey,
+        max_count: usize,
+    ) -> usize {
+        let mut moved = 0;
+        for item in self
+            .items
+            .iter_mut()
+            .filter(|item| item.key.match_up(key))
+            .take(max_count)
+        {
+            item.rekey(new_key);
+            moved += 1;
         }
+        moved
     }
 
     pub(self) fn requeue_items_to_another_bucket(
@@ -515,41 +545,55 @@ impl FutexBucket {
         key: &FutexKey,
         another: &mut Self,
         new_key: &FutexKey,
+        destination: usize,
         max_nrequeues: usize,
-    ) {
-        let mut count = 0;
-        self.items
-            .extract_if(.., |item| {
-                if item.key.match_up(key) && count < max_nrequeues {
-                    count += 1;
-                    true
-                } else {
-                    false
-                }
-            })
-            .for_each(|mut extracted| {
-                extracted.key = new_key.clone();
-                another.add_item(extracted);
-            });
+    ) -> usize {
+        let mut moved = 0;
+        for mut item in self
+            .items
+            .extract_if(.., |item| item.key.match_up(key))
+            .take(max_nrequeues)
+        {
+            item.rekey(new_key);
+            item.location.store(destination, Ordering::Release);
+            another.add_item(item);
+            moved += 1;
+        }
+        moved
     }
 }
 
 struct FutexItem {
     key: FutexKey,
     waker: Arc<Waker>,
+    location: Arc<AtomicUsize>,
 }
 
 impl FutexItem {
-    pub(self) fn create(key: FutexKey) -> (Self, Waiter) {
+    pub(self) fn create(key: FutexKey, bucket: usize) -> (Self, Waiter) {
         let (waiter, waker) = Waiter::new_pair();
-        let futex_item = FutexItem { key, waker };
+        let futex_item = FutexItem {
+            key,
+            waker,
+            location: Arc::new(AtomicUsize::new(bucket)),
+        };
 
         (futex_item, waiter)
     }
 
+    fn rekey(&mut self, destination: &FutexKey) {
+        // WAIT_BITSET belongs to the waiter, independent of the futex address.
+        self.key.identity = destination.identity.clone();
+        self.key.hash = destination.hash;
+    }
+
     #[must_use]
     pub(self) fn wake(&self) -> bool {
-        self.waker.wake_up()
+        if !self.waker.wake_up() {
+            return false;
+        }
+        self.location.store(FUTEX_WOKEN, Ordering::Release);
+        true
     }
 }
 
@@ -729,4 +773,120 @@ pub(crate) fn futex_op_and_flags_from_u32(bits: u32) -> Result<(FutexOp, FutexFl
     };
 
     Ok((op, flags))
+}
+
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn requeued_wait_preserves_mask_and_cancels_from_current_bucket() {
+        let key = |offset, bitset| {
+            let identity = FutexIdentity::Shared {
+                vmo: Weak::new(),
+                offset,
+            };
+            FutexKey {
+                hash: identity.hash(),
+                identity,
+                bitset,
+            }
+        };
+        let source = key(0, 0b01);
+        let destination = key(4, FUTEX_BITSET_MATCH_ANY);
+        let third = key(8, FUTEX_BITSET_MATCH_ANY);
+        let buckets = FutexBucketVec::new(3);
+        let (item, waiter) = FutexItem::create(source.clone(), 0);
+        let location = item.location.clone();
+        buckets.vec[0].lock().add_item(item);
+        {
+            let mut first = buckets.vec[0].lock();
+            let mut second = buckets.vec[1].lock();
+            assert_eq!(first.update_item_keys(&source, &destination, 0), 0);
+            assert_eq!(
+                first.requeue_items_to_another_bucket(&source, &mut second, &destination, 1, 1),
+                1
+            );
+            assert_eq!(second.remove_and_wake_items(&key(4, 0b10), 1), 0);
+            assert_eq!(second.update_item_keys(&destination, &third, 1), 1);
+            assert_eq!(second.remove_and_wake_items(&key(8, 0b10), 1), 0);
+            assert_eq!(
+                second.requeue_items_to_another_bucket(
+                    &third,
+                    &mut buckets.vec[2].lock(),
+                    &source,
+                    2,
+                    1
+                ),
+                1
+            );
+        }
+        assert!(buckets.cancel_wait(&location, &waiter));
+        assert!(buckets.vec.iter().all(|b| b.lock().items.is_empty()));
+
+        let (item, waiter) = FutexItem::create(source.clone(), 0);
+        let location = item.location.clone();
+        buckets.vec[0].lock().add_item(item);
+        assert_eq!(buckets.vec[0].lock().remove_and_wake_items(&source, 1), 1);
+        assert!(!buckets.cancel_wait(&location, &waiter));
+    }
+
+    #[ktest]
+    fn single_futex_wake_preserves_survivors_and_requeue_order() {
+        let key = |offset, bitset| {
+            let identity = FutexIdentity::Shared {
+                vmo: Weak::new(),
+                offset,
+            };
+            FutexKey {
+                hash: identity.hash(),
+                identity,
+                bitset,
+            }
+        };
+        let source = key(0, 1);
+        let other = key(0, 2);
+        let dest = key(4, 1);
+        let mut from = FutexBucket::new();
+        let mut to = FutexBucket::new();
+        let (closed, closed_waiter) = FutexItem::create(source.clone(), 0);
+        let closed_waker = closed_waiter.waker();
+        drop(closed_waiter);
+        from.add_item(closed);
+        let (skip, skip_waiter) = FutexItem::create(other.clone(), 0);
+        from.add_item(skip);
+        let mut waiters = Vec::new();
+        for _ in 0..32 {
+            let (item, waiter) = FutexItem::create(source.clone(), 0);
+            from.add_item(item);
+            waiters.push(waiter);
+        }
+        assert_eq!(from.remove_and_wake_items(&source, 0), 0);
+        assert_eq!(from.remove_and_wake_items(&source, 1), 1);
+        assert!(Arc::ptr_eq(&from.items[0].waker, &closed_waker));
+        assert!(Arc::ptr_eq(&from.items[1].waker, &skip_waiter.waker()));
+        assert!(Arc::ptr_eq(&from.items[2].waker, &waiters[1].waker()));
+        assert_eq!(
+            from.requeue_items_to_another_bucket(&source, &mut to, &dest, 1, 0),
+            0
+        );
+        assert!(to.items.is_empty());
+        assert_eq!(
+            from.requeue_items_to_another_bucket(&source, &mut to, &dest, 1, 5),
+            5
+        );
+        assert_eq!(to.items.len(), 5);
+        assert!(Arc::ptr_eq(&to.items[0].waker, &closed_waker));
+        for i in 1..5 {
+            assert!(Arc::ptr_eq(&to.items[i].waker, &waiters[i].waker()));
+        }
+        assert_eq!(to.remove_and_wake_items(&dest, usize::MAX), 4);
+        assert!(to.remove_by_waker(&closed_waker).is_some());
+        assert!(to.items.is_empty());
+        assert_eq!(from.remove_and_wake_items(&source, usize::MAX), 27);
+        assert_eq!(from.remove_and_wake_items(&other, 1), 1);
+        assert!(from.items.is_empty());
+    }
 }

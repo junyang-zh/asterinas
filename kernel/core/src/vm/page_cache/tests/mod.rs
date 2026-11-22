@@ -574,3 +574,34 @@ fn reverse_mapping_updates_during_page_cache_operation() {
     worker.join();
     drop(operation);
 }
+
+#[ktest]
+fn anonymous_buffered_write_page_tracks_truncation_and_regrowth() {
+    let mut cache = super::AnonFileCache::new().unwrap();
+    let full = 2 * PAGE_SIZE;
+    cache.resize(full, 0).unwrap();
+    let write = |cache: &mut super::AnonFileCache, offset, bytes: &[u8]| {
+        let mut reader = VmReader::from(bytes).to_fallible();
+        cache.write(offset, &mut reader).unwrap();
+        assert_eq!(reader.remain(), 0);
+    };
+    write(&mut cache, PAGE_SIZE + 3, b"old");
+    write(&mut cache, PAGE_SIZE + 9, b"tail");
+    assert_eq!(cache.write_page.as_ref().unwrap().0, 1);
+    cache.resize(PAGE_SIZE, full).unwrap();
+    assert!(cache.write_page.is_none());
+    cache.resize(full, PAGE_SIZE).unwrap();
+    write(&mut cache, PAGE_SIZE + 8, b"new");
+    let mut bytes = [0xaa; 16];
+    cache.read_bytes(PAGE_SIZE, &mut bytes).unwrap();
+    assert_eq!(&bytes[..8], &[0; 8]);
+    assert_eq!(&bytes[8..11], b"new");
+    assert_eq!(&bytes[11..], &[0; 5]);
+
+    // A partial truncation retains this page, clearing the truncated tail.
+    cache.resize(PAGE_SIZE + 9, full).unwrap();
+    cache.resize(full, PAGE_SIZE + 9).unwrap();
+    write(&mut cache, PAGE_SIZE + 11, b"x");
+    cache.read_bytes(PAGE_SIZE, &mut bytes).unwrap();
+    assert_eq!(&bytes[8..12], b"n\0\0x");
+}

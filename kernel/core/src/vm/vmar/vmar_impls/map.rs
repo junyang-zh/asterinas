@@ -339,8 +339,15 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             .accounting_pause
             .hit(super::accounting_tests::BEFORE_MAP_PT);
 
-        let (map_to_addr, mut cursor) =
-            allocate_range(&preempt_guard, parent, offset, align, map_size)?;
+        let private_anon = matches!(mapped_mem, MappedMemory::Anonymous) && !map_mode.is_shared();
+        let (map_to_addr, mut cursor) = allocate_range(
+            &preempt_guard,
+            parent,
+            offset,
+            align,
+            map_size,
+            private_anon,
+        )?;
 
         let affected_range = map_to_addr..map_to_addr + map_size.get();
         let old_rmap_entries = if replaces_existing {
@@ -547,6 +554,7 @@ fn allocate_range<'a>(
     offset: Option<(usize, OffsetType)>,
     align: usize,
     map_size: NonZeroUsize,
+    private_anon: bool,
 ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
     let map_size_bytes = map_size.get();
 
@@ -556,6 +564,7 @@ fn allocate_range<'a>(
             parent.vm_space(),
             map_size_bytes,
             align,
+            private_anon,
         ),
         Some((offset, OffsetType::Fixed)) => {
             let range = offset..offset + map_size_bytes;
@@ -596,6 +605,7 @@ fn allocate_range<'a>(
                     parent.vm_space(),
                     map_size_bytes,
                     align,
+                    false,
                 )
             } else {
                 Ok((offset, cursor))

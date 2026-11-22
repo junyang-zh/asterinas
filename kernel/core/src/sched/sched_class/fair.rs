@@ -128,6 +128,8 @@ pub(crate) struct FairAttr {
     weight: AtomicU64,
     pending_weight: SpinLock<u64>,
     vruntime: AtomicU64,
+    // Published with the CPU reservation when the task blocks.
+    departure_min: AtomicU64,
 }
 
 impl FairAttr {
@@ -137,6 +139,7 @@ impl FairAttr {
             weight: weight.into(),
             pending_weight: SpinLock::new(weight),
             vruntime: Default::default(),
+            departure_min: Default::default(),
         }
     }
 
@@ -145,6 +148,32 @@ impl FairAttr {
         *pending_weight = nice_to_weight(nice);
         self.weight.store(
             self.weight.load(Ordering::Relaxed) | HAS_PENDING,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(super) fn remember_departure(&self, source: &FairClassRq) {
+        self.departure_min
+            .store(source.min_vruntime, Ordering::Relaxed);
+    }
+
+    pub(super) fn migrate_on_wake(&self, destination: &FairClassRq) {
+        self.rebase(self.departure_min.load(Ordering::Relaxed), destination);
+    }
+
+    pub(super) fn migrate_on_steal(&self, source: &FairClassRq, destination: &FairClassRq) {
+        self.rebase(source.min_vruntime, destination);
+    }
+
+    // Call only while the task is off both fair heaps. Keep the service debt
+    // relative to the source floor. Each CPU advances its own virtual clock.
+    fn rebase(&self, source_min: u64, destination: &FairClassRq) {
+        let debt = self
+            .vruntime
+            .load(Ordering::Relaxed)
+            .saturating_sub(source_min);
+        self.vruntime.store(
+            destination.min_vruntime.saturating_add(debt),
             Ordering::Relaxed,
         );
     }
@@ -341,6 +370,39 @@ impl SchedClassRq for FairClassRq {
                     || vruntime > self.min_vruntime + self.vtime_slice()
             }
             UpdateFlags::Exit => !self.is_empty(),
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod migration_test {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn migration_preserves_positive_debt_from_the_departure_queue() {
+        let mut source = FairClassRq::new(CpuId::bsp());
+        let mut destination = FairClassRq::new(CpuId::bsp());
+        let fair = FairAttr::new(Nice::default());
+        for (origin, runtime, target, expected) in [
+            (1000, 1030, 10, 40),
+            (10, 40, 1000, 1030),
+            (1000, 900, 5, 5),
+            (3, 12, u64::MAX - 2, u64::MAX),
+        ] {
+            source.min_vruntime = origin;
+            destination.min_vruntime = target;
+            fair.vruntime.store(runtime, Ordering::Relaxed);
+            fair.remember_departure(&source);
+            // Other tasks can advance the source after this task blocks.
+            source.min_vruntime = origin + 100;
+            fair.migrate_on_wake(&destination);
+            assert_eq!(fair.vruntime.load(Ordering::Relaxed), expected);
+            source.min_vruntime = origin;
+            fair.vruntime.store(runtime, Ordering::Relaxed);
+            fair.migrate_on_steal(&source, &destination);
+            assert_eq!(fair.vruntime.load(Ordering::Relaxed), expected);
         }
     }
 }

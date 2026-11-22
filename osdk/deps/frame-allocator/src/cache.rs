@@ -47,16 +47,18 @@ impl<const NR_CONT_FRAMES: usize, const COUNT: usize> CacheArray<NR_CONT_FRAMES,
     ///
     /// It may allocate directly from this cache. If the cache is empty, it
     /// will fill the cache.
-    fn alloc(&mut self, guard: &DisabledLocalIrqGuard) -> Option<Paddr> {
+    fn alloc(&mut self, mut allocate: impl FnMut(Layout) -> Option<Paddr>) -> Option<Paddr> {
         if let Some(frame) = self.pop_front() {
             return Some(frame);
         }
 
         let nr_to_alloc = COUNT * 2 / 3;
-        let allocated = super::pools::alloc(
-            guard,
-            Layout::from_size_align(nr_to_alloc * Self::segment_size(), PAGE_SIZE).unwrap(),
-        )?;
+        let refill =
+            Layout::from_size_align(nr_to_alloc * Self::segment_size(), PAGE_SIZE).unwrap();
+        let Some(allocated) = allocate(refill) else {
+            // A fragmented pool can still satisfy the requested segment.
+            return allocate(Layout::from_size_align(Self::segment_size(), PAGE_SIZE).unwrap());
+        };
 
         for i in 1..nr_to_alloc {
             self.push_front(allocated + i * Self::segment_size());
@@ -119,18 +121,22 @@ impl CacheOfSizes {
 
 pub(super) fn alloc(guard: &DisabledLocalIrqGuard, layout: Layout) -> Option<Paddr> {
     let nr_frames = layout.size() / PAGE_SIZE;
-    if layout.align() > layout.size() {
+    // Entries returned by OSTD may start at any page boundary, including
+    // subranges of an earlier allocation. Only the buddy pools honor a
+    // stricter requested alignment.
+    if layout.align() > PAGE_SIZE {
         return super::pools::alloc(guard, layout);
     }
 
     let cache_cell = CACHE.get_with(guard);
     let mut cache = cache_cell.borrow_mut();
 
+    let allocate = |layout| super::pools::alloc(guard, layout);
     match nr_frames {
-        1 => cache.cache1.alloc(guard),
-        2 => cache.cache2.alloc(guard),
-        3 => cache.cache3.alloc(guard),
-        4 => cache.cache4.alloc(guard),
+        1 => cache.cache1.alloc(allocate),
+        2 => cache.cache2.alloc(allocate),
+        3 => cache.cache3.alloc(allocate),
+        4 => cache.cache4.alloc(allocate),
         _ => super::pools::alloc(guard, layout),
     }
 }
@@ -151,5 +157,37 @@ pub(super) fn dealloc(guard: &DisabledLocalIrqGuard, addr: Paddr, size: usize) {
         3 => cache.cache3.dealloc(guard, addr),
         4 => cache.cache4.dealloc(guard, addr),
         _ => super::pools::dealloc(guard, [(addr, size)].into_iter()),
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn fragmented_pool_can_supply_a_single_cached_segment() {
+        let mut cache = CacheArray::<3, 6>::new();
+        let mut requests = alloc::vec::Vec::new();
+        let supplied = cache.alloc(|layout| {
+            requests.push(layout.size());
+            (layout.size() == 3 * PAGE_SIZE).then_some(16 * PAGE_SIZE)
+        });
+        assert_eq!(requests, [12 * PAGE_SIZE, 3 * PAGE_SIZE]);
+        assert_eq!(supplied, Some(16 * PAGE_SIZE));
+        assert!(cache.pop_front().is_none());
+        assert!(cache.alloc(|_| None).is_none());
+
+        let mut calls = 0;
+        let mut allocate = |layout: Layout| {
+            calls += 1;
+            assert_eq!(layout.size(), 12 * PAGE_SIZE);
+            Some(32 * PAGE_SIZE)
+        };
+        let mut pages = core::array::from_fn::<_, 4, _>(|_| cache.alloc(&mut allocate).unwrap());
+        pages.sort_unstable();
+        assert_eq!(pages, [32, 35, 38, 41].map(|index| index * PAGE_SIZE));
+        assert_eq!(calls, 1);
     }
 }

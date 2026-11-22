@@ -655,20 +655,26 @@ impl VmMapping {
         let range = self.range();
         cursor.jump(range.start).unwrap();
 
-        let op = |flags: &mut PageFlags, _cache: &mut CachePolicy| *flags = new_flags;
-
         while cursor.find_next(range.end).is_some() {
             while cursor.cur_va_range().start < range.start || cursor.cur_va_range().end > range.end
             {
                 cursor.adjust_level(cursor.level() - 1);
             }
-            cursor.protect(op);
+            let mut changed = false;
+            cursor.protect(|flags, _cache| {
+                // A VMA permission change preserves the accessed and dirty
+                // history of the same resident frame.
+                let desired = new_flags | (*flags & (PageFlags::ACCESSED | PageFlags::DIRTY));
+                changed = *flags != desired;
+                *flags = desired;
+            });
 
             let va = cursor.cur_va_range();
-
-            cursor
-                .flusher()
-                .issue_tlb_flush(TlbFlushOp::for_range(va.clone()));
+            if changed {
+                cursor
+                    .flusher()
+                    .issue_tlb_flush(TlbFlushOp::for_range(va.clone()));
+            }
             debug_assert!(va.end <= range.end);
             if cursor.jump(va.end).is_err() {
                 break;

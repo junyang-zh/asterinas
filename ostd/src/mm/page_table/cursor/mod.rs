@@ -300,29 +300,24 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
                     // skip to save time.
                     if pt_guard.nr_children() != 0 {
                         self.push_level(pt_guard);
-                    } else {
-                        let _ = ManuallyDrop::new(pt_guard);
-                        if cur_va_range.end >= end {
-                            self.va = end;
-                            return None;
-                        } else {
-                            self.move_forward();
-                        }
+                        continue;
                     }
-                    continue;
+                    let _ = ManuallyDrop::new(pt_guard);
                 }
-                PteStateRef::Absent => {
-                    if cur_va_range.end >= end {
-                        self.va = end;
-                        return None;
-                    } else {
-                        self.move_forward();
-                    }
-                    continue;
-                }
+                PteStateRef::Absent => {}
                 PteStateRef::Mapped(_) => {
                     return Some(cur_va);
                 }
+            }
+            if cur_va_range.end > end {
+                self.va = end;
+                return None;
+            }
+            // At an entry boundary the address and the retained ancestor
+            // path must both point at the next entry, even on a short search.
+            self.move_forward();
+            if self.va == end {
+                return None;
             }
         }
     }

@@ -147,7 +147,7 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
                 va,
                 max_page_level::<UserPtConfig<A>>(va.len()),
             )?,
-            flusher: TlbFlusher::new(&self.cpus, disable_preempt()),
+            flusher: None,
             vmspace: self,
         })
     }
@@ -171,7 +171,7 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
     ) -> Result<CursorMut<'a, A>> {
         Ok(CursorMut {
             pt_cursor: self.pt.cursor_mut(guard, va)?,
-            flusher: TlbFlusher::new(&self.cpus, disable_preempt()),
+            flusher: None,
             vmspace: self,
         })
     }
@@ -189,7 +189,7 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
             .try_cursor_mut(guard, va)?
             .map(|pt_cursor| CursorMut {
                 pt_cursor,
-                flusher: TlbFlusher::new(&self.cpus, disable_preempt()),
+                flusher: None,
                 vmspace: self,
             }))
     }
@@ -295,6 +295,56 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
         let writer = unsafe { VmWriter::<Fallible>::from_user_space(vaddr as *mut u8, len) };
 
         Ok((reader, writer))
+    }
+}
+
+/// Switches this CPU from a borrowed user address space to the kernel root.
+/// A kernel task must finish using any user-space reader or writer before
+/// switching, just as when activating a different user address space.
+#[cfg(any(ktest, feature = "idle_shootdown_hint"))]
+pub fn deactivate_user_space() {
+    let irq = crate::irq::disable_local();
+    let last = ACTIVATED_VM_SPACE_CPUSET.load();
+    if last.is_null() {
+        return;
+    }
+
+    KERNEL_PAGE_TABLE.get().unwrap().reactivate();
+    ACTIVATED_VM_SPACE_CPUSET.store(core::ptr::null());
+    // SAFETY: VmSpace::activate stored one owned Arc in this CPU's slot.
+    // Clearing the slot transfers it here exactly once. Retire membership
+    // only after the hardware switch has invalidated the old translations.
+    let previous = unsafe { Arc::from_raw(last) };
+    previous.remove(irq.current_cpu(), Ordering::Release);
+}
+
+// Only the synchronous TLB sender runs while this guard is held. It uses
+// kernel mappings and can service remote IPIs throughout its wait.
+#[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+struct SuspendedDiscardSpace<'a, A: AuxPageTableMeta> {
+    space: &'a VmSpace<A>,
+    _pin: DisabledPreemptGuard,
+}
+
+#[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+impl<'a, A: AuxPageTableMeta> SuspendedDiscardSpace<'a, A> {
+    fn suspend(space: &'a VmSpace<A>) -> Option<Self> {
+        let pin = disable_preempt();
+        if ACTIVATED_VM_SPACE_CPUSET.load() != Arc::as_ptr(&space.cpus) {
+            return None;
+        }
+        deactivate_user_space();
+        Some(Self { space, _pin: pin })
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+impl<A: AuxPageTableMeta> Drop for SuspendedDiscardSpace<'_, A> {
+    fn drop(&mut self) {
+        // Publish membership and reload the root before permitting callbacks
+        // on this CPU to observe the reactivated address space.
+        let _irq = crate::irq::disable_local();
+        self.space.activate();
     }
 }
 
@@ -420,9 +470,9 @@ impl<A: AuxPageTableMeta> Cursor<'_, A> {
 /// reading or modifying the same sub-tree.
 pub struct CursorMut<'a, A: AuxPageTableMeta = ()> {
     pt_cursor: page_table::CursorMut<'a, UserPtConfig<A>>,
-    // We have a read lock so the CPU set in the flusher is always a superset
-    // of actual activated CPUs.
-    flusher: TlbFlusher<'a, DisabledPreemptGuard>,
+    // The page-table guard pins this cursor. Allocate its invalidation state
+    // on first use so that populating absent pages needs only the cursor.
+    flusher: Option<TlbFlusher<'a, DisabledPreemptGuard>>,
     // References to the `VmSpace`
     vmspace: &'a VmSpace<A>,
 }
@@ -438,7 +488,7 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
     /// revocation, discard and file/device invalidation must remain synchronous.
     #[cfg(feature = "lazy_tlb_flush_on_unmap")]
     pub fn complete_deferred_unmap(&mut self) {
-        if self.flusher.defer_unmap_flush() {
+        if self.flusher().defer_unmap_flush() {
             // Slots are published before this release, while the covering PT
             // lock still excludes reuse. Saturation disables barrier elision
             // permanently rather than permitting a generation wraparound.
@@ -463,7 +513,7 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
             {
                 return;
             }
-            self.flusher.sync_all_deferred_unmaps();
+            self.flusher().sync_all_deferred_unmaps();
             // Only this captured generation was covered. A newer disjoint
             // unmap may have published after a remote CPU handled our callback.
             self.vmspace
@@ -568,7 +618,33 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
 
     /// Gets the dedicated TLB flusher for this cursor.
     pub fn flusher(&mut self) -> &mut TlbFlusher<'a, DisabledPreemptGuard> {
-        &mut self.flusher
+        self.flusher
+            .get_or_insert_with(|| TlbFlusher::new(&self.vmspace.cpus, disable_preempt()))
+    }
+
+    /// Completes a discard before the caller resumes access to user memory.
+    /// When peers share this address space, switch to the kernel root while
+    /// servicing their invalidations. Activation reloads the user's page table
+    /// before the cursor is returned to the caller.
+    pub fn finish_synchronous_discard(&mut self) {
+        let Some(flusher) = self.flusher.as_mut() else {
+            return;
+        };
+        #[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+        let _suspended = if flusher.has_shared_discard_work() {
+            SuspendedDiscardSpace::suspend(self.vmspace)
+        } else {
+            None
+        };
+        flusher.dispatch_and_wait();
+    }
+
+    /// Dispatches and waits for invalidations issued by this cursor.
+    pub fn flush_pending_tlb(&mut self) {
+        if let Some(flusher) = self.flusher.as_mut() {
+            flusher.dispatch_tlb_flush();
+            flusher.sync_tlb_flush();
+        }
     }
 
     /// Maps a frame into the current slot.
@@ -685,6 +761,17 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
     ///  - the current virtual address range is not fully contained in the
     ///    cursor range.
     pub fn unmap(&mut self) -> usize {
+        self.unmap_inner::<true>()
+    }
+
+    /// Unmaps the current entry for a transaction that will synchronously
+    /// dispatch and await all invalidations before releasing this cursor.
+    /// Retains base frames in the transaction's ordinary flush batch.
+    pub fn unmap_for_synchronous_flush(&mut self) -> usize {
+        self.unmap_inner::<false>()
+    }
+
+    fn unmap_inner<const MAY_DEFER: bool>(&mut self) -> usize {
         let cur_range = self.pt_cursor.cur_va_range();
 
         // SAFETY:
@@ -709,12 +796,13 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
                         let rcu_frame = RcuDrop::new(old_frame);
                         panic_guard.forget();
                         let rcu_frame = Frame::rcu_from_unsized(rcu_frame);
-                        #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
-                        self.flusher
-                            .issue_tlb_flush_with(TlbFlushOp::for_single(va), rcu_frame);
+                        let op = TlbFlushOp::for_single(va);
                         #[cfg(feature = "lazy_tlb_flush_on_unmap")]
-                        self.flusher
-                            .latr_with(TlbFlushOp::for_single(va), rcu_frame);
+                        if MAY_DEFER {
+                            self.flusher().latr_with(op, rcu_frame);
+                            return 1;
+                        }
+                        self.flusher().issue_tlb_flush_with(op, rcu_frame);
 
                         1
                     }
@@ -729,7 +817,7 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
                         // corresponding `IoMem`. This is because we manage
                         // the range of I/O as a whole, but the frames
                         // handled here might be one segment of it.
-                        self.flusher
+                        self.flusher()
                             .issue_tlb_flush(TlbFlushOp::for_range(cur_range.clone()));
 
                         page_size_at(level) / page_size_at(1)
@@ -744,7 +832,7 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
             } => {
                 // A subtree can retain arbitrarily many data frames. Only
                 // tracked base frames belong in the 64-slot lazy reserve.
-                self.flusher.issue_tlb_flush_with(
+                self.flusher().issue_tlb_flush_with(
                     TlbFlushOp::for_range(va..va + len),
                     Frame::rcu_from_unsized(pt),
                 );

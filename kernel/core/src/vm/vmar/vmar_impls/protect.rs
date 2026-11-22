@@ -35,6 +35,7 @@ impl Vmar {
 
         // To check if any pages are not mapped.
         let mut last_protected_addr = range.start;
+        let mut permission_error = None;
 
         let preempt_guard = disable_preempt();
         let vm_space = self.vm_space();
@@ -61,6 +62,14 @@ impl Vmar {
                 }
             }
 
+            // Validate while the mapping still owns its place in the tree.
+            // Earlier changes in this range must finish their shootdowns.
+            let new_perms = perms | (mapping_perms & VmPerms::ALL_MAY_PERMS);
+            if let Err(error) = new_perms.check() {
+                permission_error = Some(error);
+                break;
+            }
+
             let intersected_range = get_intersected_range(&range, &vm_mapping_range);
             cursor.jump(intersected_range.start).unwrap();
             propagate_if_needed(&mut cursor, intersected_range.len());
@@ -72,9 +81,6 @@ impl Vmar {
             else {
                 panic!("`find_next_mapped` does not stop at mapped `VmMapping`");
             };
-
-            let new_perms = perms | (vm_mapping.perms() & VmPerms::ALL_MAY_PERMS);
-            new_perms.check()?;
 
             let taken = split_and_insert_rest(&mut cursor, vm_mapping, intersected_range.clone());
             let next_address = taken.range().end;
@@ -98,6 +104,9 @@ impl Vmar {
         cursor.flusher().dispatch_tlb_flush();
         cursor.flusher().sync_tlb_flush();
 
+        if let Some(error) = permission_error {
+            return Err(error);
+        }
         if last_protected_addr < range.end {
             return_errno_with_message!(Errno::ENOMEM, "protect: the range covers unmapped pages");
         }

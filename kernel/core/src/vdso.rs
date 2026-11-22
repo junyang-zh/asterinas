@@ -384,6 +384,12 @@ fn init_vdso() {
 
 pub(super) fn init_in_first_kthread() {
     init_start_secs_count();
+    // The bundled x86-64 vDSO encodes only 12 CPU bits in getcpu. On
+    // larger machines libc can use the full-width getcpu system call.
+    #[cfg(target_arch = "x86_64")]
+    if ostd::cpu::num_cpus() > 1 << 12 {
+        return;
+    }
     init_vdso();
 
     aster_time::VDSO_DATA_HIGH_RES_UPDATE_FN.call_once(|| update_vdso_high_res_instant);

@@ -481,6 +481,15 @@ impl<T: Send + 'static> RcuDrop<T> {
         }
     }
 
+    /// Defers an independent destructor until every CPU passes a quiescent state.
+    /// The caller must allow reordering relative to other retired values.
+    pub(crate) fn retire_independently(value: T) {
+        RCU_MONITOR
+            .get()
+            .unwrap()
+            .retire_independently(move || drop(value));
+    }
+
     /// Extracts the value from the `RcuDrop` container.
     ///
     /// # Safety

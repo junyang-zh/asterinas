@@ -223,8 +223,7 @@ impl Vmar {
                 range_handled.end = va + PAGE_SIZE;
             }
 
-            cursor.flusher().dispatch_tlb_flush();
-            cursor.flusher().sync_tlb_flush();
+            cursor.flush_pending_tlb();
 
             break 'retry;
         }
@@ -602,6 +601,61 @@ mod test {
                 .unwrap(),
             range.start
         );
+    }
+
+    #[ktest]
+    fn protect_preserves_resident_page_status_and_write_faults() {
+        let vmar = new_vmar();
+        let addr = page_size_at(2);
+        let range = addr..addr + PAGE_SIZE;
+        let rw = VmPerms::READ | VmPerms::WRITE;
+        map_anon(&vmar, range.clone(), rw);
+        let write = || {
+            vmar.handle_page_fault(&PageFaultInfo::new(addr, VmPerms::WRITE))
+                .unwrap()
+        };
+        let flags = || {
+            let guard = disable_preempt();
+            let mut cursor = vmar.vm_space.cursor(&guard, &range).unwrap();
+            while cursor.push_level_if_exists().is_some() {}
+            match cursor.query() {
+                VmQueriedItem::MappedRam { prop, .. } => prop.flags,
+                _ => panic!("expected a resident anonymous page"),
+            }
+        };
+        write();
+        let history = PageFlags::ACCESSED | PageFlags::DIRTY;
+        assert!(flags().contains(history | PageFlags::RW));
+        vmar.protect(VmPerms::READ, range.clone()).unwrap();
+        assert!(flags().contains(history | PageFlags::R));
+        assert!(!flags().contains(PageFlags::W));
+        vmar.protect(rw, range.clone()).unwrap();
+        assert!(flags().contains(history));
+        assert!(!flags().contains(PageFlags::W));
+        write();
+        assert!(flags().contains(history | PageFlags::RW));
+    }
+
+    #[ktest]
+    fn protect_error_retains_mapping_and_prior_changes() {
+        let vmar = new_vmar();
+        let start = page_size_at(2);
+        let split = start + PAGE_SIZE;
+        let end = split + PAGE_SIZE;
+        map_anon(&vmar, start..split, VmPerms::READ | VmPerms::WRITE);
+        vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+            .unwrap()
+            .may_perms(VmPerms::MAY_READ)
+            .offset(split, OffsetType::FixedNoReplace)
+            .build()
+            .unwrap();
+        let result = vmar.protect(VmPerms::READ | VmPerms::EXEC, start..end);
+        assert_eq!(result.unwrap_err().error(), Errno::EACCES);
+        let read = |addr| vmar.handle_page_fault(&PageFaultInfo::new(addr, VmPerms::READ));
+        read(split).unwrap();
+        read(start).unwrap();
+        let write = vmar.handle_page_fault(&PageFaultInfo::new(start, VmPerms::WRITE));
+        assert_eq!(write.unwrap_err().error(), Errno::EACCES);
     }
 
     /// Exercise actual metadata delegation, including a missing intermediate PT.

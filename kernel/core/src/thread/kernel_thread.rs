@@ -5,7 +5,7 @@ use ostd::{
     task::{Task, TaskOptions},
 };
 
-use super::{AsThread, Thread, oops};
+use super::{AsThread, CpuAffinitySnapshot, Thread, oops};
 use crate::{
     prelude::*,
     sched::{Nice, SchedPolicy},
@@ -45,7 +45,7 @@ impl AsKernelThread for Task {
 /// Options to create or spawn a new kernel thread.
 pub(crate) struct ThreadOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
-    cpu_affinity: CpuSet,
+    cpu_affinity: CpuAffinitySnapshot,
     sched_policy: SchedPolicy,
     vmar: Option<Arc<Vmar>>,
 }
@@ -56,7 +56,7 @@ impl ThreadOptions {
     where
         F: FnOnce() + Send + 'static,
     {
-        let cpu_affinity = CpuSet::new_full();
+        let cpu_affinity = CpuAffinitySnapshot::default();
         let sched_policy = SchedPolicy::Fair(Nice::default());
         Self {
             func: Some(Box::new(func)),
@@ -68,7 +68,7 @@ impl ThreadOptions {
 
     /// Sets the CPU affinity of the new thread.
     pub(crate) fn cpu_affinity(mut self, cpu_affinity: CpuSet) -> Self {
-        self.cpu_affinity = cpu_affinity;
+        self.cpu_affinity = CpuAffinitySnapshot::new(cpu_affinity);
         self
     }
 

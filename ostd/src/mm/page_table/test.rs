@@ -795,6 +795,24 @@ mod navigation {
     }
 
     #[ktest]
+    fn find_next_resumes_after_an_internal_leaf_boundary() {
+        let pt = PageTable::<TestPtConfig>::empty();
+        let pin = disable_preempt();
+        let boundary = 512 * PAGE_SIZE;
+        let first = PAGE_SIZE;
+        let second = boundary + 3 * PAGE_SIZE;
+        let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback);
+        map_untracked(&pt, first..first + PAGE_SIZE, 0, prop);
+        map_untracked(&pt, second..second + PAGE_SIZE, PAGE_SIZE, prop);
+        let end = second + PAGE_SIZE;
+        let mut cursor = pt.cursor(&pin, &(0..end)).unwrap();
+        cursor.jump(first + PAGE_SIZE).unwrap();
+        assert_eq!(cursor.find_next(boundary), None);
+        assert_eq!(cursor.virt_addr(), boundary);
+        assert_eq!(cursor.find_next(end), Some(second));
+    }
+
+    #[ktest]
     fn find_next_stops_at_each_requested_end() {
         let page_table = PageTable::<TestPtConfig>::empty();
         let preempt_guard = disable_preempt();

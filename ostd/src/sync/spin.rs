@@ -82,7 +82,9 @@ impl<T: ?Sized, G: SpinGuardian> SpinLock<T, G> {
     /// Tries acquiring the spin lock immediately.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T, G>> {
         let inner_guard = G::guard();
-        if self.try_acquire_lock() {
+        // An unsuccessful speculative acquisition can share the owner's cache
+        // line. A racing contender is still excluded by the acquire CAS.
+        if !self.inner.lock.load(Ordering::Relaxed) && self.try_acquire_lock() {
             let lock_guard = SpinLockGuard {
                 guard: inner_guard,
                 lock: self,
@@ -102,7 +104,11 @@ impl<T: ?Sized, G: SpinGuardian> SpinLock<T, G> {
 
     fn acquire_lock(&self) {
         while !self.try_acquire_lock() {
-            core::hint::spin_loop();
+            // Poll with shared reads while another CPU owns the lock.
+            // The successful compare-exchange supplies acquire ordering.
+            while self.inner.lock.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
         }
     }
 
@@ -177,3 +183,46 @@ impl<T: ?Sized + fmt::Debug, G: SpinGuardian> fmt::Debug for SpinLockGuard<'_, T
 // `G::Guard` is `!Send` and `!Sync`, so is `SpinLockGuard`.
 impl<T: ?Sized, G: SpinGuardian> !Send for SpinLockGuard<'_, T, G> {}
 impl<T: ?Sized, G: SpinGuardian> !Sync for SpinLockGuard<'_, T, G> {}
+
+#[cfg(ktest)]
+mod test {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::SpinLock;
+    use crate::{
+        cpu::{self, CpuSet, PinCurrentCpu},
+        prelude::ktest,
+        smp::inter_processor_call,
+        task::disable_preempt,
+    };
+
+    #[ktest]
+    fn occupied_try_lock_and_remote_handoff() {
+        static VALUE: SpinLock<usize> = SpinLock::new(0);
+        static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+        let pin = disable_preempt();
+        let mut owner = VALUE.lock();
+        *owner = 41;
+        BUSY.store(0, Ordering::Relaxed);
+        inter_processor_call(&CpuSet::new_full(), || {
+            if VALUE.try_lock().is_none() {
+                BUSY.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .wait();
+        assert_eq!(BUSY.load(Ordering::Relaxed), cpu::num_cpus());
+        drop(owner);
+
+        let target = cpu::all_cpus()
+            .find(|cpu| *cpu != pin.current_cpu())
+            .unwrap_or(pin.current_cpu());
+        inter_processor_call(&CpuSet::from(target), || {
+            if let Some(mut value) = VALUE.try_lock() {
+                *value += 1;
+            }
+        })
+        .wait();
+        assert_eq!(*VALUE.lock(), 42);
+    }
+}

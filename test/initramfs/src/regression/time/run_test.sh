@@ -10,5 +10,8 @@ set -e
 
 ./itimer/setitimer
 ./itimer/timer_create
+./itimer/thread_virtual_timer
 
 ./timerfd/timerfd_clockid
+
+./times/process_times
