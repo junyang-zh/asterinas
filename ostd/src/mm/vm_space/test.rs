@@ -640,3 +640,46 @@ fn base_page_cursor_splits_existing_huge_iomem() {
     let cursor = vmspace.cursor_mut_base_pages(&guard, &range).unwrap();
     assert_eq!(cursor.guard_level(), 1);
 }
+
+#[ktest]
+fn idle_kernel_root_releases_and_rejoins_the_active_set() {
+    let space = VmSpace::<()>::new();
+    let guard = disable_preempt();
+    let cpu = guard.current_cpu();
+    for _ in 0..8 {
+        space.activate();
+        assert_eq!(current_page_table_paddr(), space.pt.root_paddr());
+        assert!(space.cpus.contains(cpu, Ordering::Acquire));
+        deactivate_user_space();
+        assert_eq!(current_page_table_paddr(), KERNEL_PAGE_TABLE.get().unwrap().root_paddr());
+        assert!(!space.cpus.contains(cpu, Ordering::Acquire));
+        assert!(space.reader(0x1000, 1).is_err());
+        deactivate_user_space();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[ktest]
+fn discard_suspends_only_its_own_root_and_restores_membership() {
+    let own = VmSpace::<()>::new();
+    let other = VmSpace::<()>::new();
+    let pin = disable_preempt();
+    let cpu = pin.current_cpu();
+    own.activate();
+    assert!(SuspendedDiscardSpace::suspend(&other).is_none());
+    assert_eq!(current_page_table_paddr(), own.pt.root_paddr());
+    assert!(own.cpus.contains(cpu, Ordering::Acquire));
+    {
+        let _suspended = SuspendedDiscardSpace::suspend(&own).unwrap();
+        assert_eq!(
+            current_page_table_paddr(),
+            KERNEL_PAGE_TABLE.get().unwrap().root_paddr()
+        );
+        assert!(!own.cpus.contains(cpu, Ordering::Acquire));
+        assert!(own.reader(0x1000, 1).is_err());
+    }
+    assert_eq!(current_page_table_paddr(), own.pt.root_paddr());
+    assert!(own.cpus.contains(cpu, Ordering::Acquire));
+    assert!(own.reader(0x1000, 1).is_ok());
+    deactivate_user_space();
+}

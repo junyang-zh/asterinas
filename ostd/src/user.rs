@@ -127,6 +127,12 @@ pub trait UserModeHooks {
         false
     }
 
+    /// Tests whether this task may enter user space on the current CPU.
+    /// Local interrupts stay disabled between this check and the user transition.
+    fn may_enter_user(&self, _guard: &DisabledLocalIrqGuard) -> bool {
+        true
+    }
+
     /// Prepares user space execution.
     ///
     /// This method will be called just before entering user space.

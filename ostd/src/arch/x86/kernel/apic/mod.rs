@@ -221,7 +221,6 @@ impl ApicId {
     /// In x2APIC mode, the 32-bit logical x2APIC ID, which can be read from
     /// LDR, is derived from the 32-bit local x2APIC ID:
     /// Logical x2APIC ID = [(x2APIC ID\[19:4\] << 16) | (1 << x2APIC ID\[3:0\])]
-    #[expect(unused)]
     pub(in crate::arch) fn x2apic_logical_id(&self) -> u32 {
         (self.x2apic_logical_cluster_id() << 16) | (1 << self.x2apic_logical_field_id())
     }
@@ -302,7 +301,6 @@ pub(in crate::arch) enum DeliveryStatus {
 #[repr(u64)]
 pub(in crate::arch) enum DestinationMode {
     Physical = 0,
-    #[expect(dead_code)]
     Logical = 1,
 }
 

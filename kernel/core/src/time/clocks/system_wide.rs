@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use aster_time::read_monotonic_time;
-use ostd::{cpu::PinCurrentCpu, cpu_local, sync::SpinLock, task::disable_preempt, timer::Jiffies};
+use ostd::{cpu::PinCurrentCpu, cpu_local, task::disable_preempt, timer::Jiffies};
 use paste::paste;
 use spin::Once;
 
@@ -62,11 +62,7 @@ impl MonotonicClock {
 
 /// `RealTimeCoarseClock` is a coarse-grained version of a real-time clock.
 ///
-/// This clock will maintain a record to `RealTimeClock`. This record
-/// will be updated during each system timer interruption. Reading this clock
-/// will directly reads the value of the record instead of calculating the time
-/// based on the clocksource. Hence it is faster but less accurate.
-///
+/// It combines the common boot epoch with the elapsed system timer ticks.
 /// Usually it will not be used to create a timer.
 pub(crate) struct RealTimeCoarseClock {
     _private: (),
@@ -158,29 +154,13 @@ impl Clock for MonotonicClock {
 
 impl Clock for RealTimeCoarseClock {
     fn read_time(&self) -> Duration {
-        let guard = disable_preempt();
-        let mut cached = COARSE_REALTIME
-            .get_on_cpu(guard.current_cpu())
-            .get()
-            .unwrap()
-            .disable_irq()
-            .lock();
-        let ticks = Jiffies::elapsed();
-        if cached.0 != ticks.as_u64() {
-            // Derive every CPU cache from the same global tick epoch. This
-            // avoids stale AP clocks and backwards time after task migration.
-            *cached = (
-                ticks.as_u64(),
-                *START_TIME_AS_DURATION.get().unwrap() + ticks.as_duration(),
-            );
-        }
-        cached.1
+        *START_TIME_AS_DURATION.get().unwrap() + Jiffies::elapsed().as_duration()
     }
 }
 
 impl Clock for MonotonicCoarseClock {
     fn read_time(&self) -> Duration {
-        RealTimeCoarseClock::get().read_time() - *START_TIME_AS_DURATION.get().unwrap()
+        Jiffies::elapsed().as_duration()
     }
 }
 
@@ -291,25 +271,10 @@ fn init_jiffies_clock_manager() {
     time::softirq::register_callback(callback);
 }
 
-cpu_local! {
-    static COARSE_REALTIME: Once<SpinLock<(u64, Duration)>> = Once::new();
-}
-
-fn init_coarse_clock() {
-    let ticks = Jiffies::elapsed();
-    let real_time = *START_TIME_AS_DURATION.get().unwrap() + ticks.as_duration();
-    for cpu in ostd::cpu::all_cpus() {
-        COARSE_REALTIME
-            .get_on_cpu(cpu)
-            .call_once(|| SpinLock::new((ticks.as_u64(), real_time)));
-    }
-}
-
 pub(super) fn init() {
     init_system_wide_clocks();
     init_system_wide_timer_managers();
     init_jiffies_clock_manager();
-    init_coarse_clock();
 }
 
 #[cfg(ktest)]
@@ -327,11 +292,6 @@ pub(crate) fn init_for_ktest() {
         });
     }
     CLOCK_REALTIME_COARSE_INSTANCE.call_once(|| Arc::new(RealTimeCoarseClock { _private: () }));
-    for cpu in ostd::cpu::all_cpus() {
-        COARSE_REALTIME
-            .get_on_cpu(cpu)
-            .call_once(|| SpinLock::new((0, Duration::ZERO)));
-    }
     JIFFIES_TIMER_MANAGER.call_once(|| {
         let clock = JiffiesClock { _private: () };
         TimerManager::new(Arc::new(clock))

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 use bitflags::bitflags;
@@ -16,6 +16,10 @@ use crate::{
 pub(crate) mod inotify;
 
 use crate::fs::vfs::{inode::Inode, inode_ext::InodeExt};
+
+// Publishers are created lazily. An empty publisher may keep this count
+// positive, in which case the per-filesystem subscriber check handles it.
+static LIVE_PUBLISHERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Publishes filesystem events to subscribers.
 ///
@@ -39,6 +43,12 @@ impl Debug for FsEventPublisher {
     }
 }
 
+impl Drop for FsEventPublisher {
+    fn drop(&mut self) {
+        LIVE_PUBLISHERS.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl Default for FsEventPublisher {
     fn default() -> Self {
         Self::new()
@@ -47,6 +57,7 @@ impl Default for FsEventPublisher {
 
 impl FsEventPublisher {
     pub(crate) fn new() -> Self {
+        LIVE_PUBLISHERS.fetch_add(1, Ordering::Release);
         Self {
             subscribers: RwLock::new(Vec::new()),
             all_interesting_events: AtomicFsEvents::new(FsEvents::empty()),
@@ -271,6 +282,9 @@ define_atomic_version_of_integer_like_type!(FsEvents, {
 
 /// Notifies that a file was accessed.
 pub(crate) fn on_access(file: &Arc<dyn FileLike>) {
+    if LIVE_PUBLISHERS.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let path = file.path();
 
     if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
@@ -281,6 +295,9 @@ pub(crate) fn on_access(file: &Arc<dyn FileLike>) {
 
 /// Notifies that a file was modified.
 pub(crate) fn on_modify(file: &Arc<dyn FileLike>) {
+    if LIVE_PUBLISHERS.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let path = file.path();
 
     if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {

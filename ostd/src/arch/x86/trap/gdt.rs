@@ -43,7 +43,12 @@ use crate::{
 /// accidentally load a wrong GDT and TSS that actually belongs to another CPU.
 pub(super) unsafe fn init_on_cpu() {
     // No races because the caller guarantees that no preemption can occur.
-    let gdt = GDT.get_on_cpu(CpuId::current_racy());
+    let cpu = CpuId::current_racy();
+    let gdt = GDT.get_on_cpu(cpu);
+    // The x86-64 Linux vDSO reads selector 0x7b with LSL. Its byte
+    // limit encodes the 12-bit CPU number and the node number (currently 0).
+    let cpu_number = u64::from(u32::from(cpu)) & 0xfff;
+    gdt.cpu_node.store(CPU_NODE_DESCRIPTOR | cpu_number, Ordering::Relaxed);
 
     let tss_ptr = UnsafeCell::raw_get(LOCAL_TSS.as_ptr());
 
@@ -117,6 +122,8 @@ struct Gdt {
     // Mutable part: They are initialized at runtime; the LTR instruction will set the BUSY bit.
     tss0: AtomicU64,
     tss1: AtomicU64,
+    _reserved_before_cpu_node: [u64; 6],
+    cpu_node: AtomicU64,
 }
 
 cpu_local! {
@@ -130,6 +137,8 @@ cpu_local! {
         ucode64: UCODE64,
         tss0: AtomicU64::new(0), // To be set in `init_on_cpu`.
         tss1: AtomicU64::new(0), // To be set in `init_on_cpu`.
+        _reserved_before_cpu_node: [0; 6],
+        cpu_node: AtomicU64::new(0),
     };
 }
 
@@ -155,6 +164,11 @@ pub(in crate::arch) const KCODE32: u64 = 0x00CF_9B00_0000_FFFF;
 // the descriptor caches; the SYSRET instruction does not ensure this correspondence."
 const UCODE64: u64 = 0x00AF_FB00_0000_FFFF;
 const UDATA: u64 = 0x00CF_F300_0000_FFFF;
+
+// Read-only, expand-down, accessed, DPL 3, present, 32-bit, byte granularity.
+// The descriptor is used only for querying the CPU and NUMA node.
+const CPU_NODE_DESCRIPTOR: u64 = 0x0040_F500_0000_0000;
+const_assert!(offset_of!(Gdt, cpu_node) + 3 == 0x7b);
 
 // ========== Selectors ==========
 

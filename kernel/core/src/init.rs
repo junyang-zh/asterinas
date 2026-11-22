@@ -101,6 +101,11 @@ fn idle_step() {
     }
     #[cfg(feature = "artifact_busy_poll")]
     {
+        // Only a pinned idle thread enters this loop. Its next runnable task
+        // activates its own address space in the normal post-switch handler.
+        if ostd::mm::tlb::take_remote_flush_hint() {
+            ostd::mm::vm_space::deactivate_user_space();
+        }
         core::hint::spin_loop();
         ostd::task::Task::yield_now();
     }
@@ -118,6 +123,9 @@ fn bsp_idle_loop() {
         .cpu_affinity(CpuId::bsp().into())
         .sched_policy(SchedPolicy::default())
         .spawn();
+
+    #[cfg(feature = "artifact_busy_poll")]
+    crate::sched::register_polling_idle();
 
     // Wait till the init process is spawned.
     let init_process = loop {
@@ -148,6 +156,8 @@ fn ap_idle_loop() {
         CpuId::current_racy().as_usize(),
     );
 
+    #[cfg(feature = "artifact_busy_poll")]
+    crate::sched::register_polling_idle();
     loop {
         idle_step();
     }

@@ -15,7 +15,7 @@ mod ops;
 mod remapping;
 
 pub use chip::{IRQ_CHIP, IrqChip, MappedIrqLine};
-pub(crate) use ipi::{HwCpuId, send_ipi};
+pub(crate) use ipi::{HwCpuId, send_ipis, supports_cluster_delivery};
 pub(crate) use ops::{
     disable_local, disable_local_and_halt, enable_local, enable_local_and_halt, is_local_enabled,
 };

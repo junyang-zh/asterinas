@@ -4,6 +4,8 @@ mod nice;
 mod sched_class;
 mod stats;
 
+#[cfg(feature = "artifact_busy_poll")]
+pub(crate) use self::sched_class::register_polling_idle;
 pub(crate) use self::{
     nice::{AtomicNice, Nice},
     sched_class::{

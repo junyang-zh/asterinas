@@ -94,7 +94,7 @@ fn verify_affinity(expected: CpuId) {
     let Some(thread) = crate::thread::Thread::current() else {
         fail("task has no kernel Thread");
     };
-    let affinity = thread.atomic_cpu_affinity().load(Ordering::Acquire);
+    let affinity = thread.cpu_affinity();
     require(
         affinity.contains(expected) && affinity.iter().count() == 1,
         "task affinity is not the requested singleton",

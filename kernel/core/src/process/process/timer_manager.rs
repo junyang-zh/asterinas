@@ -84,7 +84,7 @@ fn update_cpu_time() {
         .prof_timer()
         .timer_manager()
         .process_expired_timers();
-    posix_thread.process_expired_timers();
+    posix_thread.process_expired_timers(!is_kernel_interrupted);
 }
 
 /// Registers a function to update the CPU clock in processes and

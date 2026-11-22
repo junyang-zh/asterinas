@@ -78,7 +78,7 @@ loongArch64.workspace = true
 [features]
 single_vmar_alloc = []
 lazy_tlb_flush_on_unmap = ["ostd/lazy_tlb_flush_on_unmap"]
-artifact_busy_poll = []
+artifact_busy_poll = ["ostd/idle_shootdown_hint"]
 breakdown_counters = ["ostd/breakdown_counters"]
 memory_accounting = ["ostd/memory_accounting"]
 default = ["cvm_guest"]

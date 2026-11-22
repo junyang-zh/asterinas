@@ -310,7 +310,7 @@ impl Vmo {
         self.commit_on_anonymous(page_idx)
     }
 
-    fn commit_on_anonymous(&self, page_idx: usize) -> Result<CachePage> {
+    pub(super) fn commit_on_anonymous(&self, page_idx: usize) -> Result<CachePage> {
         let mut locked_pages = self.pages.lock();
         if page_idx >= self.size().div_ceil(PAGE_SIZE) {
             return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
@@ -565,6 +565,10 @@ impl Vmo {
     }
 }
 
+// Small reads and writes can cross one page boundary without allocating
+// scratch space for their pinned page references.
+type IoPages = smallvec::SmallVec<[(usize, CachePage); 2]>;
+
 // Implement the read/write methods for `Vmo`.
 impl Vmo {
     /// Maximum number of pages collected per batch from the `XArray`.
@@ -577,13 +581,16 @@ impl Vmo {
             return Ok(());
         }
         let read_end = offset + read_len;
+        if !self.has_backend() {
+            return self.read_anonymous_pages(offset..read_end, writer);
+        }
 
         let range = offset..read_end;
         let page_idx_range = get_page_idx_range(&range);
         let mut current_idx = page_idx_range.start;
         let mut page_offset = offset % PAGE_SIZE;
         let mut page_batch =
-            Vec::with_capacity(min(page_idx_range.len(), Self::PAGE_BATCH_CAPACITY));
+            IoPages::with_capacity(min(page_idx_range.len(), Self::PAGE_BATCH_CAPACITY));
 
         while current_idx < page_idx_range.end {
             self.collect_pages(
@@ -616,7 +623,26 @@ impl Vmo {
 
         let write_range = offset..write_end;
         let mut page_offset = offset % PAGE_SIZE;
-        let mut page_batch = Vec::with_capacity(min(
+        if write_len <= PAGE_SIZE - page_offset && !self.has_backend() {
+            // A resident anonymous page needs neither a collection batch nor a
+            // dirty-state transition. Release the XArray read guard before
+            // copying from the potentially faulting userspace reader.
+            let resident = {
+                let guard = disable_preempt();
+                if write_end > self.size() {
+                    return_errno_with_message!(Errno::EINVAL, "the write exceeds the VMO size");
+                }
+                self.pages
+                    .load(&guard, (offset / PAGE_SIZE) as u64)
+                    .map(|page| page.clone())
+            };
+            if let Some(page) = resident {
+                page.writer().skip(page_offset).write_fallible(reader)?;
+                return Ok(());
+            }
+        }
+
+        let mut page_batch = IoPages::with_capacity(min(
             write_range.len().div_ceil(PAGE_SIZE),
             Self::PAGE_BATCH_CAPACITY,
         ));
@@ -704,6 +730,53 @@ impl Vmo {
         Ok(())
     }
 
+    /// Copies resident pages and returns zeros for holes without committing them.
+    fn read_anonymous_pages(&self, range: Range<usize>, writer: &mut VmWriter) -> Result<()> {
+        let indices = get_page_idx_range(&range);
+        let mut pages = smallvec::SmallVec::<[CachePage; 2]>::with_capacity(
+            indices.len().min(Self::PAGE_BATCH_CAPACITY),
+        );
+        let mut pos = range.start;
+        while pos < range.end {
+            let first = pos / PAGE_SIZE;
+            let end = indices.end.min(first + Self::PAGE_BATCH_CAPACITY);
+            pages.clear();
+            let next = {
+                let guard = disable_preempt();
+                if range.end > self.size() {
+                    return_errno_with_message!(Errno::EINVAL, "the read exceeds the VMO size");
+                }
+                let mut cursor = self.pages.cursor(&guard, first as u64);
+                for _ in first..end {
+                    let Some(page) = cursor.load() else { break };
+                    pages.push(page.clone());
+                    cursor.next();
+                }
+                if pages.is_empty() {
+                    // An unallocated range is logically zero up to the next
+                    // resident page. A concurrent fault can instantiate it.
+                    cursor.next_present()
+                        .filter(|&index| index < indices.end as u64)
+                        .map_or(range.end, |index| index as usize * PAGE_SIZE)
+                } else {
+                    range.end.min((first + pages.len()) * PAGE_SIZE)
+                }
+            };
+            // Faultable user copies run outside the XArray read guard.
+            if pages.is_empty() {
+                writer.fill_zeros(next - pos)?;
+            } else {
+                let mut in_page = pos % PAGE_SIZE;
+                for page in &pages {
+                    page.reader().skip(in_page).read_fallible(writer)?;
+                    in_page = 0;
+                }
+            }
+            pos = next;
+        }
+        Ok(())
+    }
+
     /// Writes data to pages without dirty tracking.
     ///
     /// Used for anonymous VMO writes where pages are always in the `UpToDate`
@@ -713,7 +786,7 @@ impl Vmo {
         range: &Range<usize>,
         page_offset: &mut usize,
         reader: &mut VmReader,
-        page_batch: &mut Vec<(usize, CachePage)>,
+        page_batch: &mut IoPages,
     ) -> Result<()> {
         let page_idx_range = get_page_idx_range(range);
         let mut current_idx = page_idx_range.start;
@@ -749,7 +822,7 @@ impl Vmo {
         page_offset: &mut usize,
         reader: &mut VmReader,
         commit_mode: CommitMode,
-        page_batch: &mut Vec<(usize, CachePage)>,
+        page_batch: &mut IoPages,
     ) -> Result<()> {
         let page_idx_range = get_page_idx_range(range);
         let mut current_idx = page_idx_range.start;
@@ -815,7 +888,7 @@ impl Vmo {
         start_idx: usize,
         end_idx: usize,
         commit_mode: CommitMode,
-        pages: &mut Vec<(usize, CachePage)>,
+        pages: &mut IoPages,
     ) -> Result<()> {
         let end_idx = end_idx.min(start_idx + pages.capacity());
         pages.clear();

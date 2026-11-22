@@ -5,6 +5,7 @@
 pub(crate) use core::{Clock, timer};
 
 use ::core::time::Duration;
+use ostd::timer::{Jiffies, TIMER_FREQ};
 pub(crate) use system_time::{START_TIME, SystemTime};
 pub(crate) use timer::{Timer, TimerManager};
 
@@ -179,4 +180,41 @@ pub(crate) struct itimerspec_t {
 pub(crate) struct timezone_t {
     pub tz_minuteswest: i32,
     pub tz_dsttime: i32,
+}
+
+/// Linux userspace clock ticks per second for process accounting.
+pub(crate) const USER_HZ: u64 = 100;
+
+/// Converts internal timer ticks to the units published through AT_CLKTCK.
+pub(crate) fn jiffies_to_user_ticks(jiffies: Jiffies) -> u64 {
+    const { assert!(TIMER_FREQ.is_multiple_of(USER_HZ)) };
+    jiffies.as_u64() / (TIMER_FREQ / USER_HZ)
+}
+
+pub(crate) fn duration_to_user_ticks(duration: Duration) -> u64 {
+    const NSEC_PER_TICK: u64 = NSEC_PER_SEC as u64 / USER_HZ;
+    const { assert!((NSEC_PER_SEC as u64).is_multiple_of(USER_HZ)) };
+    duration
+        .as_secs()
+        .saturating_mul(USER_HZ)
+        .saturating_add(u64::from(duration.subsec_nanos()) / NSEC_PER_TICK)
+}
+
+#[cfg(ktest)]
+mod user_tick_tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn proc_ticks_match_advertised_clock() {
+        for raw in [0, 1, 9, 10, 11, 999, 1000, 12123, u64::MAX] {
+            let jiffies = Jiffies::new(raw);
+            assert_eq!(jiffies_to_user_ticks(jiffies), duration_to_user_ticks(jiffies.as_duration()));
+        }
+        assert_eq!(duration_to_user_ticks(Duration::from_nanos(9_999_999)), 0);
+        assert_eq!(duration_to_user_ticks(Duration::from_millis(10)), 1);
+        assert_eq!(duration_to_user_ticks(Duration::from_secs(1)), USER_HZ);
+        assert_eq!(duration_to_user_ticks(Duration::MAX), u64::MAX);
+    }
 }

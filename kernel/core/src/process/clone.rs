@@ -451,6 +451,7 @@ fn clone_child_task(
             child_vmar,
         )
         .process(posix_thread.weak_process().clone())
+        .cpu_affinity(ctx.thread.cpu_affinity())
         .sig_mask(sig_mask)
         .file_table(child_file_table)
         .fs(child_fs)
@@ -586,6 +587,7 @@ fn clone_child_process(
                 credentials,
                 child_vmar,
             )
+            .cpu_affinity(ctx.thread.cpu_affinity())
             .sig_mask(child_sig_mask)
             .file_table(child_file_table)
             .fs(child_fs)

@@ -15,9 +15,8 @@ use super::{
 use crate::{
     const_assert,
     cpu::{AtomicCpuSet, PinCurrentCpu},
-    cpu_local,
     smp::{IpiSender, PendingIpis},
-    sync::{LocalIrqDisabled, RcuDrop, SpinLock},
+    sync::RcuDrop,
 };
 
 /// A TLB flusher that is aware of which CPUs are needed to be flushed.
@@ -148,12 +147,7 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
         }
 
         if let Some(ipi_sender) = self.ipi_sender {
-            for cpu in target_cpus.iter() {
-                let mut flush_ops = FLUSH_OPS.get_on_cpu(cpu).lock();
-                flush_ops.push_from(&self.ops_stack);
-            }
-
-            let pending_ipis = ipi_sender.inter_processor_call(&target_cpus, do_remote_flush);
+            let pending_ipis = ipi_sender.send_tlb_flush(&target_cpus, &self.ops_stack);
             self.pending_ipis.extend(&pending_ipis);
         }
 
@@ -162,6 +156,32 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
             self.ops_stack.flush_all();
         } else {
             self.ops_stack.clear_without_flush();
+        }
+    }
+
+    /// A hint for switching away from the user root during a shared discard.
+    /// Dispatch still snapshots the real targets with release ordering.
+    #[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+    pub(crate) fn has_shared_discard_work(&self) -> bool {
+        !self.ops_stack.is_empty()
+            && self
+                .target_cpus
+                .has_other_than(self._pin_current.current_cpu())
+    }
+
+    /// Dispatches queued invalidations and waits before retiring their frames.
+    /// The caller's retained references cover every target until its callback
+    /// completes, so the remote queues only need the invalidation operations.
+    pub fn dispatch_and_wait(&mut self) {
+        let frames =
+            core::mem::ManuallyDrop::new(core::mem::take(&mut self.ops_stack.frame_keeper));
+        self.dispatch_tlb_flush();
+        self.sync_tlb_flush();
+
+        // An unwind before acknowledgement must leave these references held.
+        let frames = core::mem::ManuallyDrop::into_inner(frames);
+        if !frames.is_empty() {
+            drop(RcuDrop::new(frames));
         }
     }
 
@@ -314,30 +334,28 @@ impl TlbFlushOp {
     }
 }
 
-// The queues of pending requests on each CPU.
-cpu_local! {
-    static FLUSH_OPS: SpinLock<OpsStack, LocalIrqDisabled> = SpinLock::new(OpsStack::new());
+#[cfg(feature = "idle_shootdown_hint")]
+crate::cpu_local_cell! {
+    static REMOTE_FLUSH_SEEN: u8 = 0;
 }
 
-fn do_remote_flush() {
-    // No races because we are in IRQs or have disabled preemption.
-    let current_cpu = crate::cpu::CpuId::current_racy();
-
-    let mut new_op_queue = OpsStack::new();
-    {
-        let mut op_queue = FLUSH_OPS.get_on_cpu(current_cpu).lock();
-
-        core::mem::swap(&mut *op_queue, &mut new_op_queue);
+/// Returns whether this CPU recently serviced a queued remote invalidation.
+/// Idle tasks use this hint to stop borrowing a busy address space. Losing a
+/// concurrent hint only postpones the optional address-space switch.
+#[cfg(feature = "idle_shootdown_hint")]
+pub fn take_remote_flush_hint() -> bool {
+    if REMOTE_FLUSH_SEEN.load() == 0 {
+        return false;
     }
-    // Unlock the locks quickly to avoid contention.
-    new_op_queue.flush_all();
+    REMOTE_FLUSH_SEEN.store(0);
+    true
 }
 
 /// If the number of pending pages to flush exceeds this threshold, we flush all the
 /// TLB entries instead of flushing them one by one.
 const FLUSH_ALL_PAGES_THRESHOLD: usize = 32;
 
-struct OpsStack {
+pub(crate) struct OpsStack {
     /// From 0 to `num_ops`, the array entry must be initialized.
     ops: [MaybeUninit<TlbFlushOp>; FLUSH_ALL_PAGES_THRESHOLD],
     num_ops: u32,
@@ -354,7 +372,7 @@ struct OpsStack {
 }
 
 impl OpsStack {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             ops: [const { MaybeUninit::uninit() }; FLUSH_ALL_PAGES_THRESHOLD],
             num_ops: 0,
@@ -363,7 +381,7 @@ impl OpsStack {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.num_ops == 0 && self.num_pages_to_flush == 0
     }
 
@@ -398,7 +416,7 @@ impl OpsStack {
         self.num_pages_to_flush += op_num_pages;
     }
 
-    fn push_from(&mut self, other: &OpsStack) {
+    pub(crate) fn push_from(&mut self, other: &OpsStack) {
         self.frame_keeper.extend(other.frame_keeper.iter().cloned());
 
         if self.need_flush_all() {
@@ -418,6 +436,13 @@ impl OpsStack {
             self.num_ops += 1;
         }
         self.num_pages_to_flush += other.num_pages_to_flush;
+    }
+
+    pub(crate) fn flush_on_remote(&mut self) {
+        debug_assert!(!self.is_empty());
+        #[cfg(feature = "idle_shootdown_hint")]
+        REMOTE_FLUSH_SEEN.store(1);
+        self.flush_all();
     }
 
     fn flush_all(&mut self) {
@@ -452,6 +477,38 @@ impl Drop for OpsStack {
     fn drop(&mut self) {
         if !self.frame_keeper.is_empty() {
             let _ = RcuDrop::new(core::mem::take(&mut self.frame_keeper));
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod owner_test {
+    use super::*;
+    use crate::{
+        cpu::{AtomicCpuSet, CpuSet},
+        mm::FrameAllocOptions,
+        prelude::*,
+        task::disable_preempt,
+    };
+
+    #[ktest]
+    fn synchronous_dispatch_retains_frames_through_the_read_side_section() {
+        let targets = AtomicCpuSet::new(CpuSet::new_full());
+        let mut flusher = TlbFlusher::new(&targets, disable_preempt());
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        // Exercise both single-address and full-flush batches.
+        for pages in [1, FLUSH_ALL_PAGES_THRESHOLD] {
+            let before = frame.reference_count();
+            for i in 1..=pages {
+                flusher.issue_tlb_flush_with(
+                    TlbFlushOp::for_single(i * PAGE_SIZE),
+                    RcuDrop::new(frame.clone().into()),
+                );
+            }
+            flusher.dispatch_and_wait();
+            assert!(flusher.ops_stack.is_empty());
+            assert!(flusher.ops_stack.frame_keeper.is_empty());
+            assert_eq!(frame.reference_count(), before + pages as u64);
         }
     }
 }

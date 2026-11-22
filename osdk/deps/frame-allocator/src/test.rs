@@ -27,6 +27,32 @@ fn frame_allocator_alloc_layout_match() {
     assert_allocation_well_formed(Layout::from_size_align(PAGE_SIZE * 16, PAGE_SIZE * 16).unwrap());
 }
 
+#[ktest]
+fn cached_frame_sizes_honor_stronger_alignment() {
+    let _irq = ostd::irq::disable_local();
+    for frames in [2, 3, 4] {
+        let size = frames * PAGE_SIZE;
+        // An ordinary allocation leaves room in this CPU's size cache.
+        let ordinary = FrameAllocator
+            .alloc(Layout::from_size_align(size, PAGE_SIZE).unwrap())
+            .unwrap();
+        let large = FrameAllocator
+            .alloc(Layout::from_size_align(8 * PAGE_SIZE, 8 * PAGE_SIZE).unwrap())
+            .unwrap();
+        // OSTD can return a subrange. Put an odd-page segment at the front.
+        FrameAllocator.dealloc(large + PAGE_SIZE, size);
+        let aligned = FrameAllocator
+            .alloc(Layout::from_size_align(size, 2 * PAGE_SIZE).unwrap())
+            .unwrap();
+        assert!(aligned.is_multiple_of(2 * PAGE_SIZE));
+
+        FrameAllocator.dealloc(aligned, size);
+        FrameAllocator.dealloc(ordinary, size);
+        FrameAllocator.dealloc(large, PAGE_SIZE);
+        FrameAllocator.dealloc(large + PAGE_SIZE + size, 7 * PAGE_SIZE - size);
+    }
+}
+
 #[track_caller]
 fn assert_allocation_well_formed(layout: Layout) {
     let instance = FrameAllocator;

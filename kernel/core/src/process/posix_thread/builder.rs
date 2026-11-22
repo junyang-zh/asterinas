@@ -6,7 +6,6 @@ use core::sync::atomic::{AtomicU32, AtomicU64};
 use ostd::arch::cpu::context::{FsBase, GsBase};
 use ostd::{
     arch::cpu::context::{FpuContext, UserContext},
-    cpu::CpuSet,
     sync::RwArc,
     task::Task,
 };
@@ -22,8 +21,8 @@ use crate::{
         signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
     },
     sched::{Nice, SchedPolicy},
-    thread::{Thread, Tid, task},
-    time::{TimerManager, clocks::ProfClock},
+    thread::{CpuAffinitySnapshot, Thread, Tid, task},
+    time::clocks::ProfClock,
     vm::vmar::VmarHandle,
 };
 
@@ -38,6 +37,7 @@ pub(crate) struct PosixThreadBuilder {
     vmar: VmarHandle,
 
     // Optional part
+    cpu_affinity: CpuAffinitySnapshot,
     set_child_tid: Vaddr,
     clear_child_tid: Vaddr,
     file_table: Option<RwArc<FileTable>>,
@@ -66,6 +66,7 @@ impl PosixThreadBuilder {
             process: Weak::new(),
             credentials,
             vmar,
+            cpu_affinity: CpuAffinitySnapshot::default(),
             set_child_tid: 0,
             clear_child_tid: 0,
             file_table: None,
@@ -78,6 +79,11 @@ impl PosixThreadBuilder {
             ns_proxy: None,
             default_timer_slack_ns: 50_000, // 50 usec default slack
         }
+    }
+
+    pub(crate) fn cpu_affinity(mut self, affinity: CpuAffinitySnapshot) -> Self {
+        self.cpu_affinity = affinity;
+        self
     }
 
     pub(crate) fn process(mut self, process: Weak<Process>) -> Self {
@@ -162,6 +168,7 @@ impl PosixThreadBuilder {
             fs,
             sig_mask,
             sig_queues,
+            cpu_affinity,
             sched_policy,
             supp_user_context,
             user_ns,
@@ -181,8 +188,6 @@ impl PosixThreadBuilder {
         Arc::new_cyclic(|weak_task| {
             let posix_thread = {
                 let prof_clock = ProfClock::new();
-                let virtual_timer_manager = TimerManager::new(prof_clock.user_clock().clone());
-                let prof_timer_manager = TimerManager::new(prof_clock.clone());
 
                 PosixThread {
                     process,
@@ -196,8 +201,7 @@ impl PosixThreadBuilder {
                     sig_queues,
                     signalled_waker: SpinLock::new(None),
                     prof_clock,
-                    virtual_timer_manager,
-                    prof_timer_manager,
+                    cpu_timers: Once::new(),
                     io_priority: AtomicU32::new(0),
                     ns_proxy: Mutex::new(Some(ns_proxy.clone())),
                     timer_slack_ns: AtomicU64::new(default_timer_slack_ns),
@@ -209,7 +213,6 @@ impl PosixThreadBuilder {
                 }
             };
 
-            let cpu_affinity = CpuSet::new_full();
             let thread = Arc::new(Thread::new(
                 weak_task.clone(),
                 posix_thread,

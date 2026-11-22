@@ -461,6 +461,7 @@ fn init_aux_vec(
     let mut aux_vec = AuxVec::new();
 
     aux_vec.set(AuxKey::AT_PAGESZ, PAGE_SIZE as _);
+    aux_vec.set(AuxKey::AT_CLKTCK, crate::time::USER_HZ as _);
 
     let Some(ph_vaddr) = elf_map_range.relocated_addr_of(elf.find_vaddr_of_phdrs()?) else {
         return_errno_with_message!(

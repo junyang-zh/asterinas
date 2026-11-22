@@ -163,6 +163,24 @@ mod test {
     }
 
     #[ktest]
+    fn sparse_read_keeps_holes_uncommitted() {
+        let vmo = VmoOptions::new_anon(5 * PAGE_SIZE).alloc().unwrap();
+        let mut input = VmReader::from(&[0x47u8, 0x23][..]).to_fallible();
+        vmo.write(2 * PAGE_SIZE, &mut input).unwrap();
+        let mut data = alloc::vec![0xffu8; 3 * PAGE_SIZE + 2];
+        let mut out = VmWriter::from(data.as_mut_slice()).to_fallible();
+        vmo.read(PAGE_SIZE - 1, &mut out).unwrap();
+        assert_eq!(out.avail(), 0);
+        assert_eq!(&data[PAGE_SIZE + 1..PAGE_SIZE + 3], &[0x47, 0x23]);
+        assert!(data[..PAGE_SIZE + 1].iter().all(|&byte| byte == 0));
+        assert!(data[PAGE_SIZE + 3..].iter().all(|&byte| byte == 0));
+        let guard = ostd::task::disable_preempt();
+        for index in 0..5 {
+            assert_eq!(vmo.pages.load(&guard, index).is_some(), index == 2);
+        }
+    }
+
+    #[ktest]
     fn alloc_continuous_vmo() {
         let vmo = VmoOptions::new(10 * PAGE_SIZE)
             .flags(VmoFlags::CONTIGUOUS)

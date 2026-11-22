@@ -17,13 +17,12 @@ pub(crate) const SECURITY_CAPABILITY_XATTR_NAME: &str = "security.capability";
 
 /// Clears file privileges after an operation modifies file contents.
 pub(in crate::fs) fn clear_file_priv(dentry: &Dentry) -> Result<()> {
-    let inode = dentry.inode().as_ref();
-    if inode.type_() != InodeType::File {
+    if dentry.type_() != InodeType::File {
         return Ok(());
     }
 
     let xattr_name = XattrName::try_from_full_name(SECURITY_CAPABILITY_XATTR_NAME).unwrap();
-    match inode.remove_xattr(dentry, xattr_name) {
+    match dentry.inode().remove_xattr(dentry, xattr_name) {
         Ok(()) => Ok(()),
         Err(error) if matches!(error.error(), Errno::ENODATA | Errno::EOPNOTSUPP) => Ok(()),
         Err(error) => Err(error),

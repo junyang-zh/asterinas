@@ -115,7 +115,7 @@ use aster_block::{
     id::Bid,
 };
 use io_util::batch::IoBatch;
-use ostd::mm::{Segment, VmIo, VmIoFill};
+use ostd::mm::{Segment, VmIo, VmIoFill, io::util::HasVmReaderWriter};
 
 use crate::prelude::*;
 
@@ -343,6 +343,51 @@ impl PageCache {
     pub(crate) fn fill_zeros(&self, range: Range<usize>) -> Result<()> {
         self.0.fill_zeros(range)
     }
+}
+
+/// An inode-locked anonymous file cache with one retained buffered-write page.
+/// Mappings can add pages, while only the exclusive resize path removes them.
+#[derive(Debug)]
+pub(crate) struct AnonFileCache {
+    cache: PageCache,
+    write_page: Option<(usize, CachePage)>,
+}
+
+impl AnonFileCache {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self { cache: PageCache::new_anon(0)?, write_page: None })
+    }
+
+    pub(crate) fn resize(&mut self, new_size: usize, old_size: usize) -> Result<()> {
+        if self.write_page.as_ref().is_some_and(|(index, _)| *index >= new_size.div_ceil(PAGE_SIZE)) {
+            self.write_page = None;
+        }
+        self.cache.resize(new_size, old_size)
+    }
+
+    pub(crate) fn write(&mut self, offset: usize, reader: &mut VmReader) -> Result<()> {
+        let in_page = offset % PAGE_SIZE;
+        let length = reader.remain();
+        if length == 0 || length > PAGE_SIZE - in_page || length > self.cache.size().saturating_sub(offset) {
+            return Ok(self.cache.write(offset, reader)?);
+        }
+        let index = offset / PAGE_SIZE;
+        if self.write_page.as_ref().is_none_or(|(previous, _)| *previous != index) {
+            let page = self.cache.as_vmo().commit_on_anonymous(index)?;
+            self.write_page = Some((index, page));
+        }
+
+        let (_, page) = self.write_page.as_ref().unwrap();
+        page.writer().skip(in_page).write_fallible(reader)?;
+        Ok(())
+    }
+}
+
+// Read-only operations can share the underlying cache. Resizing must keep
+// the retained page consistent, so mutable access stays in AnonFileCache.
+impl core::ops::Deref for AnonFileCache {
+    type Target = PageCache;
+    fn deref(&self) -> &PageCache { &self.cache }
 }
 
 impl VmIo for PageCache {

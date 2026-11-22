@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -38,7 +38,7 @@ use crate::{
     process::{Gid, Uid, posix_thread::AsPosixThread},
     thread::Thread,
     time::clocks::RealTimeCoarseClock,
-    vm::page_cache::{PageCache, Vmo},
+    vm::page_cache::{AnonFileCache, Vmo},
 };
 
 /// A volatile file system whose data and metadata exists only in memory.
@@ -79,8 +79,8 @@ impl RamFs {
             sb,
             root: Arc::new_cyclic(|weak_root| RamInode {
                 inner: Inner::new_dir(weak_root.clone(), weak_root.clone()),
+                mode: AtomicU16::new(mkmod!(a+rx, u+w).bits()),
                 metadata: SpinLock::new(InodeMeta::new_dir(
-                    mkmod!(a+rx, u+w),
                     Uid::new_root(),
                     Gid::new_root(),
                 )),
@@ -138,6 +138,8 @@ impl FileSystem for RamFs {
 pub(in crate::fs::fs_impls) struct RamInode {
     /// Inode inner specifics
     inner: Inner,
+    /// Permission bits. Writers hold the metadata lock to update ctime with the mode.
+    mode: AtomicU16,
     /// Inode metadata
     metadata: SpinLock<InodeMeta>,
     /// Inode number
@@ -175,12 +177,19 @@ pub(in crate::fs::fs_impls) struct RamInode {
 /// Inode inner specifics.
 enum Inner {
     Dir(RwLock<DirEntry>),
-    File(Mutex<PageCache>),
+    File(RamFile),
     SymLink(SpinLock<String>),
     BlockDevice(u64),
     CharDevice(u64),
     Socket,
     NamedPipe(Pipe),
+}
+
+/// The cache mutex serializes changes to a regular file's contents and length.
+struct RamFile {
+    cache: Mutex<AnonFileCache>,
+    /// Readers of stat and size need the published EOF without taking the cache mutex.
+    size: AtomicUsize,
 }
 
 pub(super) enum ToBeRevalidated {
@@ -200,7 +209,10 @@ impl Inner {
     }
 
     pub(self) fn new_file() -> Self {
-        Self::File(Mutex::new(PageCache::new_anon(0).unwrap()))
+        Self::File(RamFile {
+            cache: Mutex::new(AnonFileCache::new().unwrap()),
+            size: AtomicUsize::new(0),
+        })
     }
 
     pub(self) fn new_symlink(target: &str) -> Self {
@@ -224,7 +236,7 @@ impl Inner {
     }
 
     pub(self) fn new_file_in_memfd() -> Self {
-        Self::File(Mutex::new(PageCache::new_anon(0).unwrap()))
+        Self::new_file()
     }
 
     fn as_direntry(&self) -> Option<&RwLock<DirEntry>> {
@@ -234,7 +246,7 @@ impl Inner {
         }
     }
 
-    fn as_file(&self) -> Option<&Mutex<PageCache>> {
+    fn as_file(&self) -> Option<&RamFile> {
         match self {
             Self::File(page_cache) => Some(page_cache),
             _ => None,
@@ -296,19 +308,19 @@ impl Inner {
 /// Inode metadata.
 #[derive(Clone, Copy, Debug)]
 struct InodeMeta {
+    // Non-regular inode size and blocks. Regular files keep their EOF in RamFile.
     size: usize,
     blocks: usize,
     atime: Duration,
     mtime: Duration,
     ctime: Duration,
-    mode: InodeMode,
     nlinks: usize,
     uid: Uid,
     gid: Gid,
 }
 
 impl InodeMeta {
-    pub(crate) fn new(mode: InodeMode, uid: Uid, gid: Gid) -> Self {
+    pub(crate) fn new(uid: Uid, gid: Gid) -> Self {
         let now = now();
         Self {
             size: 0,
@@ -316,14 +328,13 @@ impl InodeMeta {
             atime: now,
             mtime: now,
             ctime: now,
-            mode,
             nlinks: 1,
             uid,
             gid,
         }
     }
 
-    pub(crate) fn new_dir(mode: InodeMode, uid: Uid, gid: Gid) -> Self {
+    pub(crate) fn new_dir(uid: Uid, gid: Gid) -> Self {
         let now = now();
         Self {
             size: NUM_SPECIAL_ENTRIES,
@@ -331,22 +342,16 @@ impl InodeMeta {
             atime: now,
             mtime: now,
             ctime: now,
-            mode,
             nlinks: NUM_SPECIAL_ENTRIES,
             uid,
             gid,
         }
     }
 
-    pub(crate) fn new_tmpfile(mode: InodeMode, uid: Uid, gid: Gid) -> Self {
-        let mut meta = Self::new(mode, uid, gid);
+    pub(crate) fn new_tmpfile(uid: Uid, gid: Gid) -> Self {
+        let mut meta = Self::new(uid, gid);
         meta.nlinks = 0;
         meta
-    }
-
-    pub(crate) fn resize(&mut self, new_size: usize) {
-        self.size = new_size;
-        self.blocks = new_size.align_up(BLOCK_SIZE) / BLOCK_SIZE;
     }
 
     pub(crate) fn inc_size(&mut self) {
@@ -358,12 +363,6 @@ impl InodeMeta {
         debug_assert!(self.size > 0);
         self.size -= 1;
         self.blocks = self.size.align_up(BLOCK_SIZE) / BLOCK_SIZE;
-    }
-
-    pub(crate) fn nr_sectors_allocated(&self) -> usize {
-        self.blocks
-            .checked_mul(BLOCK_SIZE / SECTOR_SIZE)
-            .expect("ramfs allocated sector count overflow")
     }
 
     pub(crate) fn set_atime(&mut self, time: Duration) {
@@ -532,7 +531,8 @@ impl RamInode {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
             inner: Inner::new_dir(weak_self.clone(), parent.clone()),
-            metadata: SpinLock::new(InodeMeta::new_dir(mode, uid, gid)),
+            mode: AtomicU16::new(mode.bits()),
+            metadata: SpinLock::new(InodeMeta::new_dir(uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::Dir,
             dir_revalidation_policy: fs.revalidation_policy,
@@ -555,7 +555,8 @@ impl RamInode {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
             inner: Inner::new_file(),
-            metadata: SpinLock::new(InodeMeta::new(mode, uid, gid)),
+            mode: AtomicU16::new(mode.bits()),
+            metadata: SpinLock::new(InodeMeta::new(uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::File,
             dir_revalidation_policy: RevalidationPolicy::empty(),
@@ -579,7 +580,8 @@ impl RamInode {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
             inner: Inner::new_file(),
-            metadata: SpinLock::new(InodeMeta::new_tmpfile(mode, uid, gid)),
+            mode: AtomicU16::new(mode.bits()),
+            metadata: SpinLock::new(InodeMeta::new_tmpfile(uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::File,
             dir_revalidation_policy: RevalidationPolicy::empty(),
@@ -603,7 +605,8 @@ impl RamInode {
     ) -> Self {
         Self {
             inner: Inner::new_file_in_memfd(),
-            metadata: SpinLock::new(InodeMeta::new(mode, uid, gid)),
+            mode: AtomicU16::new(mode.bits()),
+            metadata: SpinLock::new(InodeMeta::new(uid, gid)),
             ino: weak_self.as_ptr() as u64,
             typ: InodeType::File,
             dir_revalidation_policy: RevalidationPolicy::empty(),
@@ -627,8 +630,9 @@ impl RamInode {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
             inner: Inner::new_symlink(target),
+            mode: AtomicU16::new(mode.bits()),
             metadata: SpinLock::new({
-                let mut metadata = InodeMeta::new(mode, uid, gid);
+                let mut metadata = InodeMeta::new(uid, gid);
                 metadata.size = target.len();
                 metadata
             }),
@@ -661,7 +665,8 @@ impl RamInode {
 
         Arc::new_cyclic(|weak_self| RamInode {
             inner,
-            metadata: SpinLock::new(InodeMeta::new(mode, uid, gid)),
+            mode: AtomicU16::new(mode.bits()),
+            metadata: SpinLock::new(InodeMeta::new(uid, gid)),
             ino: fs.alloc_id(),
             typ: dev_type.into(),
             dir_revalidation_policy: RevalidationPolicy::empty(),
@@ -684,7 +689,8 @@ impl RamInode {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
             inner: Inner::new_socket(),
-            metadata: SpinLock::new(InodeMeta::new(mode, uid, gid)),
+            mode: AtomicU16::new(mode.bits()),
+            metadata: SpinLock::new(InodeMeta::new(uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::Socket,
             dir_revalidation_policy: RevalidationPolicy::empty(),
@@ -707,7 +713,8 @@ impl RamInode {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
             inner: Inner::new_named_pipe(),
-            metadata: SpinLock::new(InodeMeta::new(mode, uid, gid)),
+            mode: AtomicU16::new(mode.bits()),
+            metadata: SpinLock::new(InodeMeta::new(uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::NamedPipe,
             dir_revalidation_policy: RevalidationPolicy::empty(),
@@ -1000,25 +1007,18 @@ impl RamInode {
             return_errno_with_message!(Errno::EINVAL, "the inode is not a regular file");
         }
 
-        let mut page_cache = self.inner.as_file().unwrap().lock();
-        let mut inode_meta = self.metadata.lock();
-        let file_size = inode_meta.size;
+        let file = self.inner.as_file().unwrap();
+        let mut page_cache = file.cache.lock();
+        let file_size = file.size.load(Ordering::Relaxed);
         if file_size == new_size {
             return Ok(());
         }
+        page_cache.resize(new_size, file_size)?;
         let now = now();
+        let mut inode_meta = self.metadata.lock();
         inode_meta.set_mtime(now);
         inode_meta.set_ctime(now);
-
-        if new_size > file_size {
-            inode_meta.resize(new_size);
-            drop(inode_meta);
-            page_cache.resize(new_size, file_size)?;
-        } else {
-            drop(inode_meta);
-            page_cache.resize(new_size, file_size)?;
-            self.metadata.lock().resize(new_size);
-        }
+        file.size.store(new_size, Ordering::Release);
 
         Ok(())
     }
@@ -1032,15 +1032,19 @@ impl FileOps for RamInode {
         _status_flags: StatusFlags,
     ) -> Result<usize> {
         let read_len = match &self.inner {
-            Inner::File(page_cache) => {
-                let (offset, read_len) = {
-                    let file_size = self.size();
-                    let start = file_size.min(offset);
-                    let end = file_size.min(offset + writer.avail());
-                    (start, end - start)
-                };
-                page_cache.lock().read(offset, writer)?;
-                read_len
+            Inner::File(file) => {
+                let page_cache = file.cache.lock();
+                let read_len = writer.avail().min(file.size.load(Ordering::Relaxed).saturating_sub(offset));
+                // Preserve the caller's remaining capacity at EOF. A fault
+                // after a partial copy must also advance the file offset.
+                let mut bounded = writer.clone_exclusive();
+                let result = page_cache.read(offset, bounded.limit(read_len));
+                let copied = read_len - bounded.avail();
+                writer.skip(copied);
+                if copied == 0 {
+                    result?;
+                }
+                copied
             }
             _ => return_errno_with_message!(Errno::EISDIR, "read is not supported"),
         };
@@ -1065,29 +1069,43 @@ impl FileOps for RamInode {
                     return Ok(0);
                 }
 
+                let file = self.inner.as_file().unwrap();
+                let mut page_cache = file.cache.lock();
+                let old_size = file.size.load(Ordering::Relaxed);
+                let end = offset.checked_add(write_len).ok_or(Errno::EFBIG)?;
+                // A tail append overwrites every newly visible byte. Sparse
+                // growth must clear the gap between the old EOF and offset.
+                if end > old_size && (offset != old_size || end > page_cache.size()) {
+                    page_cache.resize(end, old_size)?;
+                }
+                let result = page_cache.write(offset, reader);
+                let copied = write_len - reader.remain();
+                let new_size = if copied == 0 {
+                    old_size
+                } else {
+                    old_size.max(offset + copied)
+                };
+                if copied < write_len && end > old_size {
+                    // Release whole pages reserved beyond the actual EOF.
+                    // Future growth will initialize the retained tail.
+                    let retained = new_size.align_up(ostd::mm::PAGE_SIZE);
+                    let reserved = page_cache.size();
+                    if retained < reserved {
+                        page_cache.resize(retained, reserved)?;
+                    }
+                }
+                if copied == 0 {
+                    result?;
+                    return Ok(0);
+                }
                 let now = now();
-
-                let mut page_cache = self.inner.as_file().unwrap().lock();
-
                 let mut inode_meta = self.metadata.lock();
-                let file_size = inode_meta.size;
-                let new_size = offset + write_len;
-                let should_expand_size = new_size > file_size;
-                let new_size_aligned = new_size.align_up(BLOCK_SIZE);
                 inode_meta.set_mtime(now);
                 inode_meta.set_ctime(now);
-                if should_expand_size {
-                    inode_meta.size = new_size;
-                    inode_meta.blocks = new_size_aligned / BLOCK_SIZE;
+                if new_size != old_size {
+                    file.size.store(new_size, Ordering::Release);
                 }
-                drop(inode_meta);
-
-                if should_expand_size {
-                    page_cache.resize(new_size_aligned, file_size)?;
-                }
-                page_cache.write(offset, reader)?;
-
-                write_len
+                copied
             }
             _ => return_errno_with_message!(Errno::EISDIR, "write is not supported"),
         };
@@ -1116,11 +1134,14 @@ impl Inode for RamInode {
     fn page_cache(&self) -> Option<Arc<Vmo>> {
         self.inner
             .as_file()
-            .map(|page_cache| page_cache.lock().as_vmo().clone())
+            .map(|file| file.cache.lock().as_vmo().clone())
     }
 
     fn size(&self) -> usize {
-        self.metadata.lock().size
+        match self.inner.as_file() {
+            Some(file) => file.size.load(Ordering::Acquire),
+            None => self.metadata.lock().size,
+        }
     }
 
     fn resize(&self, _self_dentry: &Dentry, new_size: usize) -> Result<()> {
@@ -1160,13 +1181,13 @@ impl Inode for RamInode {
     }
 
     fn mode(&self) -> Result<InodeMode> {
-        Ok(self.metadata.lock().mode)
+        Ok(InodeMode::from_bits_truncate(self.mode.load(Ordering::Acquire)))
     }
 
     fn set_mode(&self, _self_dentry: &Dentry, mode: InodeMode) -> Result<()> {
         let mut inode_meta = self.metadata.lock();
-        inode_meta.mode = mode;
         inode_meta.set_ctime(now());
+        self.mode.store(mode.bits(), Ordering::Release);
         Ok(())
     }
 
@@ -1475,16 +1496,24 @@ impl Inode for RamInode {
     fn metadata(&self) -> Result<Metadata> {
         let rdev = self.inner.device_id().unwrap_or(0);
         let inode_metadata = self.metadata.lock();
+        let (size, blocks) = if let Some(file) = self.inner.as_file() {
+            let size = file.size.load(Ordering::Acquire);
+            (size, size.div_ceil(BLOCK_SIZE))
+        } else {
+            (inode_metadata.size, inode_metadata.blocks)
+        };
         Ok(Metadata {
             ino: self.ino as _,
-            size: inode_metadata.size,
+            size,
             optimal_block_size: BLOCK_SIZE,
-            nr_sectors_allocated: inode_metadata.nr_sectors_allocated(),
+            nr_sectors_allocated: blocks
+                .checked_mul(BLOCK_SIZE / SECTOR_SIZE)
+                .expect("ramfs allocated sector count overflow"),
             last_access_at: inode_metadata.atime,
             last_modify_at: inode_metadata.mtime,
             last_meta_change_at: inode_metadata.ctime,
             type_: self.typ,
-            mode: inode_metadata.mode,
+            mode: InodeMode::from_bits_truncate(self.mode.load(Ordering::Relaxed)),
             nr_hard_links: inode_metadata.nlinks,
             uid: inode_metadata.uid,
             gid: inode_metadata.gid,
@@ -1536,7 +1565,7 @@ impl Inode for RamInode {
                 }
                 let range = offset..file_size.min(offset + len);
                 // TODO: Think of a more light-weight approach
-                self.inner.as_file().unwrap().lock().fill_zeros(range)
+                self.inner.as_file().unwrap().cache.lock().fill_zeros(range)
             }
             _ => {
                 return_errno_with_message!(
@@ -1696,5 +1725,38 @@ impl FsType for RamFsType {
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
         None
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn ramfs_reads_stop_at_logical_eof() {
+        crate::time::clocks::init_for_ktest();
+        let fs = RamFs::new();
+        let inode = RamInode::new_file(
+            &fs,
+            InodeMode::empty(),
+            Uid::new_root(),
+            Gid::new_root(),
+            ToBeRevalidated::No,
+        );
+        let flags = StatusFlags::empty();
+        let mut reader = VmReader::from(&b"abc"[..]).to_fallible();
+        assert_eq!(inode.write_at(0, &mut reader, flags).unwrap(), 3);
+
+        let mut buf = [b'!'; 8];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        assert_eq!(inode.read_at(1, &mut writer, flags).unwrap(), 2);
+        assert_eq!(writer.avail(), 6);
+        for offset in [3, 4, usize::MAX] {
+            assert_eq!(inode.read_at(offset, &mut writer, flags).unwrap(), 0);
+            assert_eq!(writer.avail(), 6);
+        }
+        assert_eq!(&buf, b"bc!!!!!!");
     }
 }

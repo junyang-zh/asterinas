@@ -415,6 +415,13 @@ impl<A: AuxPageTableMeta> PageTable<UserPtConfig<A>> {
 }
 
 impl PageTable<KernelPtConfig> {
+    #[cfg(any(ktest, feature = "idle_shootdown_hint"))]
+    pub(in crate::mm) fn reactivate(&self) {
+        // SAFETY: This initialized root contains all the kernel mappings.
+        // Normal activation transfers the CPU's reference from the old root.
+        unsafe { self.root.activate() };
+    }
+
     /// Creates a new kernel page table.
     pub(in crate::mm) fn new_kernel_page_table() -> Self {
         let kpt = Self::empty();

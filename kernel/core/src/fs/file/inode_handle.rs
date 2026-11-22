@@ -108,9 +108,8 @@ impl InodeHandle {
             return (open_file.as_ref(), is_offset_aware);
         }
 
-        let inode = self.path().inode();
-        let is_offset_aware = inode.type_().is_seekable();
-        (inode.as_ref(), is_offset_aware)
+        let path = self.path();
+        (path.inode().as_ref(), path.type_().is_seekable())
     }
 
     /// Returns the `FileOps` for positional I/O, rejecting files
@@ -121,14 +120,14 @@ impl InodeHandle {
             return Ok(open_file.as_ref());
         }
 
-        let inode = self.path().inode();
-        if !inode.type_().is_seekable() {
+        let path = self.path();
+        if !path.type_().is_seekable() {
             return_errno_with_message!(
                 Errno::ESPIPE,
                 "the inode cannot be read or written at a specific offset"
             );
         }
-        Ok(inode.as_ref())
+        Ok(path.inode().as_ref())
     }
 
     pub(crate) fn readdir(&self, visitor: &mut dyn DirentVisitor) -> Result<usize> {

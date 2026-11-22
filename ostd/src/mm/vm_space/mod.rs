@@ -298,6 +298,56 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
     }
 }
 
+/// Switches this CPU from a borrowed user address space to the kernel root.
+/// A kernel task must finish using any user-space reader or writer before
+/// switching, just as when activating a different user address space.
+#[cfg(any(ktest, feature = "idle_shootdown_hint"))]
+pub fn deactivate_user_space() {
+    let irq = crate::irq::disable_local();
+    let last = ACTIVATED_VM_SPACE_CPUSET.load();
+    if last.is_null() {
+        return;
+    }
+
+    KERNEL_PAGE_TABLE.get().unwrap().reactivate();
+    ACTIVATED_VM_SPACE_CPUSET.store(core::ptr::null());
+    // SAFETY: VmSpace::activate stored one owned Arc in this CPU's slot.
+    // Clearing the slot transfers it here exactly once. Retire membership
+    // only after the hardware switch has invalidated the old translations.
+    let previous = unsafe { Arc::from_raw(last) };
+    previous.remove(irq.current_cpu(), Ordering::Release);
+}
+
+// Only the synchronous TLB sender runs while this guard is held. It uses
+// kernel mappings and can service remote IPIs throughout its wait.
+#[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+struct SuspendedDiscardSpace<'a, A: AuxPageTableMeta> {
+    space: &'a VmSpace<A>,
+    _pin: DisabledPreemptGuard,
+}
+
+#[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+impl<'a, A: AuxPageTableMeta> SuspendedDiscardSpace<'a, A> {
+    fn suspend(space: &'a VmSpace<A>) -> Option<Self> {
+        let pin = disable_preempt();
+        if ACTIVATED_VM_SPACE_CPUSET.load() != Arc::as_ptr(&space.cpus) {
+            return None;
+        }
+        deactivate_user_space();
+        Some(Self { space, _pin: pin })
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+impl<A: AuxPageTableMeta> Drop for SuspendedDiscardSpace<'_, A> {
+    fn drop(&mut self) {
+        // Publish membership and reload the root before permitting callbacks
+        // on this CPU to observe the reactivated address space.
+        let _irq = crate::irq::disable_local();
+        self.space.activate();
+    }
+}
+
 impl<A: AuxPageTableMeta> Default for VmSpace<A> {
     fn default() -> Self {
         Self::new()
@@ -566,6 +616,21 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
         self.pt_cursor.pop_level();
     }
 
+    /// Completes a discard before the caller resumes access to user memory.
+    /// When peers share this address space, switch to the kernel root while
+    /// servicing their invalidations. Activation reloads the user's page table
+    /// before the cursor is returned to the caller.
+    pub fn finish_synchronous_discard(&mut self) {
+        let flusher = &mut self.flusher;
+        #[cfg(all(target_arch = "x86_64", any(ktest, feature = "idle_shootdown_hint")))]
+        let _suspended = if flusher.has_shared_discard_work() {
+            SuspendedDiscardSpace::suspend(self.vmspace)
+        } else {
+            None
+        };
+        flusher.dispatch_and_wait();
+    }
+
     /// Gets the dedicated TLB flusher for this cursor.
     pub fn flusher(&mut self) -> &mut TlbFlusher<'a, DisabledPreemptGuard> {
         &mut self.flusher
@@ -685,6 +750,17 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
     ///  - the current virtual address range is not fully contained in the
     ///    cursor range.
     pub fn unmap(&mut self) -> usize {
+        self.unmap_inner::<true>()
+    }
+
+    /// Unmaps the current entry for a transaction that will synchronously
+    /// dispatch and await all invalidations before releasing this cursor.
+    /// Retains base frames in the transaction's ordinary flush batch.
+    pub fn unmap_for_synchronous_flush(&mut self) -> usize {
+        self.unmap_inner::<false>()
+    }
+
+    fn unmap_inner<const MAY_DEFER: bool>(&mut self) -> usize {
         let cur_range = self.pt_cursor.cur_va_range();
 
         // SAFETY:
@@ -709,12 +785,13 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
                         let rcu_frame = RcuDrop::new(old_frame);
                         panic_guard.forget();
                         let rcu_frame = Frame::rcu_from_unsized(rcu_frame);
-                        #[cfg(not(feature = "lazy_tlb_flush_on_unmap"))]
-                        self.flusher
-                            .issue_tlb_flush_with(TlbFlushOp::for_single(va), rcu_frame);
+                        let op = TlbFlushOp::for_single(va);
                         #[cfg(feature = "lazy_tlb_flush_on_unmap")]
-                        self.flusher
-                            .latr_with(TlbFlushOp::for_single(va), rcu_frame);
+                        if MAY_DEFER {
+                            self.flusher.latr_with(op, rcu_frame);
+                            return 1;
+                        }
+                        self.flusher.issue_tlb_flush_with(op, rcu_frame);
 
                         1
                     }

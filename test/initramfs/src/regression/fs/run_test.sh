@@ -114,6 +114,8 @@ test_mount_bind_file
 echo "All mount bind file test passed."
 
 TEST_TMPDIR=/tmp TEST_DIRECT=0 ./empty_write/empty_write
+./empty_write/partial_write
+./empty_write/partial_read
 TEST_TMPDIR=/exfat TEST_DIRECT=0 ./empty_write/empty_write
 TEST_TMPDIR=/exfat TEST_DIRECT=1 ./empty_write/empty_write
 TEST_TMPDIR=/ext2 TEST_DIRECT=0 ./empty_write/empty_write
@@ -144,6 +146,7 @@ TEST_TMPDIR=/ext2 TEST_DIRECT=1 ./empty_write/empty_write
 ./overlayfs/sparse_copyup_consistency
 ./overlayfs/xino_dino_identity
 
+./procfs/cpu_ticks
 ./procfs/dentry_cache
 ./procfs/fd
 ./procfs/getdents

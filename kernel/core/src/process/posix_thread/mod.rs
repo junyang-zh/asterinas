@@ -79,10 +79,8 @@ pub struct PosixThread {
     // Time
     /// A profiling clock measures the user CPU time and kernel CPU time in the thread.
     prof_clock: Arc<ProfClock>,
-    /// A manager that manages timers based on the user CPU time of the current thread.
-    virtual_timer_manager: Arc<TimerManager>,
-    /// A manager that manages timers based on the profiling clock of the current thread.
-    prof_timer_manager: Arc<TimerManager>,
+    /// CPU timer queues are allocated together at the first thread timer request.
+    cpu_timers: Once<Box<ThreadCpuTimers>>,
 
     /// I/O Scheduling priority value
     io_priority: AtomicU32,
@@ -106,6 +104,11 @@ pub struct PosixThread {
 
     /// The personality value for this thread.
     personality: AtomicU32,
+}
+
+struct ThreadCpuTimers {
+    profiling: Arc<TimerManager>,
+    virtual_time: Arc<TimerManager>,
 }
 
 impl PosixThread {
@@ -253,14 +256,26 @@ impl PosixThread {
         }
     }
 
+    /// A blocked signal stays pending without interrupting an ordinary sleep.
+    /// Stop and ptrace waiters retain their own continuation rules.
+    pub(super) fn wake_for_queued_signal(&self, signum: SigNum) {
+        if let Some((waker, reason)) = &*self.signalled_waker.lock() {
+            if matches!(reason, PauseReason::Sleep) && self.sig_mask().contains(signum) {
+                return;
+            }
+            waker.wake_up();
+        }
+    }
+
     /// Enqueues a thread-directed signal.
     ///
     /// This method does not perform permission checks on user signals.
     /// Therefore, unless the caller can ensure that there are no permission issues,
     /// this method should be used to enqueue kernel signals or fault signals.
     pub(crate) fn enqueue_signal(&self, signal: Box<dyn Signal>) {
+        let signum = signal.num();
         self.sig_queues.enqueue(signal);
-        self.wake_signalled_waker();
+        self.wake_for_queued_signal(signum);
     }
 
     pub(crate) fn register_signalfd_poller(&self, poller: &mut PollHandle, mask: IoEvents) {
@@ -275,12 +290,21 @@ impl PosixThread {
         &self.prof_clock
     }
 
+    fn cpu_timers(&self) -> &ThreadCpuTimers {
+        self.cpu_timers.call_once(|| {
+            Box::new(ThreadCpuTimers {
+                profiling: TimerManager::new(self.prof_clock.clone()),
+                virtual_time: TimerManager::new(self.prof_clock.user_clock().clone()),
+            })
+        })
+    }
+
     /// Creates a timer based on the profiling CPU clock of the current thread.
     pub(crate) fn create_prof_timer<F>(&self, func: F) -> Arc<Timer>
     where
         F: Fn(TimerGuard) + Send + Sync + 'static,
     {
-        self.prof_timer_manager.create_timer(func)
+        self.cpu_timers().profiling.create_timer(func)
     }
 
     /// Creates a timer based on the user CPU clock of the current thread.
@@ -288,13 +312,18 @@ impl PosixThread {
     where
         F: Fn(TimerGuard) + Send + Sync + 'static,
     {
-        self.virtual_timer_manager.create_timer(func)
+        self.cpu_timers().virtual_time.create_timer(func)
     }
 
-    /// Checks the `TimerCallback`s that are managed by the `prof_timer_manager`.
-    /// If any have timed out, call the corresponding callback functions.
-    pub(crate) fn process_expired_timers(&self) {
-        self.prof_timer_manager.process_expired_timers();
+    /// Checks initialized timer queues whose thread CPU clock advanced on this tick.
+    pub(crate) fn process_expired_timers(&self, user_tick: bool) {
+        let Some(timers) = self.cpu_timers.get() else {
+            return;
+        };
+        if user_tick {
+            timers.virtual_time.process_expired_timers();
+        }
+        timers.profiling.process_expired_timers();
     }
 
     /// Gets the read-only credentials of the thread.

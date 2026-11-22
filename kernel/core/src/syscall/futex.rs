@@ -103,10 +103,10 @@ pub(super) fn sys_futex(
             futex_wake_bitset(futex_addr as _, max_count, bitset as _, visibility)
         }
         FutexOp::FUTEX_REQUEUE => {
-            let max_nwakes = futex_val_to_max_count(futex_val);
-            // `utime_addr` is used as the maximum number of requeues in this case.
-            // When `utime_addr` is 0 or negative, it means no requeues.
-            let max_nrequeues = (utime_addr as i32).max(0) as usize;
+            let max_nwakes = usize::try_from(futex_val as i32)
+                .map_err(|_| Error::with_message(Errno::EINVAL, "negative futex wake count"))?;
+            let max_nrequeues = usize::try_from(utime_addr as i32)
+                .map_err(|_| Error::with_message(Errno::EINVAL, "negative futex requeue count"))?;
             futex_requeue(
                 futex_addr as _,
                 max_nwakes,
