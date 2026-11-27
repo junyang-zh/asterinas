@@ -81,6 +81,12 @@ impl Rmap {
             .push(entry)
     }
 
+    #[cfg(ktest)]
+    pub(super) fn vmar_ranges(&self, vmar: Weak<Vmar>) -> Vec<(usize, usize, usize)> {
+        self.entries.get(&KeyableWeak::from(vmar)).into_iter().flatten()
+            .map(|e| (e.vaddr, e.offset, e.size)).collect()
+    }
+
     /// Removes the part of this VMAR's entries that overlaps `range`.
     ///
     /// Entries crossing either boundary are split while preserving their VMO

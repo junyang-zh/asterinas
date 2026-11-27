@@ -68,13 +68,20 @@ impl Vmar {
         });
 
         // Clone mappings.
-        cow_copy_pt(&mut cur_cursor, &mut new_cursor);
+        let changes = cow_copy_pt(&mut cur_cursor, &mut new_cursor);
+        if changes.parent_write_protected {
+            // Other CPUs can retain a writable translation until the synchronous
+            // invalidation finishes. Both complete VM spaces remain locked here.
+            cur_cursor.flusher().issue_tlb_flush(TlbFlushOp::for_all());
+            cur_cursor.flusher().dispatch_tlb_flush();
+            cur_cursor.flusher().sync_tlb_flush();
+        }
 
-        cur_cursor.flusher().issue_tlb_flush(TlbFlushOp::for_all());
-        cur_cursor.flusher().dispatch_tlb_flush();
-        cur_cursor.flusher().sync_tlb_flush();
-
-        new_vmar.refresh_rmap_entries(&mut new_cursor, Vec::new(), core::slice::from_ref(&RANGE));
+        // Each mapping is copied once into this unpublished child. Register its
+        // shared VMO aliases before releasing either full-range cursor.
+        for (vmo, entry) in changes.child_reverse_maps {
+            vmo.rmap().lock().insert(new_vmar.weak_self.clone(), entry);
+        }
 
         drop(cur_cursor);
         drop(new_cursor);
@@ -84,12 +91,25 @@ impl Vmar {
     }
 }
 
-/// Copies both the page table mappings and metadata from the source cursor to
-/// the destination cursor using copy-on-write semantics.
-fn cow_copy_pt(src: &mut CursorMut<'_, PerPtMeta>, dst: &mut CursorMut<'_, PerPtMeta>) {
+#[derive(Default)]
+struct ForkPageChanges {
+    parent_write_protected: bool,
+    child_reverse_maps: Vec<(Arc<super::Vmo>, super::RmapEntry)>,
+}
+
+/// Copies page-table mappings and metadata, recording pending parent
+/// permission invalidations and child reverse-map registrations.
+fn cow_copy_pt(
+    src: &mut CursorMut<'_, PerPtMeta>,
+    dst: &mut CursorMut<'_, PerPtMeta>,
+) -> ForkPageChanges {
+    let mut changes = ForkPageChanges::default();
     while let Some(src_vm_mapping) = src.find_next_mapped(VMAR_CAP_ADDR) {
         let vm_mapping_range = src_vm_mapping.range();
         let new_vm_mapping = src_vm_mapping.new_fork();
+        if let Some(entry) = new_vm_mapping.rmap_entry_in(&vm_mapping_range) {
+            changes.child_reverse_maps.push(entry);
+        }
         let is_device = matches!(src_vm_mapping.mapped_mem(), super::MappedMemory::Device(_));
         let level = src.level();
 
@@ -99,12 +119,13 @@ fn cow_copy_pt(src: &mut CursorMut<'_, PerPtMeta>, dst: &mut CursorMut<'_, PerPt
 
         src.jump(vm_mapping_range.start).unwrap();
 
-        cow_copy_mappings(src, dst, vm_mapping_range.end, !is_device);
+        changes.parent_write_protected |= cow_copy_mappings(src, dst, vm_mapping_range.end, !is_device);
 
         if src.jump(vm_mapping_range.end).is_err() {
             break;
         }
     }
+    changes
 }
 
 /// Sets mappings in the source page table as read-only to trigger COW, and
@@ -114,7 +135,8 @@ fn cow_copy_mappings(
     dst: &mut CursorMut<'_, PerPtMeta>,
     end: usize,
     copy_on_write: bool,
-) {
+) -> bool {
+    let mut parent_write_protected = false;
     debug_assert_eq!(src.level(), dst.level());
     debug_assert_eq!(src.virt_addr(), dst.virt_addr());
 
@@ -128,15 +150,14 @@ fn cow_copy_mappings(
                 let frame = (*frame).clone();
                 let mapped_size = page_size_at(frame.map_level());
 
-                if copy_on_write {
+                if copy_on_write && prop.flags.contains(PageFlags::W) {
                     src.protect(op);
+                    op(&mut prop.flags, &mut prop.cache);
+                    parent_write_protected = true;
                 }
 
                 dst.jump(mapped_va).unwrap();
                 dst.adjust_level(frame.map_level());
-                if copy_on_write {
-                    op(&mut prop.flags, &mut prop.cache);
-                }
                 dst.map(frame, prop);
                 mapped_size
             }
@@ -161,6 +182,7 @@ fn cow_copy_mappings(
             break;
         }
     }
+    parent_write_protected
 }
 
 #[cfg(ktest)]
@@ -172,6 +194,35 @@ mod test {
     };
 
     use super::*;
+
+    #[ktest]
+    fn repeated_cow_copy_only_flushes_new_write_downgrades() {
+        let parent = VmarSpace::new();
+        let pin = disable_preempt();
+        let base = 4 * PAGE_SIZE;
+        let range = base..base + 3 * PAGE_SIZE;
+        for (index, flags) in [(0, PageFlags::R), (2, PageFlags::RW)] {
+            let slot = base + index * PAGE_SIZE;
+            let mut cursor = parent.cursor_mut(&pin, &(slot..slot + PAGE_SIZE)).unwrap();
+            cursor.map(FrameAllocOptions::default().alloc_frame().unwrap().into(),
+                       PageProperty::new_user(flags, CachePolicy::Writeback));
+        }
+        for first_fork in [true, false] {
+            let child = VmarSpace::new();
+            let mut src = parent.cursor_mut(&pin, &range).unwrap();
+            let mut dst = child.cursor_mut(&pin, &range).unwrap();
+            assert_eq!(cow_copy_mappings(&mut src, &mut dst, range.end, true), first_fork);
+            for slot in [base, base + 2 * PAGE_SIZE] {
+                src.jump(slot).unwrap();
+                dst.jump(slot).unwrap();
+                let VmQueriedItem::MappedRam { frame: parent_frame, prop: parent_prop } = src.query() else { panic!("missing parent page") };
+                let VmQueriedItem::MappedRam { frame: child_frame, prop: child_prop } = dst.query() else { panic!("missing child page") };
+                assert_eq!(child_frame.paddr(), parent_frame.paddr());
+                assert_eq!(parent_prop.flags, PageFlags::R);
+                assert_eq!(child_prop.flags, PageFlags::R);
+            }
+        }
+    }
 
     #[ktest]
     fn copy_mappings_basic() {

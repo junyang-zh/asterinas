@@ -790,3 +790,33 @@ fn filling_gap_merges_both_neighbors_and_preserves_residency() {
     assert_eq!(read_byte(&vmar, right), 37);
     assert_consistent(&vmar);
 }
+
+#[ktest]
+fn fork_and_clear_keep_shared_alias_registration_exact() {
+    use crate::vm::page_cache::VmoOptions;
+    let vmar = new_vmar();
+    let vmo = VmoOptions::new_anon(4 * PAGE_SIZE).alloc().unwrap();
+    let limit = RLimit64::new_for_accounting_test(RLIM_INFINITY);
+    for (addr, offset) in [(ADDR, 0), (DEST, 2 * PAGE_SIZE)] {
+        vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ | VmPerms::WRITE)
+            .unwrap()
+            .offset(addr, OffsetType::FixedNoReplace)
+            .vmo(vmo.clone())
+            .vmo_offset(offset)
+            .map_mode(map::MmapMode::Shared)
+            .build_with_rlimit_as(&limit).unwrap();
+    }
+    let child = Vmar::fork_from(&vmar).unwrap();
+    let child_key = child.weak_self.clone();
+    let expected = [(ADDR, 0, PAGE_SIZE), (DEST, 2 * PAGE_SIZE, PAGE_SIZE)];
+    let check = |key| {
+        let mut entries = vmo.rmap().lock().vmar_ranges(key);
+        entries.sort_unstable();
+        entries
+    };
+    assert_eq!(check(vmar.weak_self.clone()), expected);
+    assert_eq!(check(child_key.clone()), expected);
+    drop(child);
+    assert!(check(child_key).is_empty());
+    assert_eq!(check(vmar.weak_self.clone()), expected);
+}
