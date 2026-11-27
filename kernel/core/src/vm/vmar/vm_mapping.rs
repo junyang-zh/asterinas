@@ -436,6 +436,47 @@ impl VmMapping {
         }
     }
 
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    pub(super) fn trim_anon_edge(&mut self, page: &Range<Vaddr>, resident: bool) -> bool {
+        if self.is_shared()
+            || !matches!(self.mapped_mem(), MappedMemory::Anonymous)
+            || self.map_size() <= PAGE_SIZE
+        {
+            return false;
+        }
+        debug_assert_eq!(page.len(), PAGE_SIZE);
+        if self.map_to_addr() == page.start {
+            self.map_to_addr = page.end;
+        } else if self.map_end() != page.end {
+            return false;
+        }
+        if resident {
+            self.dec_frames_mapped(1);
+        }
+        self.map_size = NonZeroUsize::new(self.map_size() - PAGE_SIZE).unwrap();
+        true
+    }
+
+    /// Removes a strict interior page from a private anonymous mapping.
+    /// The left interval keeps its tree key. Only the right interval needs
+    /// to be inserted. An unknown resident count remains unknown on a split.
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    pub(super) fn split_off_after_anon_page(&mut self, page: &Range<Vaddr>) -> Self {
+        debug_assert!(!self.is_shared() && matches!(self.mapped_mem(), MappedMemory::Anonymous));
+        debug_assert!(self.map_to_addr() < page.start && page.end < self.map_end());
+        debug_assert_eq!(page.len(), PAGE_SIZE);
+        let right = self.clone_range_for_remap_at(page.end..self.map_end(), page.end);
+        let left_size = page.start - self.map_to_addr();
+        let left_count = match self.frames_mapped() {
+            Some(0) => Some(0),
+            Some(n) if n == self.map_size() / PAGE_SIZE => Some(left_size / PAGE_SIZE),
+            _ => None,
+        };
+        self.map_size = NonZeroUsize::new(left_size).unwrap();
+        self.frames_mapped = left_count;
+        right
+    }
+
     /// Splits the mapping at the specified address.
     ///
     /// The address must be within the mapping and page-aligned. The address
@@ -1070,4 +1111,31 @@ pub(super) fn map_device_pages(
         }
     }
     num_frames
+}
+
+#[cfg(all(ktest, feature = "lazy_tlb_flush_on_unmap"))]
+#[ostd::prelude::ktest]
+fn private_interior_keeps_keys_and_known_frame_counts() {
+    for (resident, expected_left, expected_right) in [
+        (0, Some(0), Some(0)),
+        (5, Some(1), Some(3)),
+        (2, None, None),
+    ] {
+        let mut mapping = VmMapping::new(
+            NonZeroUsize::new(5 * PAGE_SIZE).unwrap(),
+            PAGE_SIZE,
+            MappedMemory::Anonymous,
+            None,
+            MmapMode::Private,
+            false,
+            VmPerms::READ | VmPerms::WRITE,
+        );
+        mapping.add_frames_mapped(resident);
+        let right = mapping.split_off_after_anon_page(&(2 * PAGE_SIZE..3 * PAGE_SIZE));
+        assert_eq!(mapping.range(), PAGE_SIZE..2 * PAGE_SIZE);
+        assert_eq!(right.range(), 3 * PAGE_SIZE..6 * PAGE_SIZE);
+        assert_eq!(mapping.frames_mapped(), expected_left);
+        assert_eq!(right.frames_mapped(), expected_right);
+        assert_eq!(mapping.perms(), right.perms());
+    }
 }

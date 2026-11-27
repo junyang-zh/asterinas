@@ -90,18 +90,17 @@ impl Vmar {
         let mut rs_as_delta = RsAsDelta::new(self);
         #[cfg(feature = "lazy_tlb_flush_on_unmap")]
         if range.len() == PAGE_SIZE {
-            let can_defer = cursor.find_next_mapped(range.end).is_some_and(|mapping| {
-                mapping.map_to_addr() <= range.start
-                    && mapping.map_end() >= range.end
-                    && !mapping.is_shared()
-                    && matches!(mapping.mapped_mem(), super::MappedMemory::Anonymous)
-            });
-            cursor.jump(range.start).unwrap();
-            if can_defer {
-                let mapping = take_next_unmappable(&mut cursor, range.end)
-                    .unwrap()
-                    .unwrap_mapping();
-                mapping.unmap(&mut cursor, &mut rs_as_delta);
+            let removed = remove_private_leaf_page(&mut cursor, &range, &mut rs_as_delta);
+            let private = removed || cursor.find_next_mapped_with(range.end, |mapping| {
+                mapping.map_to_addr() <= range.start && mapping.map_end() >= range.end
+                    && !mapping.is_shared() && matches!(mapping.mapped_mem(), super::MappedMemory::Anonymous)
+            }) == Some(true);
+            if private {
+                if !removed {
+                    cursor.jump(range.start).unwrap();
+                    let mapping = take_next_unmappable(&mut cursor, range.end).unwrap().unwrap_mapping();
+                    mapping.unmap(&mut cursor, &mut rs_as_delta);
+                }
                 cursor.complete_deferred_unmap();
                 // Private anonymous mappings have no reverse-map entries.
                 drop(rs_as_delta);
@@ -111,6 +110,7 @@ impl Vmar {
                 self.accounting_pause.hit(accounting_tests::AFTER_UNMAP_PT);
                 return Ok(());
             }
+            cursor.jump(range.start).unwrap();
         }
         let old_rmap_entries =
             Self::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&range));
@@ -264,4 +264,61 @@ impl Vmar {
 
         Ok(())
     }
+}
+
+/// Removes one private anonymous page with its leaf table locked.
+/// Both fragments can be updated through the same interval-tree cursor.
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+fn remove_private_leaf_page(
+    cursor: &mut VmarCursorMut<'_>,
+    page: &Range<Vaddr>,
+    delta: &mut RsAsDelta,
+) -> bool {
+    if cursor.level() != 1 {
+        return false;
+    }
+    let resident = match cursor.query() {
+        VmQueriedItem::None => false,
+        VmQueriedItem::MappedRam { .. } => true,
+        _ => return false,
+    };
+    {
+        let mut gap = cursor.aux_meta_mut().inner.gap_before(&page.end);
+        let Some((key, PteRangeMeta::VmMapping(mapping))) = gap.peek_prev() else {
+            return false;
+        };
+        if mapping.map_to_addr() > page.start
+            || mapping.map_end() < page.end
+            || mapping.is_shared()
+            || !matches!(mapping.mapped_mem(), super::MappedMemory::Anonymous)
+        {
+            return false;
+        }
+        if mapping.map_size() == PAGE_SIZE {
+            debug_assert!(
+                mapping
+                    .frames_mapped()
+                    .is_none_or(|n| n == usize::from(resident))
+            );
+            gap.remove_prev().unwrap();
+        } else if mapping.trim_anon_edge(page, resident) {
+            let start = mapping.map_to_addr();
+            if start != *key {
+                let (_, item) = gap.remove_prev().unwrap();
+                gap.insert_before(start, item)
+                    .expect("shrinking an interval preserves order");
+            }
+        } else {
+            let right = mapping.split_off_after_anon_page(page);
+            gap.insert_before(right.map_to_addr(), PteRangeMeta::VmMapping(right))
+                .expect("the right fragment fits before the next interval");
+        }
+    }
+    if resident {
+        let removed = cursor.unmap();
+        debug_assert_eq!(removed, 1);
+        delta.add_rs(super::RssType::Anon, -(removed as isize));
+    }
+    delta.sub_as(PAGE_SIZE);
+    true
 }
