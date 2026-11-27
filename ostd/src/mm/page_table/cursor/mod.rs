@@ -34,7 +34,7 @@ use core::{
 use align_ext::AlignExt;
 
 use super::{
-    Entry, PageTable, PageTableConfig, PageTableError, PageTableGuard, PagingConstsTrait,
+    Entry, PageTable, PageTableConfig, PteTrait, PageTableError, PageTableGuard, PagingConstsTrait,
     PagingLevel, PteState, PteStateRef, page_size, pte_index,
 };
 use crate::{
@@ -277,7 +277,6 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
             }
 
             let cur_va = self.va;
-            let cur_va_range = self.cur_va_range();
             let cur_entry_fits_range = self.entry_at_level_fits_unmap(self.level, end);
 
             match self.cur_entry().to_ref() {
@@ -299,12 +298,30 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
                     }
                     drop(pt_guard); // Implicit descendant.
                 }
-                PteStateRef::Absent => {}
+                PteStateRef::Absent => {
+                    let span = page_size::<C>(self.level);
+                    let base = cur_va.align_down(span);
+                    let first = pte_index::<C>(cur_va, self.level);
+                    let remaining = crate::mm::nr_subpage_per_huge::<C>() - first - 1;
+                    let last = first + ((end - 1 - base) / span).min(remaining);
+                    let node = self.path[self.level as usize - 1].as_ref().unwrap();
+                    // Decode every nonzero PTE normally, including software entries.
+                    if let Some(next) = (first + 1..=last)
+                        .find(|&idx| node.read_pte(idx).as_usize() != 0)
+                    {
+                        self.va = base + (next - first) * span;
+                        continue;
+                    }
+                    if last != first {
+                        self.va = base + (last - first) * span;
+                    }
+                }
                 PteStateRef::Mapped(_) => {
                     return Some(cur_va);
                 }
             }
-            if cur_va_range.end > end {
+            let span = page_size::<C>(self.level);
+            if end - self.va.align_down(span) < span {
                 self.va = end;
                 return None;
             }

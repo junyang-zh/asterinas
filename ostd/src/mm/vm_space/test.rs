@@ -683,3 +683,80 @@ fn discard_suspends_only_its_own_root_and_restores_membership() {
     assert!(own.reader(0x1000, 1).is_ok());
     deactivate_user_space();
 }
+
+#[ktest]
+fn sparse_parent_scan_stops_at_partial_and_exact_subtree_boundaries() {
+    let space = VmSpace::<()>::new();
+    let guard = disable_preempt();
+    let span = page_size_at(2);
+    let base = page_size_at(3);
+    let end = base + 2 * page_size_at(3);
+    let mut cursor = space.cursor_mut(&guard, &(base..end)).unwrap();
+    let prop = PageProperty::new_user(PageFlags::R, CachePolicy::Writeback);
+    for i in [2, 45, 510, 513] {
+        let va = base + i * span + PAGE_SIZE;
+        cursor.jump(va).unwrap();
+        cursor.adjust_level(1);
+        cursor.map(create_dummy_frame(), prop);
+    }
+    for (start, stop, expected) in [
+        (3 * span + PAGE_SIZE, 44 * span + 3 * PAGE_SIZE, None),
+        (3 * span, 45 * span, None),
+        (
+            3 * span + PAGE_SIZE,
+            45 * span + 2 * PAGE_SIZE,
+            Some(45 * span + PAGE_SIZE),
+        ),
+        (46 * span, 511 * span, Some(510 * span + PAGE_SIZE)),
+        (511 * span + PAGE_SIZE, 512 * span, None),
+        (511 * span, 514 * span, Some(513 * span + PAGE_SIZE)),
+    ] {
+        cursor.jump(base + start).unwrap();
+        let found = cursor.find_next(base + stop);
+        assert_eq!(found, expected.map(|va| base + va));
+        assert_eq!(cursor.virt_addr(), found.unwrap_or(base + stop));
+    }
+    cursor.jump(base + 45 * span + PAGE_SIZE).unwrap();
+    cursor.adjust_level(1);
+    assert_eq!(cursor.unmap(), 1);
+    cursor.jump(base + 3 * span).unwrap();
+    assert_eq!(cursor.find_next(end), Some(base + 510 * span + PAGE_SIZE));
+}
+
+#[ktest]
+fn sparse_leaf_scan_preserves_end_positions_and_late_slots() {
+    let space = VmSpace::<()>::new();
+    let pin = disable_preempt();
+    let start = page_size_at(2);
+    let range = start..start + 2 * page_size_at(2);
+    let mut cursor = space.cursor_mut(&pin, &range).unwrap();
+    let prop = PageProperty::new_user(PageFlags::R, CachePolicy::Writeback);
+    for index in [3, 33, 510, 513] {
+        cursor.jump(start + index * PAGE_SIZE).unwrap();
+        cursor.adjust_level(1);
+        cursor.map(create_dummy_frame(), prop);
+    }
+    for (from, to, found) in [
+        (1, 3, None),
+        (1, 4, Some(3)),
+        (4, 34, Some(33)),
+        (34, 510, None),
+        (510, 513, Some(510)),
+        (511, 513, None),
+        (512, 514, Some(513)),
+        (515, 1024, None),
+    ] {
+        cursor.jump(start + from * PAGE_SIZE).unwrap();
+        let result = cursor.find_next(start + to * PAGE_SIZE);
+        assert_eq!(result, found.map(|i| start + i * PAGE_SIZE));
+        assert_eq!(cursor.virt_addr(), result.unwrap_or(start + to * PAGE_SIZE));
+    }
+    cursor.jump(start + 33 * PAGE_SIZE).unwrap();
+    cursor.adjust_level(1);
+    assert_eq!(cursor.unmap(), 1);
+    cursor.jump(start + 300 * PAGE_SIZE).unwrap();
+    cursor.adjust_level(1);
+    cursor.map(create_dummy_frame(), prop);
+    cursor.jump(start + 4 * PAGE_SIZE).unwrap();
+    assert_eq!(cursor.find_next(range.end), Some(start + 300 * PAGE_SIZE));
+}
