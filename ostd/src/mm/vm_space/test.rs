@@ -24,46 +24,78 @@ fn create_dummy_frame() -> UFrame {
 
 #[cfg(feature = "lazy_tlb_flush_on_unmap")]
 #[ktest]
-fn deferred_generations_saturate_without_eliding_publication_barriers() {
+fn publication_preserves_unmaps_issued_during_another_drain() {
     let vmspace = VmSpace::<()>::new();
     vmspace.cpus.store(&CpuSet::new_full(), Ordering::Release);
-    vmspace
-        .deferred_issued
-        .store(u64::MAX - 1, Ordering::Relaxed);
-    vmspace
-        .deferred_completed
-        .store(u64::MAX - 1, Ordering::Relaxed);
     let preempt = disable_preempt();
     let range = 0x1000..0x2000;
     let prop = PageProperty::new_user(PageFlags::R, CachePolicy::Writeback);
     let mut cursor = vmspace.cursor_mut(&preempt, &range).unwrap();
-    for _ in 0..3 {
-        cursor.jump(range.start).unwrap();
-        cursor.map(create_dummy_frame(), prop);
+    let state = vmspace.unmap_stripe(0);
+
+    // Pause a disjoint publisher immediately after it claims the dirty state.
+    state.store(UNMAP_DRAINING, Ordering::Release);
+    cursor.map(create_dummy_frame(), prop);
+    assert_eq!(cursor.unmap(), 1);
+    cursor.complete_deferred_unmap();
+    assert_eq!(state.load(Ordering::Acquire), UNMAP_DRAINING | UNMAP_PENDING);
+
+    // Publication cannot skip the flush or clear the other publisher's state.
+    cursor.sync_deferred_unmaps_before_publish();
+    assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
+    assert_eq!(state.load(Ordering::Acquire), UNMAP_DRAINING | UNMAP_PENDING);
+    state.fetch_and(!UNMAP_DRAINING, Ordering::Release);
+    assert_eq!(state.load(Ordering::Acquire), UNMAP_PENDING);
+    cursor.sync_deferred_unmaps_before_publish();
+    assert_eq!(state.load(Ordering::Acquire), 0);
+}
+
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+#[ktest]
+fn publication_covers_intersecting_leaves_and_stripe_aliases() {
+    use alloc::vec::Vec;
+
+    let span = page_size_at(2);
+    let end = NR_UNMAP_STRIPES * span;
+    assert_eq!(unmap_stripes(end - PAGE_SIZE..end + PAGE_SIZE).collect::<Vec<_>>(), [NR_UNMAP_STRIPES - 1, 0]);
+    assert_eq!(unmap_stripes(span - PAGE_SIZE..span).collect::<Vec<_>>(), [0]);
+    assert_eq!(unmap_stripes(0..3 * end).collect::<Vec<_>>(), (0..NR_UNMAP_STRIPES).collect::<Vec<_>>());
+
+    let space = VmSpace::<()>::new();
+    let pin = disable_preempt();
+    let (left, right) = (space.unmap_stripe(NR_UNMAP_STRIPES - 1), space.unmap_stripe(0));
+    left.store(UNMAP_PENDING, Ordering::Release);
+    right.store(UNMAP_PENDING, Ordering::Release);
+    space.cursor_mut(&pin, &(end..end + PAGE_SIZE)).unwrap().sync_deferred_unmaps_before_publish();
+    assert_eq!(left.load(Ordering::Acquire), UNMAP_PENDING);
+    assert_eq!(right.load(Ordering::Acquire), 0);
+    right.store(UNMAP_PENDING, Ordering::Release);
+    space.cursor_mut(&pin, &(end - PAGE_SIZE..end + PAGE_SIZE)).unwrap().sync_deferred_unmaps_before_publish();
+    assert_eq!(left.load(Ordering::Acquire), 0);
+    assert_eq!(right.load(Ordering::Acquire), 0);
+}
+
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+#[ktest]
+fn aliased_address_spaces_share_a_complete_publication_barrier() {
+    let a = VmSpace::<()>::new();
+    let b = VmSpace::<()>::new();
+    let bucket = (0..NR_UNMAP_STRIPES)
+        .find(|i| core::ptr::eq(a.unmap_stripe(0), b.unmap_stripe(*i)))
+        .unwrap();
+    a.cpus.store(&CpuSet::new_full(), Ordering::Release);
+    let pin = disable_preempt();
+    {
+        let mut cursor = a.cursor_mut(&pin, &(PAGE_SIZE..2 * PAGE_SIZE)).unwrap();
+        cursor.map(create_dummy_frame(), PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback));
         assert_eq!(cursor.unmap(), 1);
         cursor.complete_deferred_unmap();
-        assert_eq!(vmspace.deferred_issued.load(Ordering::Acquire), u64::MAX);
-        cursor.sync_deferred_unmaps_before_publish();
-        assert_eq!(vmspace.deferred_completed.load(Ordering::Acquire), u64::MAX);
-        assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
-
-        // At saturation, equal watermarks cannot justify skipping a barrier.
-        // Queue a retained frame without dispatching, preserving the origin's
-        // pending bit until the barrier performs its own local invalidation.
-        let frame = create_dummy_frame();
-        {
-            let _irq = crate::irq::disable_local();
-            cursor.flusher.latr_with(
-                TlbFlushOp::for_single(range.start),
-                Frame::rcu_from_unsized(RcuDrop::new(frame.clone())),
-            );
-            assert!(crate::mm::tlb::latr::pending_cpus_for_test().contains(preempt.current_cpu()));
-        }
-        cursor.sync_deferred_unmaps_before_publish();
-        assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
-        cursor.flusher.dispatch_tlb_flush();
-        cursor.flusher.sync_tlb_flush();
+        assert_eq!(a.unmap_stripe(0).load(Ordering::Acquire), UNMAP_PENDING);
     }
+    let va = bucket * page_size_at(2) + PAGE_SIZE;
+    b.cursor_mut(&pin, &(va..va + PAGE_SIZE)).unwrap().sync_deferred_unmaps_before_publish();
+    assert_eq!(a.unmap_stripe(0).load(Ordering::Acquire), 0);
+    assert!(crate::mm::tlb::latr::pending_cpus_for_test().is_empty());
 }
 
 /// Creates a new `VmSpace` and verifies its initial state.

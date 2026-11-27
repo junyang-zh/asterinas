@@ -12,7 +12,7 @@
 mod test;
 
 #[cfg(feature = "lazy_tlb_flush_on_unmap")]
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::AtomicU8;
 use core::{ops::Range, sync::atomic::Ordering};
 
 use super::{AnyUFrameMeta, PagingLevel, page_table::PageTableConfig};
@@ -40,6 +40,36 @@ use crate::{
     sync::{RcuDrop, SpinLock},
     task::{DisabledPreemptGuard, atomic_mode::AsAtomicModeGuard, disable_preempt},
 };
+
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+const UNMAP_PENDING: u8 = 1;
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+const UNMAP_DRAINING: u8 = 2;
+
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+const NR_UNMAP_STRIPES: usize = u64::BITS as usize;
+
+/// Disjoint page-table leaves can publish unmaps on separate cache lines.
+/// Aliasing two leaves only requires a conservative invalidation.
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+#[repr(align(64))]
+#[derive(Debug)]
+struct UnmapStripe(AtomicU8);
+
+// A publication barrier invalidates pending translations from every address
+// space. Hash collisions therefore require only a conservative extra drain.
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+static UNMAP_STRIPES: [UnmapStripe; NR_UNMAP_STRIPES] =
+    [const { UnmapStripe(AtomicU8::new(0)) }; NR_UNMAP_STRIPES];
+
+#[cfg(feature = "lazy_tlb_flush_on_unmap")]
+fn unmap_stripes(range: Range<Vaddr>) -> impl Iterator<Item = usize> {
+    let leaf_span = page_size_at(2);
+    let first = range.start / leaf_span;
+    let last = (range.end - 1) / leaf_span;
+    let count = (last - first + 1).min(NR_UNMAP_STRIPES);
+    (first..first + count).map(|leaf| leaf % NR_UNMAP_STRIPES)
+}
 
 /// A virtual address space for user-mode tasks, enabling safe manipulation of user-space memory.
 ///
@@ -81,10 +111,6 @@ pub struct VmSpace<A: AuxPageTableMeta = ()> {
     pt: PageTable<UserPtConfig<A>>,
     cpus: Arc<AtomicCpuSet>,
     iomems: SpinLock<Vec<IoMem>>,
-    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
-    deferred_issued: AtomicU64,
-    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
-    deferred_completed: AtomicU64,
 }
 
 impl<A: AuxPageTableMeta> VmSpace<A> {
@@ -103,11 +129,14 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
                 .create_user_page_table::<A>(),
             cpus: Arc::new(AtomicCpuSet::new(CpuSet::new_empty())),
             iomems: SpinLock::new(Vec::new()),
-            #[cfg(feature = "lazy_tlb_flush_on_unmap")]
-            deferred_issued: AtomicU64::new(0),
-            #[cfg(feature = "lazy_tlb_flush_on_unmap")]
-            deferred_completed: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    fn unmap_stripe(&self, index: usize) -> &'static AtomicU8 {
+        // The CPU-set Arc retains its address when the owning VmSpace moves.
+        let salt = Arc::as_ptr(&self.cpus) as usize / 64;
+        &UNMAP_STRIPES[(index ^ salt) % NR_UNMAP_STRIPES].0
     }
 
     /// Gets an immutable cursor in the virtual address range.
@@ -489,15 +518,11 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
     #[cfg(feature = "lazy_tlb_flush_on_unmap")]
     pub fn complete_deferred_unmap(&mut self) {
         if self.flusher.defer_unmap_flush() {
-            // Slots are published before this release, while the covering PT
-            // lock still excludes reuse. Saturation disables barrier elision
-            // permanently rather than permitting a generation wraparound.
-            self.vmspace
-                .deferred_issued
-                .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
-                    Some(value.saturating_add(1))
-                })
-                .unwrap();
+            // Every producer contributes to the release sequence, even when the
+            // pending bit was already set. The covering PT lock excludes reuse.
+            for index in unmap_stripes(self.guard_va_range()) {
+                self.vmspace.unmap_stripe(index).fetch_or(UNMAP_PENDING, Ordering::Release);
+            }
         }
     }
 
@@ -507,18 +532,35 @@ impl<'a, A: AuxPageTableMeta> CursorMut<'a, A> {
     pub fn sync_deferred_unmaps_before_publish(&mut self) {
         #[cfg(feature = "lazy_tlb_flush_on_unmap")]
         {
-            let issued = self.vmspace.deferred_issued.load(Ordering::Acquire);
-            if issued != u64::MAX
-                && self.vmspace.deferred_completed.load(Ordering::Acquire) >= issued
-            {
-                return;
+            let mut must_flush = false;
+            let mut owned = 0u64;
+            for index in unmap_stripes(self.guard_va_range()) {
+                let state = self.vmspace.unmap_stripe(index);
+                if state.load(Ordering::Acquire) == 0 {
+                    continue;
+                }
+                // A publisher may always drain independently, but only the
+                // one that claimed this stripe can clear its DRAINING bit.
+                match state.compare_exchange(
+                    UNMAP_PENDING,
+                    UNMAP_DRAINING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => owned |= 1 << index,
+                    Err(0) => continue,
+                    Err(_) => (),
+                }
+                must_flush = true;
             }
-            self.flusher.sync_all_deferred_unmaps();
-            // Only this captured generation was covered. A newer disjoint
-            // unmap may have published after a remote CPU handled our callback.
-            self.vmspace
-                .deferred_completed
-                .fetch_max(issued, Ordering::Release);
+            if must_flush {
+                self.flusher.sync_all_deferred_unmaps();
+                while owned != 0 {
+                    let index = owned.trailing_zeros() as usize;
+                    owned &= owned - 1;
+                    self.vmspace.unmap_stripe(index).fetch_and(!UNMAP_DRAINING, Ordering::Release);
+                }
+            }
         }
     }
 
