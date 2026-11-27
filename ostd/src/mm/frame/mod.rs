@@ -39,6 +39,8 @@ pub mod unique;
 pub mod untyped;
 
 mod frame_ref;
+#[cfg(target_arch = "x86_64")]
+mod idle_zero;
 pub use frame_ref::FrameRef;
 
 #[cfg(ktest)]

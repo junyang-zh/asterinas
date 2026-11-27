@@ -68,7 +68,7 @@ impl PreparedFrame {
 
     fn replenish(&mut self) -> Result<()> {
         if self.0.is_none() {
-            self.0 = Some(FrameAllocOptions::new().alloc_frame()?);
+            self.0 = Some(FrameAllocOptions::alloc_zeroed_fault_frame()?);
         }
         Ok(())
     }

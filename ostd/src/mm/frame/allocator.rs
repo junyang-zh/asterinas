@@ -53,6 +53,16 @@ unsafe fn zero_frames(addr: *mut u8, len: usize) {
     unsafe { core::ptr::write_bytes(addr, 0, len) };
 }
 
+fn alloc_physical(layout: Layout) -> Option<Paddr> {
+    let allocator = get_global_frame_allocator();
+    let allocation = allocator.alloc(layout);
+    #[cfg(target_arch = "x86_64")]
+    if allocation.is_none() && super::idle_zero::reclaim() {
+        return allocator.alloc(layout);
+    }
+    allocation
+}
+
 /// Options for allocating physical memory frames.
 pub struct FrameAllocOptions {
     zeroed: bool,
@@ -82,6 +92,21 @@ impl FrameAllocOptions {
         self
     }
 
+    /// Returns a zeroed frame for a user fault, using an idle-prepared frame when available.
+    pub fn alloc_zeroed_fault_frame() -> Result<Frame<()>> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(frame) = super::idle_zero::take() {
+            return Ok(frame);
+        }
+        Self::new().alloc_frame()
+    }
+
+    /// Prepares a bounded number of frames after the idle CPU has checked for work.
+    #[cfg(target_arch = "x86_64")]
+    pub fn prepare_idle_fault_frames() -> bool {
+        super::idle_zero::fill_batch()
+    }
+
     /// Allocates a single untyped frame without metadata.
     pub fn alloc_frame(&self) -> Result<Frame<()>> {
         self.alloc_frame_with(())
@@ -90,8 +115,7 @@ impl FrameAllocOptions {
     /// Allocates a single frame with additional metadata.
     pub fn alloc_frame_with<M: AnyFrameMeta>(&self, metadata: M) -> Result<Frame<M>> {
         let single_layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
-        let frame = get_global_frame_allocator()
-            .alloc(single_layout)
+        let frame = alloc_physical(single_layout)
             .map(|paddr| Frame::from_unused(paddr, metadata).unwrap())
             .ok_or(Error::NoMemory)?;
 
@@ -125,8 +149,7 @@ impl FrameAllocOptions {
             return Err(Error::InvalidArgs);
         }
         let layout = Layout::from_size_align(nframes * PAGE_SIZE, PAGE_SIZE).unwrap();
-        let segment = get_global_frame_allocator()
-            .alloc(layout)
+        let segment = alloc_physical(layout)
             .map(|start| {
                 Segment::from_unused(start..start + nframes * PAGE_SIZE, metadata_fn).unwrap()
             })

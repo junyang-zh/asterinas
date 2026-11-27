@@ -99,6 +99,11 @@ fn idle_step() {
         ostd::task::Task::yield_now();
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if ostd::mm::FrameAllocOptions::prepare_idle_fault_frames() {
+        ostd::task::Task::yield_now();
+        return;
+    }
     #[cfg(feature = "artifact_busy_poll")]
     {
         // Only a pinned idle thread enters this loop. Its next runnable task
