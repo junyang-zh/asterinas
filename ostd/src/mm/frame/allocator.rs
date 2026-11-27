@@ -16,6 +16,43 @@ use crate::{
     util::ops::range_difference,
 };
 
+/// Zeros a nonempty, page-aligned allocation of whole normal-RAM frames.
+///
+/// # Safety
+/// The caller must own all `len` writable bytes beginning at `addr`.
+#[inline]
+unsafe fn zero_frames(addr: *mut u8, len: usize) {
+    debug_assert!(len > 0 && len.is_multiple_of(PAGE_SIZE));
+    debug_assert!((addr as usize).is_multiple_of(PAGE_SIZE));
+    #[cfg(target_arch = "riscv64")]
+    {
+        const { assert!(PAGE_SIZE.is_multiple_of(64)) };
+        // SAFETY: Both bounds belong to the caller's allocation. Each iteration
+        // writes exactly 64 aligned bytes, using only base RV64 instructions.
+        unsafe {
+            core::arch::asm!(
+                "2:",
+                "sd zero, 0({addr})",
+                "sd zero, 8({addr})",
+                "sd zero, 16({addr})",
+                "sd zero, 24({addr})",
+                "sd zero, 32({addr})",
+                "sd zero, 40({addr})",
+                "sd zero, 48({addr})",
+                "sd zero, 56({addr})",
+                "addi {addr}, {addr}, 64",
+                "bne {addr}, {end}, 2b",
+                addr = inout(reg) addr => _,
+                end = in(reg) addr.add(len),
+                options(nostack),
+            );
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    // SAFETY: The caller owns this writable allocation.
+    unsafe { core::ptr::write_bytes(addr, 0, len) };
+}
+
 /// Options for allocating physical memory frames.
 pub struct FrameAllocOptions {
     zeroed: bool,
@@ -61,7 +98,7 @@ impl FrameAllocOptions {
         if self.zeroed {
             let addr = paddr_to_vaddr(frame.paddr()) as *mut u8;
             // SAFETY: The newly allocated frame is guaranteed to be valid.
-            unsafe { core::ptr::write_bytes(addr, 0, PAGE_SIZE) }
+            unsafe { zero_frames(addr, PAGE_SIZE) }
         }
 
         Ok(frame)
@@ -98,7 +135,7 @@ impl FrameAllocOptions {
         if self.zeroed {
             let addr = paddr_to_vaddr(segment.paddr()) as *mut u8;
             // SAFETY: The newly allocated segment is guaranteed to be valid.
-            unsafe { core::ptr::write_bytes(addr, 0, nframes * PAGE_SIZE) }
+            unsafe { zero_frames(addr, nframes * PAGE_SIZE) }
         }
 
         Ok(segment)
