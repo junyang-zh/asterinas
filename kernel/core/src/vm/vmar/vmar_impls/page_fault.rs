@@ -6,13 +6,11 @@ use core::{cmp::min, ops::Range};
 
 use align_ext::AlignExt;
 use ostd::{
-    cpu::PinCurrentCpu,
     cpu_local,
     mm::{
         CachePolicy, Frame, FrameAllocOptions, PageFlags, PageProperty, UFrame,
         io::util::HasVmReaderWriter, page_size_at, tlb::TlbFlushOp, vm_space::VmQueriedItem,
     },
-    sync::SpinLock,
     task::disable_preempt,
 };
 
@@ -57,21 +55,15 @@ struct PendingDeviceFault {
 // Keep an unused zeroed fault frame on each CPU. Allocation and zeroing occur
 // before cursor acquisition; only copying a COW page occurs under its PT lock.
 cpu_local! {
-    static FAULT_FRAME: SpinLock<Option<Frame<()>>> = SpinLock::new(None);
+    static FAULT_FRAME: core::cell::Cell<Option<Frame<()>>> = core::cell::Cell::new(None);
 }
 
 struct PreparedFrame(Option<Frame<()>>);
 
 impl PreparedFrame {
     fn new() -> Self {
-        let guard = disable_preempt();
-        Self(
-            FAULT_FRAME
-                .get_on_cpu(guard.current_cpu())
-                .disable_irq()
-                .lock()
-                .take(),
-        )
+        let irq = ostd::irq::disable_local();
+        Self(FAULT_FRAME.get_with(&irq).take())
     }
 
     fn replenish(&mut self) -> Result<()> {
@@ -89,14 +81,13 @@ impl PreparedFrame {
 impl Drop for PreparedFrame {
     fn drop(&mut self) {
         if let Some(frame) = self.0.take() {
-            let guard = disable_preempt();
-            let mut slot = FAULT_FRAME
-                .get_on_cpu(guard.current_cpu())
-                .disable_irq()
-                .lock();
-            if slot.is_none() {
-                *slot = Some(frame);
-            }
+            // Keep one unused zeroed frame. If this task migrated during the
+            // fault, release any displaced spare after enabling local IRQs.
+            let old = {
+                let irq = ostd::irq::disable_local();
+                FAULT_FRAME.get_with(&irq).replace(Some(frame))
+            };
+            drop(old);
         }
     }
 }
