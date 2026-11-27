@@ -764,3 +764,29 @@ fn private_file_write_fault_preserves_sibling_pages() {
     assert_eq!(read_byte(&vmar, ADDR + 2 * PAGE_SIZE), 0);
     assert_consistent(&vmar);
 }
+
+#[ktest]
+fn filling_gap_merges_both_neighbors_and_preserves_residency() {
+    let vmar = new_vmar();
+    let quota = RLimit64::new_for_accounting_test(RLIM_INFINITY);
+    let left = ADDR;
+    let middle = left + PAGE_SIZE;
+    let right = middle + PAGE_SIZE;
+    map(&vmar, left, 1, &quota).unwrap();
+    write_byte(&vmar, left, 12);
+    map(&vmar, right, 1, &quota).unwrap();
+    write_byte(&vmar, right, 37);
+    map(&vmar, middle, 1, &quota).unwrap();
+
+    let range = left..right + PAGE_SIZE;
+    let mut mappings = Vec::new();
+    vmar.for_each_mapping(range.clone(), false, |mapping| {
+        mappings.push((mapping.range(), mapping.frames_mapped()));
+    })
+    .unwrap();
+    assert_eq!(mappings, [(range, Some(2))]);
+    assert_eq!(read_byte(&vmar, left), 12);
+    assert_eq!(read_byte(&vmar, middle), 0);
+    assert_eq!(read_byte(&vmar, right), 37);
+    assert_consistent(&vmar);
+}

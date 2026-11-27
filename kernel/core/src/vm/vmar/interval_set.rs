@@ -132,6 +132,12 @@ where
         }
     }
 
+    /// Positions a cursor between the neighbors of an unmapped address.
+    pub(super) fn gap_before(&mut self, point: &K) -> IntervalCursorMut<'_, K, V> {
+        self.btree
+            .lower_bound_mut(core::ops::Bound::Included(point))
+    }
+
     /// Finds the last interval that covers any address smaller the point.
     ///
     /// If no such item exists, returns [`None`].
