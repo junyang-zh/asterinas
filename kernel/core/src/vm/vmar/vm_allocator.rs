@@ -148,15 +148,19 @@ impl VirtualAddressAllocator {
         #[cfg(ktest)]
         self.test_pause.before_pt(tests::FIXED);
         let cursor = vmar_space.cursor_mut(guard, lock_range).unwrap();
-        // Fixed mappings may concentrate on one CPU's hint. Do not wait for
-        // hint maintenance: cached selections revalidate Aux under PT even
-        // when a busy hint retains an overlap with this mapping.
-        for cpu in cpu_range_for_vaddr_range(range) {
-            if let Some(mut hint) = self
-                .must_be_free
-                .get_on_cpu(cpu.try_into().unwrap())
-                .try_lock()
-            {
+        // Stale placement hints are safe because allocated addresses are
+        // checked against the locked page table. Small fixed updates often
+        // share an address partition across CPUs. Leave remote hints alone
+        // for these updates, and trim all affected hints for larger areas.
+        let local = if cfg!(feature = "single_vmar_alloc") { CpuId::bsp() } else { guard.current_cpu() };
+        let cpus = cpu_range_for_vaddr_range(range);
+        let affected = if range.len() <= page_size_at(2) {
+            cpus.start.max(local.as_usize())..cpus.end.min(local.as_usize() + 1)
+        } else {
+            cpus
+        };
+        for cpu in affected {
+            if let Some(mut hint) = self.must_be_free.get_on_cpu(cpu.try_into().unwrap()).try_lock() {
                 hint.truncate(range);
             }
         }
