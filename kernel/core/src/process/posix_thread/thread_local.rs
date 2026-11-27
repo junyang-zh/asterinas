@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::cell::{Cell, Ref, RefCell, RefMut};
+use core::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 
 #[cfg(target_arch = "x86_64")]
 use ostd::arch::cpu::context::{FsBase, GsBase};
 use ostd::{
+    cpu::CpuId,
     arch::cpu::context::FpuContext, irq::DisabledLocalIrqGuard, sync::RwArc, task::CurrentTask,
 };
 
@@ -29,6 +30,9 @@ pub(crate) struct ThreadLocal {
     // Virtual memory address regions.
     vmar: RefCell<Option<VmarHandle>>,
     page_fault_disabled: Cell<bool>,
+    // Keep anonymous stacks allocated by this thread close in virtual
+    // address space even when the allocating thread migrates.
+    stack_allocation_cpu: OnceCell<CpuId>,
 
     // Robust futexes.
     // https://man7.org/linux/man-pages/man2/get_robust_list.2.html
@@ -75,6 +79,7 @@ impl ThreadLocal {
             clear_child_tid: Cell::new(clear_child_tid),
             vmar: RefCell::new(Some(vmar)),
             page_fault_disabled: Cell::new(false),
+            stack_allocation_cpu: OnceCell::new(),
             robust_list: RefCell::new(None),
             file_table: RefCell::new(Some(file_table)),
             fs: RefCell::new(fs),
@@ -136,6 +141,10 @@ impl ThreadLocal {
 
     pub(crate) fn is_page_fault_disabled(&self) -> bool {
         self.page_fault_disabled.get()
+    }
+
+    pub(crate) fn stack_allocation_cpu(&self) -> CpuId {
+        *self.stack_allocation_cpu.get_or_init(CpuId::current_racy)
     }
 
     pub(crate) fn robust_list(&self) -> &RefCell<Option<RobustListHead>> {

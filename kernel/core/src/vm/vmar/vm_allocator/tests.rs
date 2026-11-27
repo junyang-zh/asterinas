@@ -127,7 +127,7 @@ fn inversion_probe(stage: usize) {
                 true
             }
             CACHED => worker_allocator
-                .alloc_and_lock(&guard, &worker_space, PAGE_SIZE, PAGE_SIZE, false)
+                .alloc_and_lock(&guard, &worker_space, PAGE_SIZE, PAGE_SIZE, false, None)
                 .is_ok(),
             SLOW => worker_allocator
                 .try_lock_and_alloc_from(
@@ -1044,6 +1044,27 @@ fn exhausted_current_hint_uses_other_hint_then_slow_search() {
         .unwrap();
     vmar.for_each_mapping(second..second + PAGE_SIZE, true, |_| {})
         .unwrap();
+}
+
+#[ktest]
+fn unplaced_stacks_use_preferred_partition_and_keep_fixed_addresses() {
+    let vmar = new_vmar();
+    let remote = remote_cpu(CpuId::current_racy());
+    let extent = NonZeroUsize::new(8 * 1024 * 1024 + PAGE_SIZE).unwrap();
+    let perms = VmPerms::READ | VmPerms::WRITE;
+    let range = assigned_range_on_cpu(allocation_cpu(remote));
+    let first = vmar.new_map(extent, perms).unwrap().stack_allocation_cpu(remote).build().unwrap();
+    let second = vmar.new_map(extent, perms).unwrap().stack_allocation_cpu(remote).build().unwrap();
+    assert!(range.contains(&first) && range.contains(&second));
+    assert_eq!(second + extent.get(), first);
+    write_byte(&vmar, first + PAGE_SIZE, 0x47);
+    write_byte(&vmar, second + PAGE_SIZE, 0x53);
+    let fixed = 0x400_000;
+    let actual = vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), perms).unwrap()
+        .stack_allocation_cpu(remote).offset(fixed, OffsetType::FixedNoReplace).build().unwrap();
+    assert_eq!(actual, fixed);
+    assert_eq!(read_byte(&vmar, first + PAGE_SIZE), 0x47);
+    assert_eq!(read_byte(&vmar, second + PAGE_SIZE), 0x53);
 }
 
 #[ktest]

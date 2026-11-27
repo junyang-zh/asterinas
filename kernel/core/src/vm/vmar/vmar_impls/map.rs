@@ -3,6 +3,7 @@
 use core::{num::NonZeroUsize, ops::Range};
 
 use ostd::{
+    cpu::CpuId,
     mm::{CachePolicy, FrameAllocOptions, PageFlags, PageProperty},
     task::{DisabledPreemptGuard, disable_preempt},
 };
@@ -118,6 +119,7 @@ pub(crate) struct VmarMapOptions<'a, 'b> {
     handle_page_faults_around: bool,
     // Whether to map all pages immediately instead of on-demand.
     populate: bool,
+    stack_cpu: Option<CpuId>,
     #[cfg(ktest)]
     before_admission: Option<&'b dyn Fn()>,
 }
@@ -139,6 +141,7 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_mode: MmapMode::Private,
             handle_page_faults_around: false,
             populate: false,
+            stack_cpu: None,
             #[cfg(ktest)]
             before_admission: None,
         }
@@ -275,6 +278,12 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
         self
     }
 
+    /// Prefers the creator's original address partition for an unplaced stack.
+    pub(crate) fn stack_allocation_cpu(mut self, cpu: CpuId) -> Self {
+        self.stack_cpu = Some(cpu);
+        self
+    }
+
     /// Creates the mapping and adds it to the parent VMAR.
     ///
     /// All options will be checked at this point.
@@ -326,11 +335,10 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             map_mode,
             handle_page_faults_around,
             populate,
+            stack_cpu,
             #[cfg(ktest)]
             before_admission,
         } = self;
-
-        let replaces_existing = matches!(offset, Some((_, OffsetType::Fixed)));
 
         let preempt_guard = disable_preempt();
 
@@ -347,8 +355,10 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             align,
             map_size,
             private_anon,
+            stack_cpu,
         )?;
 
+        let replaces_existing = matches!(offset, Some((_, OffsetType::Fixed)));
         let affected_range = map_to_addr..map_to_addr + map_size.get();
         let old_rmap_entries = if replaces_existing {
             Vmar::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&affected_range))
@@ -555,6 +565,7 @@ fn allocate_range<'a>(
     align: usize,
     map_size: NonZeroUsize,
     private_anon: bool,
+    stack_cpu: Option<CpuId>,
 ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
     let map_size_bytes = map_size.get();
 
@@ -565,6 +576,7 @@ fn allocate_range<'a>(
             map_size_bytes,
             align,
             private_anon,
+            stack_cpu,
         ),
         Some((offset, OffsetType::Fixed)) => {
             let range = offset..offset + map_size_bytes;
@@ -606,6 +618,7 @@ fn allocate_range<'a>(
                     map_size_bytes,
                     align,
                     false,
+                    None,
                 )
             } else {
                 Ok((offset, cursor))

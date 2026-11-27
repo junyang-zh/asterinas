@@ -171,11 +171,12 @@ impl VirtualAddressAllocator {
         size: usize,
         align: usize,
         prefer_single_leaf: bool,
+        preferred_cpu: Option<CpuId>,
     ) -> Result<(Vaddr, VmarCursorMut<'a>)> {
         let cur_cpu = if cfg!(feature = "single_vmar_alloc") {
             CpuId::bsp()
         } else {
-            guard.current_cpu()
+            preferred_cpu.unwrap_or_else(|| guard.current_cpu())
         };
 
         // Fast path by querying the `must_be_free` range.

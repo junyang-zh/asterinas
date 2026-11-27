@@ -126,6 +126,8 @@ fn do_sys_mmap(
                     vmo_options.alloc()?
                 };
                 options = options.vmo(shared_vmo);
+            } else if addr == 0 && !option.flags().is_fixed() && option.flags().contains(MMapFlags::MAP_STACK) {
+                options = options.stack_allocation_cpu(ctx.thread_local.stack_allocation_cpu());
             }
 
             options.build_with_rlimit_as(
