@@ -605,3 +605,71 @@ fn anonymous_buffered_write_page_tracks_truncation_and_regrowth() {
     cache.read_bytes(PAGE_SIZE, &mut bytes).unwrap();
     assert_eq!(&bytes[8..12], b"n\0\0x");
 }
+
+#[ktest]
+fn private_read_cluster_accounts_once_across_backend_retry() {
+    use core::num::NonZeroUsize;
+
+    use ostd::mm::VmWriter;
+
+    use crate::{
+        fs::pseudofs::SockFs,
+        process::ProcessVm,
+        vm::{
+            perms::VmPerms,
+            vmar::{OffsetType, PageFaultInfo, RssType, VmarHandle},
+        },
+    };
+
+    crate::thread::init();
+    crate::time::clocks::init_for_ktest();
+    crate::util::random::init();
+    let vmar = VmarHandle::new(ProcessVm::new(SockFs::new_path())).unwrap();
+    let base = 0x20_0000;
+    let backend = MockPageCacheBackend::new(4);
+    for i in 0..4 {
+        backend.set_persisted_page_bytes(i, &vec![0x51 + i as u8; PAGE_SIZE]);
+    }
+    let cache = new_backend_page_cache(&backend, 4);
+    let vmo = cache.as_vmo();
+    for i in 0..2 {
+        vmo.commit_on(i, VmoMapMode::Private).unwrap();
+    }
+    assert_eq!(backend.read_count(2), 0);
+    vmar.new_map(NonZeroUsize::new(4 * PAGE_SIZE).unwrap(), VmPerms::READ)
+        .unwrap()
+        .offset(base, OffsetType::FixedNoReplace)
+        .vmo(vmo.clone())
+        .handle_page_faults_around()
+        .build()
+        .unwrap();
+    // Populate the same leaf while leaving every file PTE absent.
+    let neighbor = base + 8 * PAGE_SIZE;
+    vmar.new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
+        .unwrap()
+        .offset(neighbor, OffsetType::FixedNoReplace)
+        .build()
+        .unwrap();
+    vmar.handle_page_fault(&PageFaultInfo::new(neighbor, VmPerms::READ))
+        .unwrap();
+    let rss = || vmar.get_rss_counter(RssType::File) + vmar.get_rss_counter(RssType::Anon);
+    let before = rss();
+    vmar.handle_page_fault(&PageFaultInfo::new(base + 2 * PAGE_SIZE, VmPerms::READ))
+        .unwrap();
+    assert_eq!(rss(), before + 4);
+    for i in 0..4 {
+        let mut value = [0];
+        assert_eq!(
+            vmar.read_alien(
+                base + i * PAGE_SIZE,
+                &mut VmWriter::from(&mut value[..]).to_fallible()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(value, [0x51 + i as u8]);
+        assert_eq!(backend.read_count(i), 1);
+    }
+    vmar.remove_mapping(base..base + 4 * PAGE_SIZE).unwrap();
+    assert_eq!(rss(), before);
+}

@@ -400,7 +400,6 @@ impl Vmo {
     /// If the VMO corresponds to a page cache, callers must hold the page table
     /// lock and insert the committed page atomically to the page table inside
     /// the operation.
-    #[expect(dead_code)]
     pub(crate) fn try_operate_on_range<F>(
         &self,
         range: &Range<usize>,

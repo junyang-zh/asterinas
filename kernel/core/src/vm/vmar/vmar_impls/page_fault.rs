@@ -174,6 +174,19 @@ impl Vmar {
             }
 
             let range_to_handle = range_to_handle(vm_mapping, page_fault_info);
+            if vacant_leaf
+                && range_handled.is_empty()
+                && range_to_handle.len() > PAGE_SIZE
+                && try_read_private_cluster(
+                    &mut cursor,
+                    &range_to_handle,
+                    page_fault_info,
+                    &mut rs_as_delta,
+                )
+            {
+                cursor.flush_pending_tlb();
+                break 'retry;
+            }
             if range_handled.is_empty() {
                 range_handled = range_to_handle.start..range_to_handle.start;
             }
@@ -335,6 +348,71 @@ fn range_to_handle(vm_mapping: &VmMapping, page_fault_info: &PageFaultInfo) -> R
     start_addr..end_addr
 }
 
+/// Walk the VMO and an existing leaf together for an ordinary private
+/// read fault. The page-table lock keeps the mapping and all its permissions
+/// stable throughout the cluster. A cache miss resumes normal fault handling.
+fn try_read_private_cluster(
+    cursor: &mut VmarCursorMut<'_>,
+    range: &Range<Vaddr>,
+    fault: &PageFaultInfo,
+    delta: &mut RsAsDelta,
+) -> bool {
+    let Some(PteRangeMeta::VmMapping(mapping)) = cursor.aux_meta().inner.find_one(&range.start)
+    else {
+        return false;
+    };
+    if mapping.is_shared()
+        || fault.is_forced()
+        || fault.required_perms.contains(VmPerms::WRITE)
+        || !mapping.perms().contains(fault.required_perms)
+        || mapping.map_end() < range.end
+    {
+        return false;
+    }
+    let Some(mapped_vmo) = mapping.vmo() else {
+        return false;
+    };
+    let Some(first) = mapped_vmo
+        .offset()
+        .checked_add(range.start - mapping.map_to_addr())
+    else {
+        return false;
+    };
+    let Some(end) = first.checked_add(range.len()) else {
+        return false;
+    };
+    let vmo = mapped_vmo.vmo().clone();
+    let mode = vmo_map_mode(mapping, false);
+    let rss_type = mapping.rss_type();
+    let prop = fault_page_property(mapping.perms() - VmPerms::WRITE, false);
+    let mut next = range.start;
+    let mut added = 0;
+    let outcome = vmo.try_operate_on_range(
+        &(first..end),
+        |commit| {
+            cursor.jump(next).unwrap();
+            if matches!(cursor.query(), VmQueriedItem::None) {
+                let (_, page) = commit()?;
+                cursor.map(page.into(), prop);
+                added += 1;
+            }
+            next += PAGE_SIZE;
+            Ok(())
+        },
+        mode,
+    );
+    if added != 0 {
+        let Some(PteRangeMeta::VmMapping(mapping)) =
+            cursor.aux_meta_mut().inner.find_one_mut(&range.start)
+        else {
+            unreachable!("covered mapping changed within a locked leaf")
+        };
+        mapping.add_frames_mapped(added);
+        delta.add_rs(rss_type, added as isize);
+    }
+    outcome.is_ok()
+}
+
 fn handle_one_page(
     cursor: &mut VmarCursorMut<'_>,
     va: Vaddr,
@@ -468,7 +546,10 @@ fn handle_one_page(
             } else {
                 let new_frame = duplicate_frame(&frame, prepared);
                 prop.flags |= new_flags;
-                let _ = cursor.unmap();
+                // Hold the previous frame through the synchronous flush at
+                // the end of this COW fault.
+                let removed = cursor.unmap_for_synchronous_flush();
+                debug_assert_eq!(removed, 1);
                 cursor.map(new_frame.into(), prop);
             }
         }
