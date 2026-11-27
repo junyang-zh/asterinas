@@ -11,14 +11,14 @@ use crate::{
     mm::{
         HasPaddr, Vaddr, nr_base_per_page, nr_subpage_per_huge, paddr_to_vaddr,
         page_table::{
-            PageTable, PageTableConfig, PageTableGuard, PageTableNodeRef, PagingConstsTrait,
+            AuxPageTableMeta, PageTable, PageTableConfig, PageTableGuard, PageTableNodeRef, PagingConstsTrait,
             PagingLevel, PteScalar, PteStateRef, PteTrait, load_pte, page_size, pte_index,
         },
     },
     task::atomic_mode::InAtomicMode,
 };
 
-pub(super) fn lock_range<'rcu, C: PageTableConfig>(
+pub(super) fn lock_range<'rcu, C: PageTableConfig, const PREPARE_NEIGHBOR: bool>(
     pt: &'rcu PageTable<C>,
     guard: &'rcu dyn InAtomicMode,
     va: &Range<Vaddr>,
@@ -31,7 +31,7 @@ pub(super) fn lock_range<'rcu, C: PageTableConfig>(
     // sub-tree will not see the current state and will not change the current
     // state, breaking serializability.
     let mut subtree_root = loop {
-        if let Some(subtree_root) = try_traverse_and_lock_subtree_root(pt, guard, va, min_level) {
+        if let Some(subtree_root) = try_traverse_and_lock_subtree_root::<C, PREPARE_NEIGHBOR>(pt, guard, va, min_level) {
             break subtree_root;
         }
     };
@@ -119,7 +119,7 @@ pub(super) fn unlock_range<C: PageTableConfig>(cursor: &mut Cursor<'_, C>) {
 /// If this function founds that a locked node is stray (because of racing with
 /// page table recycling), it will return `None`. The caller should retry in
 /// this case to lock the proper node.
-fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig>(
+fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, const PREPARE_NEIGHBOR: bool>(
     pt: &PageTable<C>,
     guard: &'rcu dyn InAtomicMode,
     va: &Range<Vaddr>,
@@ -168,7 +168,27 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig>(
             return None;
         }
 
-        let mut cur_entry = pt_guard.entry(va.start.align_down(page_size::<C>(cur_level)));
+        let entry_start = va.start.align_down(page_size::<C>(cur_level));
+        let neighbor = if PREPARE_NEIGHBOR && cur_level == 2 && va.len() == C::BASE_PAGE_SIZE {
+            let span = page_size::<C>(2);
+            let offset = va.start - entry_start;
+            let other = if offset < span / 8 && start_idx > 0 {
+                entry_start.checked_sub(span)
+            } else if offset >= span - span / 8 && start_idx + 1 < nr_subpage_per_huge::<C>() {
+                entry_start.checked_add(span)
+            } else {
+                None
+            };
+            other.filter(|&other| {
+                let lo = other.min(entry_start);
+                let hi = other.max(entry_start);
+                hi.checked_add(span).is_some_and(|end| pt_guard.aux().can_prepare_adjacent_leaves(lo..end))
+            })
+        } else {
+            None
+        };
+
+        let mut cur_entry = pt_guard.entry(entry_start);
         match cur_entry.to_ref() {
             PteStateRef::Mapped(_) => {
                 break;
@@ -177,6 +197,12 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig>(
                 let allocated_guard = cur_entry.alloc_if_none(guard).unwrap();
                 cur_pt_addr = allocated_guard.paddr();
                 cur_node_guard = Some(allocated_guard);
+                if let Some(other) = neighbor {
+                    // This entry is in the same locked parent. Only an absent
+                    // entry can be created and its new child is locked before
+                    // publication. Present entries retain their ownership.
+                    drop(pt_guard.entry(other).alloc_if_none(guard));
+                }
             }
             PteStateRef::PageTable(pt) => {
                 cur_pt_addr = pt.paddr();

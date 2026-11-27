@@ -135,7 +135,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
     /// The cursor will only be able to query the page table or jump within the
     /// given range.
     /// See [`PageTable::cursor_mut_with_min_level`] for the requirements on `min_level`.
-    pub(in crate::mm) fn new(
+    pub(in crate::mm) fn new<const PREPARE_NEIGHBOR: bool>(
         pt: &'rcu PageTable<C>,
         guard: &'rcu dyn InAtomicMode,
         va: &Range<Vaddr>,
@@ -154,7 +154,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
         const { assert!(C::NR_LEVELS as usize <= MAX_NR_LEVELS) };
 
         super::zeroed_pt_pool::prefill();
-        Ok(locking::lock_range(pt, guard, va, min_level))
+        Ok(locking::lock_range::<C, PREPARE_NEIGHBOR>(pt, guard, va, min_level))
     }
 
     /// Tries to create a cursor without waiting for an overlapping cursor.
@@ -460,13 +460,13 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
     /// table within the given range. Out-of-bound accesses will result in
     /// panics or errors as return values, depending on the access method.
     /// See [`PageTable::cursor_mut_with_min_level`] for the requirements on `min_level`.
-    pub(super) fn new(
+    pub(in crate::mm) fn new<const PREPARE_NEIGHBOR: bool>(
         pt: &'rcu PageTable<C>,
         guard: &'rcu dyn InAtomicMode,
         va: &Range<Vaddr>,
         min_level: PagingLevel,
     ) -> Result<Self, PageTableError> {
-        Ok(Self(Cursor::<'rcu, C>::new(pt, guard, va, min_level)?))
+        Ok(Self(Cursor::<'rcu, C>::new::<PREPARE_NEIGHBOR>(pt, guard, va, min_level)?))
     }
 
     /// Tries to create a mutable cursor without waiting.

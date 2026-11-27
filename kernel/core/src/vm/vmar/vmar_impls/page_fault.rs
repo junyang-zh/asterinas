@@ -925,6 +925,62 @@ mod test {
     }
 
     #[ktest]
+    fn unmap_near_leaf_edge_preserves_neighbor_and_resident_accounting() {
+        let vmar = new_vmar();
+        let span = page_size_at(2);
+        let base = 8 * span;
+        let end = base + 4 * span;
+        let rw = VmPerms::READ | VmPerms::WRITE;
+        map_anon(&vmar, base..end, rw);
+        let addr = base + 2 * span - 2 * PAGE_SIZE;
+        vmar.remove_mapping(addr..addr + PAGE_SIZE).unwrap();
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+        {
+            let guard = disable_preempt();
+            let mut cursor = vmar.vm_space.cursor_mut(&guard, &(base..end)).unwrap();
+            cursor.jump(base + 2 * span).unwrap();
+            cursor.adjust_level(2);
+            assert!(matches!(cursor.aux_meta().inner.find_one(&(base + 2 * span)), Some(PteRangeMeta::ChildPt(_))));
+        }
+        assert!(vmar.handle_page_fault(&PageFaultInfo::new(addr, VmPerms::WRITE)).is_err());
+        for va in [addr - PAGE_SIZE, addr + PAGE_SIZE, base + 2 * span] {
+            vmar.handle_page_fault(&PageFaultInfo::new(va, VmPerms::WRITE)).unwrap();
+        }
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 3);
+        vmar.remove_mapping(base..end).unwrap();
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+    }
+
+    #[ktest]
+    fn fault_near_leaf_edge_keeps_adjacent_table_unprepared() {
+        let span = page_size_at(2);
+        let base = 8 * span;
+        let rw = VmPerms::READ | VmPerms::WRITE;
+        for includes_neighbor in [false, true] {
+            let vmar = new_vmar();
+            let end = base + if includes_neighbor { 4 * span } else { 2 * span };
+            map_anon(&vmar, base..end, rw);
+            let boundary = base + 2 * span;
+            let edge = boundary - 3 * PAGE_SIZE;
+            vmar.handle_page_fault(&PageFaultInfo::new(edge, VmPerms::WRITE)).unwrap();
+            assert_eq!(vmar.get_rss_counter(RssType::Anon), 1);
+            {
+                let guard = disable_preempt();
+                let mut cursor = vmar.vm_space.cursor_mut(&guard, &(base..base + 4 * span)).unwrap();
+                cursor.jump(boundary).unwrap();
+                cursor.adjust_level(2);
+                assert_eq!(matches!(cursor.aux_meta().inner.find_one(&boundary),
+                    Some(PteRangeMeta::ChildPt(_))), false);
+            }
+            let crossed = vmar.handle_page_fault(&PageFaultInfo::new(boundary, VmPerms::WRITE));
+            assert_eq!(crossed.is_ok(), includes_neighbor);
+            assert_eq!(vmar.get_rss_counter(RssType::Anon), if includes_neighbor { 2 } else { 1 });
+            vmar.remove_mapping(base..end).unwrap();
+            assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+        }
+    }
+
+    #[ktest]
     fn fault_cursor_preserves_forced_permission_rules() {
         let vmar = new_vmar();
         let addr = page_size_at(2);

@@ -86,7 +86,7 @@ impl Vmar {
     /// portions of the mappings are unmapped.
     pub(crate) fn remove_mapping(&self, range: Range<usize>) -> Result<()> {
         let preempt_guard = disable_preempt();
-        let mut cursor = self.vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+        let mut cursor = self.vm_space.cursor_mut_for_unmap(&preempt_guard, &range).unwrap();
         let mut rs_as_delta = RsAsDelta::new(self);
         #[cfg(feature = "lazy_tlb_flush_on_unmap")]
         if range.len() == PAGE_SIZE {

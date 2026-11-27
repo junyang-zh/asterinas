@@ -273,6 +273,12 @@ impl AuxPageTableMeta for PerPtMeta {
         snapshot
     }
 
+    fn can_prepare_adjacent_leaves(&self, range: Range<Vaddr>) -> bool {
+        matches!(self.inner.find_one(&range.start), Some(PteRangeMeta::VmMapping(mapping))
+            if mapping.map_end() >= range.end && !mapping.is_shared()
+                && matches!(mapping.mapped_mem(), MappedMemory::Anonymous))
+    }
+
     fn new_root_page_table() -> Self {
         PerPtMeta {
             inner: IntervalSet::new(),

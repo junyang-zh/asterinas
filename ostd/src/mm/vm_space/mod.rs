@@ -181,6 +181,26 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
         })
     }
 
+    /// Locks an unmap range. For a single-page removal near a leaf boundary,
+    /// the metadata owner may prepare an adjacent empty leaf while holding
+    /// the same parent. The cursor still covers only the original range.
+    pub fn cursor_mut_for_unmap<'a, G: AsAtomicModeGuard>(
+        &'a self,
+        guard: &'a G,
+        va: &Range<Vaddr>,
+    ) -> Result<CursorMut<'a, A>> {
+        if va.len() != PAGE_SIZE {
+            return self.cursor_mut(guard, va);
+        }
+        Ok(CursorMut {
+            pt_cursor: page_table::CursorMut::new::<true>(
+                &self.pt, guard.as_atomic_mode_guard(), va, 1,
+            )?,
+            flusher: None,
+            vmspace: self,
+        })
+    }
+
     /// Gets a mutable cursor for operations that insert only base pages.
     ///
     /// Unlike [`Self::cursor_mut`], this may lock a level-1 page table even

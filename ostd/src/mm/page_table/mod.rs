@@ -193,6 +193,12 @@ pub trait AuxPageTableMeta: AuxPtMetaLayoutChecked + Debug + Send + Sync + 'stat
         Default::default()
     }
 
+    /// Allows an empty neighboring leaf table within an existing large
+    /// mapping to be prepared while its parent is already locked.
+    fn can_prepare_adjacent_leaves(&self, _range: Range<Vaddr>) -> bool {
+        false
+    }
+
     /// The callback to allocate a new root page table.
     fn new_root_page_table() -> Self;
 
@@ -562,7 +568,7 @@ impl<C: PageTableConfig> PageTable<C> {
         va: &Range<Vaddr>,
         min_level: PagingLevel,
     ) -> Result<CursorMut<'rcu, C>, PageTableError> {
-        CursorMut::new(self, guard.as_atomic_mode_guard(), va, min_level)
+        CursorMut::new::<false>(self, guard.as_atomic_mode_guard(), va, min_level)
     }
 
     /// Tries to create a mutable cursor without waiting for an overlapping cursor.
@@ -584,7 +590,7 @@ impl<C: PageTableConfig> PageTable<C> {
         guard: &'rcu G,
         va: &Range<Vaddr>,
     ) -> Result<Cursor<'rcu, C>, PageTableError> {
-        Cursor::new(self, guard.as_atomic_mode_guard(), va, 1)
+        Cursor::new::<false>(self, guard.as_atomic_mode_guard(), va, 1)
     }
 
     /// Creates a new reference to the same page table.
