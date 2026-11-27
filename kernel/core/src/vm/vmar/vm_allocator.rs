@@ -147,7 +147,7 @@ impl VirtualAddressAllocator {
     ) -> VmarCursorMut<'a> {
         #[cfg(ktest)]
         self.test_pause.before_pt(tests::FIXED);
-        let cursor = vmar_space.cursor_mut(guard, lock_range).unwrap();
+        let cursor = vmar_space.checked_range(lock_range).unwrap().cursor_mut(guard);
         // Stale placement hints are safe because allocated addresses are
         // checked against the locked page table. Small fixed updates often
         // share an address partition across CPUs. Leave remote hints alone
@@ -187,7 +187,7 @@ impl VirtualAddressAllocator {
         if let Ok(va) = self.alloc_from_cpu_must_free(cur_cpu, size, align, prefer_single_leaf) {
             #[cfg(ktest)]
             self.test_pause.before_pt(tests::CACHED);
-            let mut cursor = vmspace.cursor_mut(guard, &(va..va + size))?;
+            let mut cursor = vmspace.checked_range(&(va..va + size))?.cursor_mut(guard);
             if cursor.find_next_mapped_with(va + size, |_| ()).is_none() {
                 return Ok((va, cursor));
             }
@@ -204,7 +204,7 @@ impl VirtualAddressAllocator {
             if let Ok(va) = self.alloc_from_cpu_must_free(cpu_id, size, align, prefer_single_leaf) {
                 #[cfg(ktest)]
                 self.test_pause.before_pt(tests::CACHED);
-                let mut cursor = vmspace.cursor_mut(guard, &(va..va + size))?;
+                let mut cursor = vmspace.checked_range(&(va..va + size))?.cursor_mut(guard);
                 if cursor.find_next_mapped_with(va + size, |_| ()).is_none() {
                     return Ok((va, cursor));
                 }
@@ -283,7 +283,7 @@ impl VirtualAddressAllocator {
             let lock_range = range.start.min(va)..range.end.max(va + size);
             #[cfg(ktest)]
             self.test_pause.before_pt(tests::REMAP_CACHED);
-            let mut cursor = vmspace.cursor_mut(guard, &lock_range)?;
+            let mut cursor = vmspace.checked_range(&lock_range)?.cursor_mut(guard);
             cursor.jump(va).unwrap();
             if cursor.find_next_mapped_with(va + size, |_| ()).is_none() {
                 cursor.jump(lock_range.start).unwrap();
@@ -340,7 +340,7 @@ impl VirtualAddressAllocator {
         // selection may be reintroduced here; its later Aux check resolves races.
         #[cfg(ktest)]
         self.test_pause.before_pt(tests::SLOW);
-        let mut cursor = vmspace.cursor_mut(guard, range)?;
+        let mut cursor = vmspace.checked_range(range)?.cursor_mut(guard);
         let (va, range) = find_fit_range_in_cursor(&mut cursor, size, align)?;
 
         let remain = truncate_get_largest(&range, &(va..va + size));

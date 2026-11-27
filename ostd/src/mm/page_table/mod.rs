@@ -43,6 +43,7 @@ mod cursor;
 mod node;
 mod zeroed_pt_pool;
 
+pub(in crate::mm) use cursor::CursorRange;
 pub(crate) use cursor::{Cursor, CursorMut, PageTableFrag};
 pub use node::PageTableFrameMeta;
 pub(crate) use node::PteStateRef;

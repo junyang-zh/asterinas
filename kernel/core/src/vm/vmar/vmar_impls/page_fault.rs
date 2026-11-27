@@ -111,6 +111,8 @@ impl Vmar {
                 .checked_add(page_size_at(2))
                 .unwrap_or_else(|| userspace_range().end);
 
+        let checked = self.vm_space.checked_range(&range_to_lock)?;
+
         // Retry is needed if the page fault needs I/O after we locked the page table.
         // Here we declare the state visible across retries. Take care of race
         // conditions when accessing such state.
@@ -123,9 +125,7 @@ impl Vmar {
             let preempt_guard = disable_preempt();
             // Faults insert base pages only. Keep the whole fault-around range,
             // but allow disjoint existing leaf tables to be locked independently.
-            let mut cursor = self
-                .vm_space
-                .cursor_mut_base_pages(&preempt_guard, &range_to_lock)?;
+            let mut cursor = checked.cursor_mut_base_pages(&preempt_guard);
             let mut rs_as_delta = RsAsDelta::new(self);
 
             cursor.jump(address.align_down(PAGE_SIZE)).unwrap();

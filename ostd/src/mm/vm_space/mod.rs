@@ -113,6 +113,46 @@ pub struct VmSpace<A: AuxPageTableMeta = ()> {
     iomems: SpinLock<Vec<IoMem>>,
 }
 
+/// An aligned user range validated for an address space. Validation acquires
+/// no page-table locks. Locking the range observes the current page tables.
+pub struct VmSpaceRange<'v, 'r, A: AuxPageTableMeta> {
+    vmspace: &'v VmSpace<A>,
+    checked: page_table::CursorRange<'r, UserPtConfig<A>>,
+}
+
+impl<'v, A: AuxPageTableMeta> VmSpaceRange<'v, '_, A> {
+    /// Locks the range for updates that can use any fitting page size.
+    pub fn cursor_mut<'g, G: AsAtomicModeGuard>(&self, guard: &'g G) -> CursorMut<'g, A>
+    where 'v: 'g {
+        self.lock::<false, _>(guard, max_page_level::<UserPtConfig<A>>(self.checked.len()))
+    }
+
+    /// Locks the range for operations restricted to base pages.
+    pub fn cursor_mut_base_pages<'g, G: AsAtomicModeGuard>(&self, guard: &'g G) -> CursorMut<'g, A>
+    where 'v: 'g {
+        self.lock::<false, _>(guard, 1)
+    }
+
+    /// Locks a removal range with the usual neighboring leaf preparation for a single page.
+    pub fn cursor_mut_for_unmap<'g, G: AsAtomicModeGuard>(&self, guard: &'g G) -> CursorMut<'g, A>
+    where 'v: 'g {
+        if self.checked.len() == PAGE_SIZE {
+            self.lock::<true, _>(guard, 1)
+        } else {
+            self.cursor_mut(guard)
+        }
+    }
+
+    fn lock<'g, const PREPARE_NEIGHBOR: bool, G: AsAtomicModeGuard>(&self, guard: &'g G, min_level: PagingLevel) -> CursorMut<'g, A>
+    where 'v: 'g {
+        CursorMut {
+            pt_cursor: self.checked.lock_mut::<PREPARE_NEIGHBOR>(&self.vmspace.pt, guard.as_atomic_mode_guard(), min_level),
+            flusher: None,
+            vmspace: self.vmspace,
+        }
+    }
+}
+
 impl<A: AuxPageTableMeta> VmSpace<A> {
     /// Snapshot existing user page tables and their live auxiliary allocations.
     #[cfg(feature = "memory_accounting")]
@@ -155,6 +195,11 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
         Ok(Cursor(self.pt.cursor(guard, va)?))
     }
 
+    /// Validates the bounds and alignment before constructing a page-table cursor.
+    pub fn checked_range<'v, 'r>(&'v self, va: &'r Range<Vaddr>) -> Result<VmSpaceRange<'v, 'r, A>> {
+        Ok(VmSpaceRange { vmspace: self, checked: page_table::CursorRange::new(va)? })
+    }
+
     /// Gets an mutable cursor in the virtual address range.
     ///
     /// The same as [`Self::cursor`], the cursor behaves like a lock guard,
@@ -170,15 +215,7 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
         guard: &'a G,
         va: &Range<Vaddr>,
     ) -> Result<CursorMut<'a, A>> {
-        Ok(CursorMut {
-            pt_cursor: self.pt.cursor_mut_with_min_level(
-                guard,
-                va,
-                max_page_level::<UserPtConfig<A>>(va.len()),
-            )?,
-            flusher: None,
-            vmspace: self,
-        })
+        Ok(self.checked_range(va)?.cursor_mut(guard))
     }
 
     /// Locks an unmap range. For a single-page removal near a leaf boundary,
@@ -189,16 +226,7 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
         guard: &'a G,
         va: &Range<Vaddr>,
     ) -> Result<CursorMut<'a, A>> {
-        if va.len() != PAGE_SIZE {
-            return self.cursor_mut(guard, va);
-        }
-        Ok(CursorMut {
-            pt_cursor: page_table::CursorMut::new::<true>(
-                &self.pt, guard.as_atomic_mode_guard(), va, 1,
-            )?,
-            flusher: None,
-            vmspace: self,
-        })
+        Ok(self.checked_range(va)?.cursor_mut_for_unmap(guard))
     }
 
     /// Gets a mutable cursor for operations that insert only base pages.
@@ -218,11 +246,7 @@ impl<A: AuxPageTableMeta> VmSpace<A> {
         guard: &'a G,
         va: &Range<Vaddr>,
     ) -> Result<CursorMut<'a, A>> {
-        Ok(CursorMut {
-            pt_cursor: self.pt.cursor_mut(guard, va)?,
-            flusher: None,
-            vmspace: self,
-        })
+        Ok(self.checked_range(va)?.cursor_mut_base_pages(guard))
     }
 
     /// Tries to get a mutable cursor without waiting for an overlapping cursor.

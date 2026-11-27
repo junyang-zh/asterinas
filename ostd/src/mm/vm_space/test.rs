@@ -841,3 +841,26 @@ fn sparse_leaf_scan_preserves_end_positions_and_late_slots() {
     cursor.jump(start + 4 * PAGE_SIZE).unwrap();
     assert_eq!(cursor.find_next(range.end), Some(start + 300 * PAGE_SIZE));
 }
+
+#[ktest]
+fn checked_range_relocks_current_entries_and_rejects_unaligned_bounds() {
+    let space = VmSpace::<()>::new();
+    let start = page_size_at(2);
+    let end = start + PAGE_SIZE;
+    assert!(space.checked_range(&(start + 1..end)).is_err());
+    assert!(space.checked_range(&(start..end - 1)).is_err());
+    assert!(space.checked_range(&(end..start)).is_err());
+    let span = start..end;
+    let checked = space.checked_range(&span).unwrap();
+    let pin = disable_preempt();
+    let frame = create_dummy_frame();
+    let prop = PageProperty::new_user(PageFlags::R, CachePolicy::Writeback);
+    {
+        let mut cursor = checked.cursor_mut_base_pages(&pin);
+        assert!(cursor.find_next(end).is_none());
+        cursor.jump(start).unwrap();
+        cursor.map(frame.clone(), prop);
+    }
+    let cursor = checked.cursor_mut(&pin);
+    assert_matches_mapped!(cursor, frame, prop);
+}

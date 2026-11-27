@@ -124,6 +124,43 @@ pub(crate) enum PageTableFrag<C: PageTableConfig> {
     },
 }
 
+/// A range checked for the address-space and alignment rules of this page table.
+pub(in crate::mm) struct CursorRange<'a, C: PageTableConfig> {
+    va: &'a Range<Vaddr>,
+    config: PhantomData<C>,
+}
+
+impl<'a, C: PageTableConfig> CursorRange<'a, C> {
+    pub(in crate::mm) fn new(va: &'a Range<Vaddr>) -> Result<Self, PageTableError> {
+        if !is_valid_range::<C>(va) {
+            return Err(PageTableError::InvalidVaddrRange(va.start, va.end));
+        }
+        if !va.start.is_multiple_of(C::BASE_PAGE_SIZE) || !va.end.is_multiple_of(C::BASE_PAGE_SIZE)
+        {
+            return Err(PageTableError::UnalignedVaddr);
+        }
+
+        const { assert!(C::NR_LEVELS as usize <= MAX_NR_LEVELS) };
+
+        Ok(Self { va, config: PhantomData })
+    }
+
+    pub(in crate::mm) fn len(&self) -> usize {
+        self.va.len()
+    }
+
+    fn lock<'rcu, const PREPARE_NEIGHBOR: bool>(&self, pt: &'rcu PageTable<C>, guard: &'rcu dyn InAtomicMode, min_level: PagingLevel) -> Cursor<'rcu, C> {
+        assert!((1..=C::NR_LEVELS).contains(&min_level));
+        super::zeroed_pt_pool::prefill();
+        locking::lock_range::<C, PREPARE_NEIGHBOR>(pt, guard, self.va, min_level)
+    }
+
+    #[inline]
+    pub(in crate::mm) fn lock_mut<'rcu, const PREPARE_NEIGHBOR: bool>(&self, pt: &'rcu PageTable<C>, guard: &'rcu dyn InAtomicMode, min_level: PagingLevel) -> CursorMut<'rcu, C> {
+        CursorMut(self.lock::<PREPARE_NEIGHBOR>(pt, guard, min_level))
+    }
+}
+
 enum FindNextMode {
     Mapping,
     UnmappableSubtree,
@@ -143,18 +180,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
     ) -> Result<Self, PageTableError> {
         assert!((1..=C::NR_LEVELS).contains(&min_level));
 
-        if !is_valid_range::<C>(va) {
-            return Err(PageTableError::InvalidVaddrRange(va.start, va.end));
-        }
-        if !va.start.is_multiple_of(C::BASE_PAGE_SIZE) || !va.end.is_multiple_of(C::BASE_PAGE_SIZE)
-        {
-            return Err(PageTableError::UnalignedVaddr);
-        }
-
-        const { assert!(C::NR_LEVELS as usize <= MAX_NR_LEVELS) };
-
-        super::zeroed_pt_pool::prefill();
-        Ok(locking::lock_range::<C, PREPARE_NEIGHBOR>(pt, guard, va, min_level))
+        Ok(CursorRange::<C>::new(va)?.lock::<PREPARE_NEIGHBOR>(pt, guard, min_level))
     }
 
     /// Tries to create a cursor without waiting for an overlapping cursor.
@@ -166,17 +192,8 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
         guard: &'rcu dyn InAtomicMode,
         va: &Range<Vaddr>,
     ) -> Result<Option<Self>, PageTableError> {
-        if !is_valid_range::<C>(va) {
-            return Err(PageTableError::InvalidVaddrRange(va.start, va.end));
-        }
-        if !va.start.is_multiple_of(C::BASE_PAGE_SIZE) || !va.end.is_multiple_of(C::BASE_PAGE_SIZE)
-        {
-            return Err(PageTableError::UnalignedVaddr);
-        }
-
-        const { assert!(C::NR_LEVELS as usize <= MAX_NR_LEVELS) };
-
-        Ok(locking::try_lock_range(pt, guard, va))
+        let range = CursorRange::<C>::new(va)?;
+        Ok(locking::try_lock_range(pt, guard, range.va))
     }
 
     /// Gets the current virtual address.
