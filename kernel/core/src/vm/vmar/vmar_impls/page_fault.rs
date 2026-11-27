@@ -279,7 +279,11 @@ impl PageFaultInfo {
 fn range_to_handle(vm_mapping: &VmMapping, page_fault_info: &PageFaultInfo) -> Range<Vaddr> {
     let page_addr = page_fault_info.address.align_down(PAGE_SIZE);
 
-    if !vm_mapping.handle_page_faults_around()
+    // Copy-on-write and shared-file dirtying apply to the addressed page.
+    // Read faults can still populate nearby cached pages as read-only mappings.
+    if page_fault_info.required_perms.contains(VmPerms::WRITE)
+        || page_fault_info.is_forced()
+        || !vm_mapping.handle_page_faults_around()
         || matches!(vm_mapping.mapped_mem(), MappedMemory::Device(_))
     {
         return page_addr..page_addr + PAGE_SIZE;
@@ -288,8 +292,9 @@ fn range_to_handle(vm_mapping: &VmMapping, page_fault_info: &PageFaultInfo) -> R
     const SURROUNDING_PAGE_NUM: usize = 16;
     const SURROUNDING_PAGE_ADDR_MASK: usize = !(SURROUNDING_PAGE_NUM * PAGE_SIZE - 1);
 
-    let start_addr = (page_addr & SURROUNDING_PAGE_ADDR_MASK).max(vm_mapping.map_to_addr());
-    let end_addr = (start_addr + SURROUNDING_PAGE_NUM * PAGE_SIZE).min(vm_mapping.map_end());
+    let window_start = page_addr & SURROUNDING_PAGE_ADDR_MASK;
+    let start_addr = window_start.max(vm_mapping.map_to_addr());
+    let end_addr = (window_start + SURROUNDING_PAGE_NUM * PAGE_SIZE).min(vm_mapping.map_end());
 
     let Some(vmo) = vm_mapping.vmo() else {
         return start_addr..end_addr;

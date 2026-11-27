@@ -657,3 +657,110 @@ fn negative_shard_overflow_normalizes_without_losing_debt() {
     vmar.remove_mapping(ADDR..ADDR + 2 * PAGE_SIZE).unwrap();
     assert_consistent(&vmar);
 }
+
+#[ktest]
+fn private_read_cluster_preserves_cow_and_respects_vmo_offset() {
+    use ostd::mm::{PageFlags, VmReader, VmWriter, vm_space::VmQueriedItem};
+
+    use super::page_fault::PageFaultInfo;
+    use crate::vm::page_cache::VmoOptions;
+
+    let vmar = new_vmar();
+    let limit = RLimit64::new_for_accounting_test(RLIM_INFINITY);
+    let vmo = VmoOptions::new_anon(9 * PAGE_SIZE).alloc().unwrap();
+    for i in 0..9 {
+        let byte = 0x40 + i as u8;
+        let mut reader = VmReader::from(core::slice::from_ref(&byte)).to_fallible();
+        vmo.write(i * PAGE_SIZE, &mut reader).unwrap();
+    }
+    let range = ADDR..ADDR + 10 * PAGE_SIZE;
+    vmar.new_map(
+        NonZeroUsize::new(range.len()).unwrap(),
+        VmPerms::READ | VmPerms::WRITE,
+    )
+    .unwrap()
+    .offset(ADDR, OffsetType::FixedNoReplace)
+    .vmo(vmo.clone())
+    .vmo_offset(PAGE_SIZE)
+    .handle_page_faults_around()
+    .build_with_rlimit_as(&limit)
+    .unwrap();
+    write_byte(&vmar, ADDR + 2 * PAGE_SIZE, 0xbc);
+    let rss = || vmar.get_rss_counter(RssType::File) + vmar.get_rss_counter(RssType::Anon);
+    let before = rss();
+    vmar.handle_page_fault(&PageFaultInfo::new(ADDR + 3 * PAGE_SIZE, VmPerms::READ))
+        .unwrap();
+    assert_eq!(rss(), before + 7);
+    {
+        let guard = disable_preempt();
+        let mut cursor = vmar.vm_space().cursor(&guard, &range).unwrap();
+        for i in 0..10 {
+            cursor.jump(ADDR + i * PAGE_SIZE).unwrap();
+            while cursor.push_level_if_exists().is_some() {}
+            match cursor.query() {
+                VmQueriedItem::MappedRam { prop, .. } => {
+                    assert!(i < 8);
+                    assert_eq!(prop.flags.contains(PageFlags::RW), i == 2);
+                }
+                VmQueriedItem::None => assert!(i >= 8),
+                _ => panic!("unexpected mapping in private cluster"),
+            }
+        }
+    }
+    for i in 0..8 {
+        assert_eq!(
+            read_byte(&vmar, ADDR + i * PAGE_SIZE),
+            if i == 2 { 0xbc } else { 0x41 + i as u8 }
+        );
+    }
+    write_byte(&vmar, ADDR + 3 * PAGE_SIZE, 0xde);
+    let mut original = [0];
+    let mut writer = VmWriter::from(original.as_mut_slice()).to_fallible();
+    vmo.read(4 * PAGE_SIZE, &mut writer).unwrap();
+    assert_eq!(original, [0x44]);
+    assert_eq!(rss(), before + 7);
+    assert_consistent(&vmar);
+}
+
+#[ktest]
+fn private_file_write_fault_preserves_sibling_pages() {
+    use ostd::mm::{PageFlags, vm_space::VmQueriedItem};
+
+    use super::page_fault::PageFaultInfo;
+    use crate::vm::page_cache::VmoOptions;
+    let vmar = new_vmar();
+    let limit = RLimit64::new_for_accounting_test(RLIM_INFINITY);
+    let vmo = VmoOptions::new_anon(8 * PAGE_SIZE).alloc().unwrap();
+    vmar.new_map(
+        NonZeroUsize::new(8 * PAGE_SIZE).unwrap(),
+        VmPerms::READ | VmPerms::WRITE,
+    )
+    .unwrap()
+    .offset(ADDR, OffsetType::FixedNoReplace)
+    .vmo(vmo)
+    .handle_page_faults_around()
+    .build_with_rlimit_as(&limit)
+    .unwrap();
+    let base = vmar.get_rss_counter(RssType::File) + vmar.get_rss_counter(RssType::Anon);
+    vmar.handle_page_fault(&PageFaultInfo::new(ADDR + PAGE_SIZE, VmPerms::WRITE))
+        .unwrap();
+    assert_eq!(
+        vmar.get_rss_counter(RssType::File) + vmar.get_rss_counter(RssType::Anon),
+        base + 1
+    );
+    let guard = disable_preempt();
+    let range = ADDR..ADDR + 8 * PAGE_SIZE;
+    let mut cursor = vmar.vm_space().cursor(&guard, &range).unwrap();
+    assert_eq!(cursor.find_next(range.end), Some(ADDR + PAGE_SIZE));
+    assert!(
+        matches!(cursor.query(), VmQueriedItem::MappedRam { prop, .. } if prop.flags.contains(PageFlags::W))
+    );
+    cursor.jump(ADDR + 2 * PAGE_SIZE).unwrap();
+    assert!(cursor.find_next(range.end).is_none());
+    drop(cursor);
+    drop(guard);
+    write_byte(&vmar, ADDR + PAGE_SIZE, 83);
+    assert_eq!(read_byte(&vmar, ADDR + PAGE_SIZE), 83);
+    assert_eq!(read_byte(&vmar, ADDR + 2 * PAGE_SIZE), 0);
+    assert_consistent(&vmar);
+}
