@@ -35,7 +35,7 @@ use core::{cell::SyncUnsafeCell, ops::Deref, sync::atomic::Ordering};
 
 pub(crate) use self::pte_state::PteStateRef;
 pub(in crate::mm) use self::{entry::Entry, pte_state::PteState};
-use super::{PageTableConfig, PteTrait, nr_subpage_per_huge};
+use super::{AuxPageTableMeta, PageTableConfig, PteTrait, nr_subpage_per_huge};
 use crate::{
     mm::{
         HasPaddr, Infallible, PagingConstsTrait, PagingLevel, Vaddr, VmReader,
@@ -43,6 +43,7 @@ use crate::{
         paddr_to_vaddr, page_size,
         page_table::{PteScalar, load_pte, store_pte},
     },
+    sync::{RcuDrop, SpinLock},
     task::atomic_mode::InAtomicMode,
 };
 
@@ -281,6 +282,38 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         Entry::new_at(self, pte_vaddr)
     }
 
+    /// Delegates one missing leaf while other readers walk existing PTEs.
+    /// A covering writer still excludes every installer. While readers coexist,
+    /// the install lock serializes the parent auxiliary data and child count.
+    pub(super) fn install_leaf(&self, va: Vaddr) -> Option<PageTableNodeRef<'rcu, C>> {
+        assert!(matches!(self.kind, GuardKind::Read(_)));
+        assert_eq!(self.level(), 2);
+        let span = page_size::<C>(2);
+        assert_eq!(va % span, 0);
+        let idx = super::pte_index::<C>(va, 2);
+        let _install = self.meta().leaf_install.disable_irq().lock();
+        match self.entry_state(idx) {
+            PteStateRef::PageTable(child) => return Some(child),
+            PteStateRef::Mapped(_) => return None,
+            PteStateRef::Absent => {}
+        }
+        // SAFETY: Exclusive and implicit writers cannot coexist with our reader.
+        // Other shared guards may only read atomic PTEs or take this lock to
+        // delegate another leaf. They cannot borrow the auxiliary data or count.
+        let inner = unsafe { &mut *self.meta().state.inner.get() };
+        let aux = inner.aux.alloc_child_page_table(va, 2);
+        let child = RcuDrop::new(PageTableNode::<C>::alloc(1, aux));
+        let pte = PteState::PageTable(child).into_pte();
+        inner.nr_children += 1;
+        let table = paddr_to_vaddr(self.paddr()) as *mut C::E;
+        // SAFETY: idx names the rechecked vacant PTE in this live parent.
+        // The new initialized child transfers its ownership to the parent.
+        // Walkers use acquire loads and take a physical lock on the child.
+        unsafe { store_pte(table.add(idx), pte, Ordering::Release) };
+        let PteStateRef::PageTable(child) = self.entry_state(idx) else { unreachable!() };
+        Some(child)
+    }
+
     /// Gets the state of the entry at a given index.
     pub(super) fn entry_state(&self, idx: usize) -> PteStateRef<'rcu, C> {
         let pte = self.read_pte(idx);
@@ -294,6 +327,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 
     /// Gets the number of valid PTEs in the node.
     pub(super) fn nr_children(&self) -> u16 {
+        self.assert_exclusive();
         // SAFETY: The lock is held so we have an exclusive access.
         unsafe { (*self.meta().state.inner.get()).nr_children }
     }
@@ -314,6 +348,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 
     /// Returns a reference to the auxiliary data of the page table node.
     pub(super) fn aux(&self) -> &C::Aux {
+        self.assert_exclusive();
         // SAFETY: The lock is held so we have an exclusive access.
         unsafe { &(*self.meta().state.inner.get()).aux }
     }
@@ -329,7 +364,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         // SAFETY:
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
         // - All page table entries are aligned and accessed with atomic operations only.
-        unsafe { load_pte(ptr.add(idx), Ordering::Relaxed) }
+        unsafe { load_pte(ptr.add(idx), Ordering::Acquire) }
     }
 
     /// Writes a page table entry at a given index.
@@ -398,6 +433,7 @@ pub struct PageTableFrameMeta<C: PageTableConfig> {
     /// pointer preserves the 64-byte physical-frame metadata geometry even when
     /// the client's auxiliary metadata fills the slot in the upstream layout.
     state: Box<NodeState<C>>,
+    leaf_install: SpinLock<()>,
     level: PagingLevel,
 }
 
@@ -425,6 +461,7 @@ impl<C: PageTableConfig> PageTableFrameMeta<C> {
     /// Creates a new page table frame metadata.
     pub(super) fn new(level: PagingLevel, aux: C::Aux) -> Self {
         Self {
+            leaf_install: SpinLock::new(()),
             state: Box::new(NodeState {
                 inner: SyncUnsafeCell::new(PageTableFrameMetaInner {
                     aux,

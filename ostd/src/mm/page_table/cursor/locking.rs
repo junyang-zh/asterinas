@@ -59,7 +59,14 @@ fn traverse<'rcu, C: PageTableConfig>(
             } else {
                 current.clone_ref().lock_read(guard)
             };
-            if let PteStateRef::PageTable(child) = read.entry_state(idx) {
+            let child = match read.entry_state(idx) {
+                PteStateRef::PageTable(child) => Some(child),
+                PteStateRef::Absent if !nonblocking && level == 2 => {
+                    read.install_leaf(va.start.align_down(page_size::<C>(level)))
+                }
+                _ => None,
+            };
+            if let Some(child) = child {
                 path[level as usize - 1] = Some(read);
                 current = child;
                 continue;

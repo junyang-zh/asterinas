@@ -1402,3 +1402,52 @@ fn rw_shared_guard_rejects_mutable_aux() {
     let mut read = pt.root.borrow().lock_read(&preempt);
     let _ = read.aux_mut();
 }
+
+#[ktest]
+fn shared_leaf_install_coexists_with_another_ancestor_reader() {
+    let preempt = disable_preempt();
+    let parent = PageTableNode::<UserPtConfig>::alloc(2, ());
+    let first = parent.borrow().lock_read(&preempt);
+    let second = parent.borrow().lock_read(&preempt);
+    let span = page_size::<UserPtConfig>(2);
+    let child = first.install_leaf(span).unwrap();
+    assert_eq!(second.install_leaf(span).unwrap().paddr(), child.paddr());
+    assert_ne!(second.install_leaf(3 * span).unwrap().paddr(), child.paddr());
+    assert!(matches!(first.entry_state(2), PteStateRef::Absent));
+    assert!(parent.borrow().try_lock(&preempt).is_none());
+    drop(second);
+    drop(first);
+    assert_eq!(parent.borrow().lock(&preempt).nr_children(), 2);
+}
+
+#[ktest]
+fn concurrent_leaf_install_preserves_disjoint_translations() {
+    use crate::cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus};
+    use spin::Once;
+    static PT: Once<PageTable<UserPtConfig>> = Once::new();
+    fn address(cpu: CpuId) -> usize {
+        page_size::<UserPtConfig>(3) + u32::from(cpu) as usize * page_size::<UserPtConfig>(2)
+    }
+    fn map_local() {
+        let pin = disable_preempt();
+        let va = address(pin.current_cpu());
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let mut cursor = PT.get().unwrap().cursor_mut(&pin, &(va..va + PAGE_SIZE)).unwrap();
+        let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback);
+        // SAFETY: this fresh frame is mapped at an aligned disjoint leaf.
+        unsafe { cursor.map(VmItem::new_tracked(frame.into(), prop)) };
+    }
+    let pt = PT.call_once(PageTable::<UserPtConfig>::empty);
+    let pin = disable_preempt();
+    drop(pt.cursor_mut(&pin, &(0..PAGE_SIZE)).unwrap());
+    let mut other = CpuSet::new_full();
+    other.remove(pin.current_cpu());
+    let pending = crate::smp::inter_processor_call(&other, map_local);
+    map_local();
+    pending.wait();
+    for cpu in all_cpus() {
+        let va = address(cpu);
+        // SAFETY: the table remains alive after all mutating callbacks completed.
+        assert!(unsafe { page_walk::<UserPtConfig>(pt.root.paddr(), va) }.is_some());
+    }
+}
