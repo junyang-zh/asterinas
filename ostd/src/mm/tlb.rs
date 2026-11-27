@@ -93,7 +93,7 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
 
     /// Transfers eligible pure-unmap requests to bounded background ownership.
     /// Ordinary requests, including reserve overflow, still complete here.
-    /// The covering VM cursor must publish its generation before unlocking.
+    /// The covering VM cursor must mark pending invalidations before unlocking.
     #[cfg(feature = "lazy_tlb_flush_on_unmap")]
     pub(crate) fn defer_unmap_flush(&mut self) -> bool {
         self.dispatch_tlb_flush();

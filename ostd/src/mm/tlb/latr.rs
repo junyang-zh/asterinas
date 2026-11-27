@@ -28,6 +28,9 @@ struct Slot {
 cpu_local! {
     static SLOTS: spin::Once<[Slot; CAPACITY]> = spin::Once::new();
     static FRAMES: RefCell<[Option<RetiredFrame>; CAPACITY]> = RefCell::new([const { None }; CAPACITY]);
+    // Only the origin consumes its own pending bit. Track those slots separately
+    // so a single unmap need not revisit slots awaiting remote acknowledgements.
+    static LOCAL_PENDING: core::cell::Cell<u64> = core::cell::Cell::new(0);
     // Only the origin writes this bitmap, with local IRQs disabled. A set bit
     // includes completed slots whose retained frame has not yet been recycled.
     static ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +71,10 @@ pub(super) fn add(
             *slots[idx].op.get() = Some(op);
         }
         slots[idx].pending.store(cpu_set, Ordering::Release);
+        if cpu_set.contains(cpu) {
+            let local = LOCAL_PENDING.get_with(&irq);
+            local.set(local.get() | (1 << idx));
+        }
         let active = ACTIVE.get_on_cpu(cpu).load(Ordering::Relaxed);
         ACTIVE
             .get_on_cpu(cpu)
@@ -87,7 +94,12 @@ pub(crate) fn do_flush() {
     let irq = crate::irq::disable_local();
     let current = irq.current_cpu();
     for origin in all_cpus() {
-        flush_origin(origin, current);
+        if origin == current {
+            flush_local_slots(current, &irq);
+        } else {
+            let active = ACTIVE.get_on_cpu(origin).load(Ordering::Acquire);
+            flush_slots(origin, current, active);
+        }
     }
     drop(irq);
     recycle();
@@ -98,9 +110,9 @@ pub(crate) fn do_flush() {
 pub(super) fn flush_local() {
     let irq = crate::irq::disable_local();
     let current = irq.current_cpu();
-    flush_origin(current, current);
-    drop(irq);
-    recycle();
+    flush_local_slots(current, &irq);
+    // Completed slots are reused by add() or retired by the background drain.
+    // The number of frames held by this CPU remains bounded by CAPACITY.
 }
 
 /// Returns CPUs that have not acknowledged this origin's published operations.
@@ -130,8 +142,12 @@ pub(crate) fn pending_cpus_for_test() -> CpuSet {
 }
 
 // The caller disables local IRQs throughout operation reads, flushes and ACKs.
-fn flush_origin(origin: CpuId, current: CpuId) {
-    let active = ACTIVE.get_on_cpu(origin).load(Ordering::Acquire);
+fn flush_local_slots(current: CpuId, irq: &crate::irq::DisabledLocalIrqGuard) {
+    let local = LOCAL_PENDING.get_with(irq).replace(0);
+    flush_slots(current, current, local);
+}
+
+fn flush_slots(origin: CpuId, current: CpuId, active: u64) {
     if active == 0 {
         return;
     }
