@@ -2,6 +2,7 @@
 
 use crate::arch::trap::SSTATUS_SUM;
 
+core::arch::global_asm!(include_str!("memcpy.S"));
 core::arch::global_asm!(include_str!("memcpy_fallible.S"), SSTATUS_SUM = const SSTATUS_SUM);
 core::arch::global_asm!(include_str!("memset_fallible.S"), SSTATUS_SUM = const SSTATUS_SUM);
 
