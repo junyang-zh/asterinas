@@ -1061,3 +1061,34 @@ fn fixed_range_crosses_assigned_cache_boundary() {
     assert_eq!(vmar.get_mappings_total_size(), before);
     assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
 }
+
+#[ktest]
+fn adjacent_stack_hints_check_existing_pages() {
+    let vmar = new_vmar();
+    let span = page_size_at(2);
+    assert!(next_stack_hint(None, PAGE_SIZE).is_none());
+    assert!(next_stack_hint(Some(2 * span), span).is_none());
+    let size = span + PAGE_SIZE;
+    let pages = size / PAGE_SIZE;
+    let flags = VmPerms::READ | VmPerms::WRITE;
+    let pin = disable_preempt();
+    let first = next_stack_hint(None, size).unwrap();
+    assert!((first + size).is_multiple_of(page_size_at(2)));
+    let cpu = if cfg!(feature = "single_vmar_alloc") { CpuId::bsp() } else { CpuId::current_racy() };
+    let span = page_size_at(HIGHEST_PAGING_LEVEL);
+    if VMAR_CAP_ADDR / span >= 2 {
+        assert_ne!(first / span, (assigned_range_on_cpu(cpu).end - 1) / span);
+    }
+    drop(pin);
+    assert_eq!(map(&vmar, first, pages, OffsetType::Hint, flags).unwrap(), first);
+    let second = next_stack_hint(Some(first), size).unwrap();
+    assert_eq!(second + size, first);
+    assert_eq!(map(&vmar, second, pages, OffsetType::Hint, flags).unwrap(), second);
+    write_byte(&vmar, second + PAGE_SIZE, 0x6b);
+    let collision = map(&vmar, second, pages, OffsetType::Hint, flags).unwrap();
+    assert!(collision + size <= second || collision >= first + size);
+    write_byte(&vmar, collision + PAGE_SIZE, 0x17);
+    assert_eq!(read_byte(&vmar, second + PAGE_SIZE), 0x6b);
+    assert!(next_stack_hint(Some(VMAR_LOWEST_ADDR), PAGE_SIZE).is_none());
+    assert!(next_stack_hint(Some(first), usize::MAX).is_none());
+}

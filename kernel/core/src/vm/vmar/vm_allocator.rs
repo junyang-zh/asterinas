@@ -357,6 +357,39 @@ fn find_fit_range_in_cursor(
     ))
 }
 
+/// Suggests adjacent addresses for stacks created by the same thread. The
+/// first hint is separated from the descending general allocation frontier.
+/// The regular hint path takes the page-table lock and checks availability.
+pub(crate) fn next_stack_hint(previous: Option<Vaddr>, size: usize) -> Option<Vaddr> {
+    // A larger stack necessarily spans multiple leaves. Its teardown takes a
+    // covering writer, which can block unrelated faults under the same node.
+    if size <= page_size_at(2) {
+        return None;
+    }
+
+    let end = previous.unwrap_or_else(|| {
+        let cpu = if cfg!(feature = "single_vmar_alloc") {
+            CpuId::bsp()
+        } else {
+            CpuId::current_racy()
+        };
+        let range = assigned_range_on_cpu(cpu);
+        let span = page_size_at(HIGHEST_PAGING_LEVEL);
+        let slots = VMAR_CAP_ADDR / span;
+        if slots < 2 {
+            return (range.start + range.len() / 2).align_down(page_size_at(2));
+        }
+        // Place the first stack away from the regular descending allocation
+        // frontier. Cleanup of a multi-leaf stack can then take its covering
+        // page-table writer independently of ordinary mappings by this creator.
+        let frontier = range.end - 1;
+        let slot = (frontier / span + slots / 2) % slots;
+        slot * span + (frontier % span / 2).align_down(page_size_at(2)) + span / 4
+    });
+    end.checked_sub(size)
+        .filter(|start| *start >= VMAR_LOWEST_ADDR && end <= VMAR_CAP_ADDR)
+}
+
 /// Returns the assigned virtual address range for the given CPU.
 ///
 /// The assigned range is firstly searched for free space to allocate.

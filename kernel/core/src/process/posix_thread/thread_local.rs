@@ -29,6 +29,7 @@ pub(crate) struct ThreadLocal {
     // Virtual memory address regions.
     vmar: RefCell<Option<VmarHandle>>,
     page_fault_disabled: Cell<bool>,
+    stack_start_hint: Cell<Option<Vaddr>>,
 
     // Robust futexes.
     // https://man7.org/linux/man-pages/man2/get_robust_list.2.html
@@ -75,6 +76,7 @@ impl ThreadLocal {
             clear_child_tid: Cell::new(clear_child_tid),
             vmar: RefCell::new(Some(vmar)),
             page_fault_disabled: Cell::new(false),
+            stack_start_hint: Cell::new(None),
             robust_list: RefCell::new(None),
             file_table: RefCell::new(Some(file_table)),
             fs: RefCell::new(fs),
@@ -97,6 +99,11 @@ impl ThreadLocal {
 
     pub(crate) fn vmar(&self) -> &RefCell<Option<VmarHandle>> {
         &self.vmar
+    }
+
+    /// Last successful unplaced private stack mapping in this address space.
+    pub(crate) fn stack_start_hint(&self) -> &Cell<Option<Vaddr>> {
+        &self.stack_start_hint
     }
 
     /// Executes the closure with the page fault handler disabled.

@@ -16,6 +16,7 @@ use ostd::mm::Vaddr;
 
 pub(crate) use self::{
     handle::VmarHandle,
+    vm_allocator::next_stack_hint,
     rmap::{Rmap, RmapEntry},
     vm_mapping::VmMapping,
     vmar_impls::{

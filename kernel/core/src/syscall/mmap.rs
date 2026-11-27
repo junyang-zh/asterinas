@@ -128,11 +128,29 @@ fn do_sys_mmap(
                 options = options.vmo(shared_vmo);
             }
 
-            options.build_with_rlimit_as(
+            let unplaced_stack = addr == 0
+                && option.typ() == MMapType::Private
+                && option.flags().contains(MMapFlags::MAP_STACK)
+                && !option.flags().is_fixed();
+            #[cfg(target_arch = "x86_64")]
+            let unplaced_stack = unplaced_stack && !option.flags().contains(MMapFlags::MAP_32BIT);
+            let hint = if unplaced_stack {
+                crate::vm::vmar::next_stack_hint(ctx.thread_local.stack_start_hint().get(), len.get())
+            } else {
+                None
+            };
+            if let Some(start) = hint {
+                options = options.offset(start, OffsetType::Hint);
+            }
+            let start = options.build_with_rlimit_as(
                 ctx.process
                     .resource_limits()
                     .get_rlimit(ResourceType::RLIMIT_AS),
-            )?
+            )?;
+            if hint.is_some() {
+                ctx.thread_local.stack_start_hint().set(Some(start));
+            }
+            start
         } else {
             let mut file_table = ctx.thread_local.borrow_file_table_mut();
             let file = get_file_fast!(&mut file_table, raw_fd.try_into()?).into_owned();
