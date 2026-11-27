@@ -38,6 +38,45 @@ use crate::{
     },
 };
 
+// Even a mapping spanning all virtual addresses holds at most usize::MAX / PAGE_SIZE frames.
+const UNKNOWN_FRAME_COUNT: usize = usize::MAX;
+
+/// A mapping starts at a base-page boundary. Its low address bits store
+/// the access permissions, sharing mode and cached read-fault policy.
+#[derive(Clone, Copy)]
+struct MappingLocation(usize);
+
+impl MappingLocation {
+    const PERMS: usize = VmPerms::all().bits() as usize;
+    const SHARED: usize = 1 << 6;
+    const FAULT_AROUND: usize = 1 << 7;
+    const ATTRS: usize = Self::PERMS | Self::SHARED | Self::FAULT_AROUND;
+
+    fn new(addr: Vaddr, mode: MmapMode, around: bool, perms: VmPerms) -> Self {
+        const {
+            assert!(MappingLocation::PERMS < MappingLocation::SHARED);
+            assert!(MappingLocation::ATTRS < PAGE_SIZE);
+        }
+        assert!(addr.is_multiple_of(PAGE_SIZE));
+        let shared = if mode.is_shared() { Self::SHARED } else { 0 };
+        let around = if around { Self::FAULT_AROUND } else { 0 };
+        Self(addr | shared | around | perms.bits() as usize)
+    }
+
+    fn addr(self) -> Vaddr {
+        self.0 & !(PAGE_SIZE - 1)
+    }
+
+    fn relocated(self, addr: Vaddr) -> Self {
+        assert!(addr.is_multiple_of(PAGE_SIZE));
+        Self(addr | (self.0 & Self::ATTRS))
+    }
+
+    fn with_perms(self, perms: VmPerms) -> Self {
+        Self((self.0 & !Self::PERMS) | perms.bits() as usize)
+    }
+}
+
 /// A memory mapping for a range of virtual addresses in a [`Vmar`].
 ///
 /// A `VmMapping` can be bound with a [`Vmo`] which can provide physical pages
@@ -63,56 +102,49 @@ pub(crate) struct VmMapping {
     ///
     /// Zero sized mapping is not allowed. So this field is always non-zero.
     map_size: NonZeroUsize,
-    /// The base address relative to the VMAR where the VMO is mapped.
-    map_to_addr: Vaddr,
-    /// The mapped memory object. This field specifies what type of memory is
-    /// mapped and provides access to the underlying memory object (VMO, device
-    /// memory, or anonymous memory).
-    ///
-    /// The start of the virtual address maps to the start of the range
-    /// specified in the mapped object.
-    mapped_mem: MappedMemory,
+    location: MappingLocation,
+    // A private anonymous mapping needs only its range, flags and resident count.
+    backing: Option<Box<MappingBacking>>,
     /// Number of base frames mapped in the page table for this mapping.
     ///
     /// If it is [`None`], we need to walk the page table to count the mapped
     /// pages. It can happen when [`VmMapping::split`] is called.
-    frames_mapped: Option<usize>,
-    /// The file that backs the mapping.
-    ///
-    /// If the mapping is VMO-backed, the `mapped_mem` field should be the page
-    /// cache of the inode referenced by the file's path.
+    frames_mapped: usize,
+
+}
+
+/// File, device and shared-anonymous capabilities owned by a mapping.
+struct MappingBacking {
+    memory: MappedMemory,
     file: Option<Arc<dyn FileLike>>,
-    /// The sharing mode of the mapping.
-    ///
-    /// The updates to a shared mapping are visible among processes, or carried
-    /// through to the underlying file for file-backed shared mappings.
-    map_mode: MmapMode,
-    /// Whether the mapping needs to handle surrounding pages when handling
-    /// page fault.
-    handle_page_faults_around: bool,
-    /// The permissions of pages in the mapping.
-    ///
-    /// All pages within the same `VmMapping` have the same permissions.
-    perms: VmPerms,
+}
+
+impl MappingBacking {
+    fn new(memory: MappedMemory, file: Option<Arc<dyn FileLike>>) -> Option<Box<Self>> {
+        if matches!(memory, MappedMemory::Anonymous) && file.is_none() {
+            return None;
+        }
+        Some(Box::new(Self { memory, file }))
+    }
 }
 
 impl Debug for VmMapping {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("VmMapping")
             .field("map_size", &self.map_size)
-            .field("map_to_addr", &self.map_to_addr)
-            .field("mapped_mem", &self.mapped_mem)
-            .field("file", &self.file.as_ref().map(|file| file.path()))
-            .field("map_mode", &self.map_mode)
-            .field("handle_page_faults_around", &self.handle_page_faults_around)
-            .field("perms", &self.perms)
+            .field("map_to_addr", &self.map_to_addr())
+            .field("mapped_mem", self.mapped_mem())
+            .field("file", &self.file().map(|file| file.path()))
+            .field("shared", &self.is_shared())
+            .field("handle_page_faults_around", &self.handle_page_faults_around())
+            .field("perms", &self.perms())
             .finish()
     }
 }
 
 impl Interval<Vaddr> for VmMapping {
     fn range(&self) -> Range<Vaddr> {
-        self.map_to_addr..self.map_to_addr + self.map_size.get()
+        self.map_to_addr()..self.map_to_addr() + self.map_size.get()
     }
 }
 
@@ -130,43 +162,38 @@ impl VmMapping {
     ) -> Self {
         Self {
             map_size,
-            map_to_addr,
-            mapped_mem,
-            frames_mapped: Some(0),
-            file,
-            map_mode,
-            handle_page_faults_around,
-            perms,
+            location: MappingLocation::new(map_to_addr, map_mode, handle_page_faults_around, perms),
+            backing: MappingBacking::new(mapped_mem, file),
+            frames_mapped: 0,
         }
     }
 
     pub(super) fn new_fork(&self) -> VmMapping {
         VmMapping {
-            mapped_mem: self.mapped_mem.dup(),
-            file: self.file.clone(),
+            backing: MappingBacking::new(self.mapped_mem().dup(), self.file().cloned()),
             ..*self
         }
     }
 
     pub(super) fn frames_mapped(&self) -> Option<usize> {
-        self.frames_mapped
+        (self.frames_mapped != UNKNOWN_FRAME_COUNT).then_some(self.frames_mapped)
     }
 
     pub(super) fn add_frames_mapped(&mut self, num_frames: usize) {
-        if let Some(frames_mapped) = self.frames_mapped.as_mut() {
-            *frames_mapped += num_frames;
-            debug_assert!(*frames_mapped <= self.map_size.get() / PAGE_SIZE);
+        if self.frames_mapped != UNKNOWN_FRAME_COUNT {
+            self.frames_mapped += num_frames;
+            debug_assert!(self.frames_mapped <= self.map_size.get() / PAGE_SIZE);
         }
     }
 
     pub(super) fn dec_frames_mapped(&mut self, num_frames: usize) {
-        if let Some(frames_mapped) = self.frames_mapped.as_mut() {
-            *frames_mapped -= num_frames;
+        if self.frames_mapped != UNKNOWN_FRAME_COUNT {
+            self.frames_mapped -= num_frames;
         }
     }
 
     pub(super) fn remap_at(mut self, va: Vaddr) -> VmMapping {
-        self.map_to_addr = va;
+        self.location = self.location.relocated(va);
         self
     }
 
@@ -175,9 +202,9 @@ impl VmMapping {
     }
 
     pub(super) fn clone_range_for_remap_at(&self, range: Range<Vaddr>, va: Vaddr) -> VmMapping {
-        let offset_in_mapping = range.start - self.map_to_addr;
+        let offset_in_mapping = range.start - self.map_to_addr();
         let range_size = range.end - range.start;
-        let frames_mapped = match self.frames_mapped {
+        let frames_mapped = match self.frames_mapped() {
             Some(0) => Some(0),
             Some(frames_mapped) if frames_mapped == self.map_size() / PAGE_SIZE => {
                 Some(range_size / PAGE_SIZE)
@@ -187,22 +214,21 @@ impl VmMapping {
         };
         VmMapping {
             map_size: NonZeroUsize::new(range_size).unwrap(),
-            map_to_addr: va,
-            mapped_mem: self.mapped_mem.dup_at_offset(offset_in_mapping),
-            frames_mapped,
-            file: self.file.clone(),
+            location: self.location.relocated(va),
+            backing: MappingBacking::new(self.mapped_mem().dup_at_offset(offset_in_mapping), self.file().cloned()),
+            frames_mapped: frames_mapped.unwrap_or(UNKNOWN_FRAME_COUNT),
             ..*self
         }
     }
 
     /// Returns the mapping's start address.
     pub(crate) fn map_to_addr(&self) -> Vaddr {
-        self.map_to_addr
+        self.location.addr()
     }
 
     /// Returns the mapping's end address.
     pub(crate) fn map_end(&self) -> Vaddr {
-        self.map_to_addr + self.map_size.get()
+        self.map_to_addr() + self.map_size.get()
     }
 
     /// Returns the mapping's size.
@@ -212,30 +238,40 @@ impl VmMapping {
 
     /// Returns the permissions of pages in the mapping.
     pub(crate) fn perms(&self) -> VmPerms {
-        self.perms
+        VmPerms::from_bits_truncate((self.location.0 & MappingLocation::PERMS) as u32)
     }
 
     /// Returns the inode of the file that backs the mapping.
     pub(crate) fn inode(&self) -> Option<&Arc<dyn Inode>> {
-        self.file.as_ref().map(|file| file.path().inode())
+        self.file().map(|file| file.path().inode())
     }
 
     /// Returns whether to handle surrounding pages when handling page fault.
     pub(crate) fn handle_page_faults_around(&self) -> bool {
-        self.handle_page_faults_around
+        self.location.0 & MappingLocation::FAULT_AROUND != 0
     }
 
     pub(super) fn mapped_mem(&self) -> &MappedMemory {
-        &self.mapped_mem
+        static ANONYMOUS: MappedMemory = MappedMemory::Anonymous;
+        self.backing.as_deref().map_or(&ANONYMOUS, |backing| &backing.memory)
+    }
+
+    #[cfg(feature = "memory_accounting")]
+    pub(super) fn backing_layout(&self) -> Option<core::alloc::Layout> {
+        self.backing.as_ref().map(|_| core::alloc::Layout::new::<MappingBacking>())
+    }
+
+    fn file(&self) -> Option<&Arc<dyn FileLike>> {
+        self.backing.as_deref().and_then(|backing| backing.file.as_ref())
     }
 
     pub(crate) fn is_shared(&self) -> bool {
-        self.map_mode.is_shared()
+        self.location.0 & MappingLocation::SHARED != 0
     }
 
     /// Returns a reference to the VMO if this mapping is VMO-backed.
     pub(super) fn vmo(&self) -> Option<&MappedVmo> {
-        match &self.mapped_mem {
+        match self.mapped_mem() {
             MappedMemory::Vmo(vmo) => Some(vmo),
             _ => None,
         }
@@ -252,8 +288,8 @@ impl VmMapping {
     // man pages say that private mappings have unspecified behavior if the
     // file content changes later on.
     pub(super) fn vmo_for_rmap(&self) -> Option<&Arc<Vmo>> {
-        match &self.mapped_mem {
-            MappedMemory::Vmo(vmo) if self.map_mode.is_shared() => Some(vmo.vmo()),
+        match self.mapped_mem() {
+            MappedMemory::Vmo(vmo) if self.is_shared() => Some(vmo.vmo()),
             _ => None,
         }
     }
@@ -261,7 +297,7 @@ impl VmMapping {
     /// Returns the reverse-mapping entry for the part intersecting `range`.
     pub(super) fn rmap_entry_in(&self, range: &Range<Vaddr>) -> Option<(Arc<Vmo>, RmapEntry)> {
         let vmo = self.vmo_for_rmap()?.clone();
-        let start = self.map_to_addr.max(range.start);
+        let start = self.map_to_addr().max(range.start);
         let end = self.map_end().min(range.end);
         if start >= end {
             return None;
@@ -271,7 +307,7 @@ impl VmMapping {
             vmo,
             RmapEntry {
                 vaddr: start,
-                offset: self.vmo().unwrap().offset() + start - self.map_to_addr,
+                offset: self.vmo().unwrap().offset() + start - self.map_to_addr(),
                 size: end - start,
             },
         ))
@@ -279,7 +315,7 @@ impl VmMapping {
 
     /// Returns the mapping's RSS type.
     pub(crate) fn rss_type(&self) -> RssType {
-        match &self.mapped_mem {
+        match self.mapped_mem() {
             MappedMemory::Anonymous => RssType::Anon,
             MappedMemory::Vmo(_) => RssType::File,
             MappedMemory::Device(_) => MapHandle::DEVICE_RSS_TYPE,
@@ -288,11 +324,11 @@ impl VmMapping {
 
     /// Returns the shared futex backing identity for the address if available.
     pub(crate) fn futex_backing(&self, addr: Vaddr) -> Result<Option<(Weak<Vmo>, usize)>> {
-        if !self.map_mode.is_shared() {
+        if !self.is_shared() {
             return Ok(None);
         }
 
-        let mapped_vmo = match &self.mapped_mem {
+        let mapped_vmo = match self.mapped_mem() {
             MappedMemory::Vmo(mapped_vmo) => mapped_vmo,
             MappedMemory::Anonymous => return Ok(None),
             MappedMemory::Device(_) => {
@@ -303,7 +339,7 @@ impl VmMapping {
             }
         };
 
-        let offset = mapped_vmo.offset() + (addr - self.map_to_addr);
+        let offset = mapped_vmo.offset() + (addr - self.map_to_addr());
 
         Ok(Some((Arc::downgrade(mapped_vmo.vmo()), offset)))
     }
@@ -313,7 +349,7 @@ impl VmMapping {
     /// Device mappings cannot be expanded as they represent fixed-size MMIO
     /// regions.
     pub(super) fn can_expand(&self) -> bool {
-        !matches!(self.mapped_mem, MappedMemory::Device(_))
+        !matches!(self.mapped_mem(), MappedMemory::Device(_))
     }
 
     /// Prints the mapping information in the format of `/proc/[pid]/maps`.
@@ -326,24 +362,24 @@ impl VmMapping {
         parent_heap_guard: &LockedHeap,
         path_resolver: &PathResolver,
     ) -> Result<()> {
-        let start = self.map_to_addr;
+        let start = self.map_to_addr();
         let end = self.map_end();
-        let read_char = if self.perms.contains(VmPerms::READ) {
+        let read_char = if self.perms().contains(VmPerms::READ) {
             'r'
         } else {
             '-'
         };
-        let write_char = if self.perms.contains(VmPerms::WRITE) {
+        let write_char = if self.perms().contains(VmPerms::WRITE) {
             'w'
         } else {
             '-'
         };
-        let exec_char = if self.perms.contains(VmPerms::EXEC) {
+        let exec_char = if self.perms().contains(VmPerms::EXEC) {
             'x'
         } else {
             '-'
         };
-        let shared_char = if self.map_mode.is_shared() { 's' } else { 'p' };
+        let shared_char = if self.is_shared() { 's' } else { 'p' };
         let offset = self.vmo().map(|vmo| vmo.offset).unwrap_or(0);
         let (dev_major, dev_minor) = self
             .inode()
@@ -373,12 +409,12 @@ impl VmMapping {
         let name = || {
             let process_vm = parent_vmar.process_vm();
             let user_stack_top = process_vm.init_stack().user_stack_top();
-            if self.map_to_addr <= user_stack_top && self.map_end() > user_stack_top {
+            if self.map_to_addr() <= user_stack_top && self.map_end() > user_stack_top {
                 return Some(Cow::Borrowed("[stack]"));
             }
 
             let heap_range = parent_heap_guard.heap_range();
-            if self.map_to_addr >= heap_range.start && self.map_end() <= heap_range.end {
+            if self.map_to_addr() >= heap_range.start && self.map_end() <= heap_range.end {
                 return Some(Cow::Borrowed("[heap]"));
             }
 
@@ -398,14 +434,14 @@ impl VmMapping {
                 }
             }
 
-            if let Some(file) = &self.file {
+            if let Some(file) = self.file() {
                 return Some(Cow::Owned(
                     path_resolver.make_abs_path(file.path()).into_string(),
                 ));
             }
 
             // Reference: <https://github.com/google/gvisor/blob/38123b53da96ff6983fcc103dfe2a9cc4e0d80c8/test/syscalls/linux/proc.cc#L1158-L1172>
-            if matches!(&self.mapped_mem, MappedMemory::Vmo(_)) && self.map_mode.is_shared() {
+            if matches!(self.mapped_mem(), MappedMemory::Vmo(_)) && self.is_shared() {
                 return Some(Cow::Borrowed("/dev/zero (deleted)"));
             }
 
@@ -436,7 +472,8 @@ impl VmMapping {
         }
     }
 
-    #[cfg(feature = "lazy_tlb_flush_on_unmap")]
+    /// Trims a private anonymous boundary page. The caller holds the leaf
+    /// lock and removes the resident PTE before releasing that lock.
     pub(super) fn trim_anon_edge(&mut self, page: &Range<Vaddr>, resident: bool) -> bool {
         if self.is_shared()
             || !matches!(self.mapped_mem(), MappedMemory::Anonymous)
@@ -446,7 +483,7 @@ impl VmMapping {
         }
         debug_assert_eq!(page.len(), PAGE_SIZE);
         if self.map_to_addr() == page.start {
-            self.map_to_addr = page.end;
+            self.location = self.location.relocated(page.end);
         } else if self.map_end() != page.end {
             return false;
         }
@@ -473,7 +510,7 @@ impl VmMapping {
             _ => None,
         };
         self.map_size = NonZeroUsize::new(left_size).unwrap();
-        self.frames_mapped = left_count;
+        self.frames_mapped = left_count.unwrap_or(UNKNOWN_FRAME_COUNT);
         right
     }
 
@@ -482,27 +519,21 @@ impl VmMapping {
     /// The address must be within the mapping and page-aligned. The address
     /// must not be either the start or the end of the mapping.
     pub(crate) fn split(self, at: Vaddr) -> Result<(Self, Self)> {
-        debug_assert!(self.map_to_addr < at && at < self.map_end());
+        debug_assert!(self.map_to_addr() < at && at < self.map_end());
         debug_assert!(at.is_multiple_of(PAGE_SIZE));
 
-        let (l_mapped_mem, r_mapped_mem) = match self.mapped_mem {
-            MappedMemory::Vmo(vmo) => {
-                let at_offset = vmo.offset() + (at - self.map_to_addr);
-                let r_mapped_vmo = vmo.dup_at_offset(at_offset);
-                (MappedMemory::Vmo(vmo), MappedMemory::Vmo(r_mapped_vmo))
-            }
-            MappedMemory::Anonymous => (MappedMemory::Anonymous, MappedMemory::Anonymous),
-            MappedMemory::Device(object) => {
-                let right = Arc::from(object.dup_at_offset(at - self.map_to_addr));
-                (MappedMemory::Device(object), MappedMemory::Device(right))
-            }
-        };
+        let original_frames = self.frames_mapped();
+        let start = self.location.addr();
+        let right_backing = MappingBacking::new(
+            self.mapped_mem().dup_at_offset(at - start),
+            self.file().cloned(),
+        );
 
-        let left_size = at - self.map_to_addr;
+        let left_size = at - start;
         let right_size = self.map_size.get() - left_size;
 
         let (left_frames_mapped, right_frames_mapped) =
-            if let Some(frames_mapped) = self.frames_mapped {
+            if let Some(frames_mapped) = original_frames {
                 if frames_mapped == 0 {
                     (Some(0), Some(0))
                 } else if frames_mapped == self.map_size.get() / PAGE_SIZE {
@@ -514,19 +545,15 @@ impl VmMapping {
                 (None, None)
             };
 
-        let left = Self {
-            map_size: NonZeroUsize::new(left_size).unwrap(),
-            map_to_addr: self.map_to_addr,
-            mapped_mem: l_mapped_mem,
-            frames_mapped: left_frames_mapped,
-            file: self.file.clone(),
-            ..self
-        };
         let right = Self {
             map_size: NonZeroUsize::new(right_size).unwrap(),
-            map_to_addr: at,
-            mapped_mem: r_mapped_mem,
-            frames_mapped: right_frames_mapped,
+            location: self.location.relocated(at),
+            backing: right_backing,
+            frames_mapped: right_frames_mapped.unwrap_or(UNKNOWN_FRAME_COUNT),
+        };
+        let left = Self {
+            map_size: NonZeroUsize::new(left_size).unwrap(),
+            frames_mapped: left_frames_mapped.unwrap_or(UNKNOWN_FRAME_COUNT),
             ..self
         };
 
@@ -580,7 +607,7 @@ impl VmMapping {
         self,
         max_level: PagingLevel,
     ) -> impl Iterator<Item = (Self, PagingLevel)> {
-        debug_assert!(self.map_to_addr.is_multiple_of(page_size_at(1)));
+        debug_assert!(self.map_to_addr().is_multiple_of(page_size_at(1)));
         debug_assert!(1 <= max_level);
         debug_assert!(max_level <= HIGHEST_PAGING_LEVEL);
 
@@ -641,7 +668,7 @@ impl VmMapping {
     pub(crate) fn can_merge_with(&self, vm_mapping: &VmMapping) -> bool {
         debug_assert!(!is_intersected(&self.range(), &vm_mapping.range()));
 
-        let (left, right) = if self.map_to_addr < vm_mapping.map_to_addr {
+        let (left, right) = if self.map_to_addr() < vm_mapping.map_to_addr() {
             (self, vm_mapping)
         } else {
             (vm_mapping, self)
@@ -662,14 +689,14 @@ impl VmMapping {
     pub(crate) fn try_merge_with(self, vm_mapping: &VmMapping) -> (Self, Option<Vaddr>) {
         debug_assert!(!is_intersected(&self.range(), &vm_mapping.range()));
 
-        let (left, right) = if self.map_to_addr < vm_mapping.map_to_addr {
+        let (left, right) = if self.map_to_addr() < vm_mapping.map_to_addr() {
             (&self, vm_mapping)
         } else {
             (vm_mapping, &self)
         };
 
         if let Some(merged) = try_merge(left, right) {
-            (merged, Some(vm_mapping.map_to_addr))
+            (merged, Some(vm_mapping.map_to_addr()))
         } else {
             (self, None)
         }
@@ -682,7 +709,7 @@ impl VmMapping {
             return false;
         }
         self.map_size = NonZeroUsize::new(self.map_size() + right.map_size()).unwrap();
-        self.frames_mapped = self.frames_mapped.zip(right.frames_mapped).map(|(l, r)| l + r);
+        self.frames_mapped = self.frames_mapped().zip(right.frames_mapped()).map_or(UNKNOWN_FRAME_COUNT, |(l, r)| l + r);
         true
     }
 
@@ -698,7 +725,7 @@ impl VmMapping {
         //    before doing so.
         //  - For shared mappings, the page may need to be marked as a dirty
         //    page in the page cache.
-        let new_flags = if matches!(self.mapped_mem, MappedMemory::Device(_)) {
+        let new_flags = if matches!(self.mapped_mem(), MappedMemory::Device(_)) {
             PageFlags::from(perms)
         } else {
             PageFlags::from(perms) - PageFlags::W
@@ -733,7 +760,7 @@ impl VmMapping {
             }
         }
 
-        Self { perms, ..self }
+        Self { location: self.location.with_perms(perms), ..self }
     }
 
     /// Unmaps the mapping.
@@ -768,7 +795,7 @@ impl VmMapping {
 
         debug_assert_eq!(
             num_unmapped_pages,
-            self.frames_mapped.unwrap_or(num_unmapped_pages)
+            self.frames_mapped().unwrap_or(num_unmapped_pages)
         );
         rs_as_delta.add_rs(self.rss_type(), -(num_unmapped_pages as isize));
         rs_as_delta.sub_as(range.len());
@@ -946,10 +973,8 @@ impl VmoCommitHandle {
 /// Returns whether two [`VmMapping`]s can be merged.
 fn can_merge(left: &VmMapping, right: &VmMapping) -> bool {
     let is_adjacent = left.map_end() == right.map_to_addr();
-    let is_type_equal = left.map_mode == right.map_mode
-        && left.handle_page_faults_around == right.handle_page_faults_around
-        && left.perms == right.perms
-        && match (&left.file, &right.file) {
+    let is_type_equal = (left.location.0 & MappingLocation::ATTRS) == (right.location.0 & MappingLocation::ATTRS)
+        && match (left.file(), right.file()) {
             (Some(left_file), Some(right_file)) => Arc::ptr_eq(left_file, right_file),
             (None, None) => true,
             _ => false,
@@ -959,7 +984,7 @@ fn can_merge(left: &VmMapping, right: &VmMapping) -> bool {
         return false;
     }
 
-    match (&left.mapped_mem, &right.mapped_mem) {
+    match (left.mapped_mem(), right.mapped_mem()) {
         (MappedMemory::Anonymous, MappedMemory::Anonymous) => true,
         (MappedMemory::Vmo(l_vmo_obj), MappedMemory::Vmo(r_vmo_obj))
             if l_vmo_obj.is_same_vmo(r_vmo_obj) =>
@@ -985,7 +1010,7 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
         return None;
     }
 
-    let mapped_mem = match (&left.mapped_mem, &right.mapped_mem) {
+    let mapped_mem = match (left.mapped_mem(), right.mapped_mem()) {
         (MappedMemory::Anonymous, MappedMemory::Anonymous) => MappedMemory::Anonymous,
         (MappedMemory::Vmo(l_vmo_obj), MappedMemory::Vmo(_r_vmo_obj)) => {
             MappedMemory::Vmo(l_vmo_obj.dup())
@@ -1000,16 +1025,15 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
 
     // Combine the accounted mapped frames if both sides tracked them; otherwise
     // fall back to `None` so callers will recount on demand.
-    let frames_mapped = match (left.frames_mapped, right.frames_mapped) {
-        (Some(l), Some(r)) => Some(l + r),
-        _ => None,
+    let frames_mapped = match (left.frames_mapped(), right.frames_mapped()) {
+        (Some(l), Some(r)) => l + r,
+        _ => UNKNOWN_FRAME_COUNT,
     };
 
     Some(VmMapping {
         map_size,
-        mapped_mem,
+        backing: MappingBacking::new(mapped_mem, left.file().cloned()),
         frames_mapped,
-        file: left.file.clone(),
         ..*left
     })
 }
@@ -1113,22 +1137,71 @@ pub(super) fn map_device_pages(
     num_frames
 }
 
+#[cfg(ktest)]
+#[ostd::prelude::ktest]
+fn cached_frame_count_preserves_unknown_and_full_splits() {
+    let make_mapping = || VmMapping::new(
+        NonZeroUsize::new(4 * PAGE_SIZE).unwrap(),
+        PAGE_SIZE,
+        MappedMemory::Anonymous,
+        None,
+        MmapMode::Private,
+        false,
+        VmPerms::READ | VmPerms::WRITE,
+    );
+    let mut partial = make_mapping();
+    assert!(partial.backing.is_none());
+    assert!(partial.new_fork().backing.is_none());
+    partial.add_frames_mapped(1);
+    let (mut left, right) = partial.split(3 * PAGE_SIZE).unwrap();
+    assert!(left.backing.is_none() && right.backing.is_none());
+    assert_eq!(left.frames_mapped(), None);
+    assert_eq!(right.new_fork().frames_mapped(), None);
+    left.add_frames_mapped(1);
+    left.dec_frames_mapped(1);
+    assert!(left.extend_right(&right));
+    assert_eq!(left.frames_mapped(), None);
+    let mut full = make_mapping();
+    assert_eq!(full.frames_mapped(), Some(0));
+    full.add_frames_mapped(4);
+    let (mut left, right) = full.split(3 * PAGE_SIZE).unwrap();
+    assert_eq!(left.frames_mapped(), Some(2));
+    assert_eq!(right.frames_mapped(), Some(2));
+    assert!(left.extend_right(&right));
+    left.dec_frames_mapped(1);
+    assert_eq!(left.frames_mapped(), Some(3));
+}
+
+#[cfg(ktest)]
+#[ostd::prelude::ktest]
+fn relocating_and_protecting_keep_mapping_attributes() {
+    for mode in [MmapMode::Private, MmapMode::Shared] {
+        for around in [false, true] {
+            for bits in 0..=VmPerms::all().bits() {
+                let perms = VmPerms::from_bits(bits).unwrap();
+                let original = MappingLocation::new(2 * PAGE_SIZE, mode, around, perms);
+                let moved = original.relocated(9 * PAGE_SIZE);
+                assert_eq!(moved.addr(), 9 * PAGE_SIZE);
+                assert_eq!(moved.0 & MappingLocation::ATTRS, original.0 & MappingLocation::ATTRS);
+                let changed = moved.with_perms(VmPerms::WRITE | VmPerms::MAY_WRITE);
+                assert_eq!(changed.addr(), moved.addr());
+                assert_eq!(changed.0 & MappingLocation::PERMS, (VmPerms::WRITE | VmPerms::MAY_WRITE).bits() as usize);
+                assert_eq!(changed.0 & MappingLocation::SHARED != 0, mode.is_shared());
+                assert_eq!(changed.0 & MappingLocation::FAULT_AROUND != 0, around);
+            }
+        }
+    }
+}
+
 #[cfg(all(ktest, feature = "lazy_tlb_flush_on_unmap"))]
 #[ostd::prelude::ktest]
 fn private_interior_keeps_keys_and_known_frame_counts() {
     for (resident, expected_left, expected_right) in [
-        (0, Some(0), Some(0)),
-        (5, Some(1), Some(3)),
-        (2, None, None),
+        (0, Some(0), Some(0)), (5, Some(1), Some(3)), (2, None, None),
     ] {
         let mut mapping = VmMapping::new(
-            NonZeroUsize::new(5 * PAGE_SIZE).unwrap(),
-            PAGE_SIZE,
-            MappedMemory::Anonymous,
-            None,
-            MmapMode::Private,
-            false,
-            VmPerms::READ | VmPerms::WRITE,
+            NonZeroUsize::new(5 * PAGE_SIZE).unwrap(), PAGE_SIZE,
+            MappedMemory::Anonymous, None, MmapMode::Private, false, VmPerms::READ | VmPerms::WRITE,
         );
         mapping.add_frames_mapped(resident);
         let right = mapping.split_off_after_anon_page(&(2 * PAGE_SIZE..3 * PAGE_SIZE));

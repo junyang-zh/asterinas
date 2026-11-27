@@ -689,7 +689,7 @@ fn map_to_page_table_recursive(cursor: &mut VmarCursorMut<'_>, vm_mapping: VmMap
     let mut vm_mapping = Some(vm_mapping);
     let cur_level = cursor.level();
     while let Some(remain) = vm_mapping.as_ref()
-        && let Some(PteRangeMeta::ChildPt(r)) = cursor.aux_meta().inner.find(&remain.range()).next()
+        && let Some(PteRangeMeta::ChildPt(r)) = cursor.aux_meta().inner.first_intersection(&remain.range())
     {
         debug_assert!(is_intersected(&remain.range(), r));
         let child_start = r.start;

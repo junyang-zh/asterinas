@@ -282,7 +282,26 @@ fn remove_private_leaf_page(
         VmQueriedItem::MappedRam { .. } => true,
         _ => return false,
     };
-    {
+    if let Some(values) = cursor.aux_meta_mut().inner.small_mut() {
+        let index = values.partition_point(|item| item.range().end <= page.start);
+        let Some(PteRangeMeta::VmMapping(mapping)) = values.get_mut(index) else {
+            return false;
+        };
+        if mapping.map_to_addr() > page.start
+            || mapping.map_end() < page.end
+            || mapping.is_shared()
+            || !matches!(mapping.mapped_mem(), super::MappedMemory::Anonymous)
+        {
+            return false;
+        }
+        if mapping.map_size() == PAGE_SIZE {
+            debug_assert!(mapping.frames_mapped().is_none_or(|n| n == usize::from(resident)));
+            cursor.aux_meta_mut().inner.remove(&page.start).unwrap();
+        } else if !mapping.trim_anon_edge(page, resident) {
+            let right = mapping.split_off_after_anon_page(page);
+            cursor.aux_meta_mut().insert_without_try_merge(right);
+        }
+    } else {
         let mut gap = cursor.aux_meta_mut().inner.gap_before(&page.end);
         let Some((key, PteRangeMeta::VmMapping(mapping))) = gap.peek_prev() else {
             return false;
