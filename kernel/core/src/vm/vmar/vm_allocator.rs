@@ -26,12 +26,79 @@ use crate::{
     },
 };
 
+/// Reserve address windows top-down and fill each leaf from its low end.
+/// Adjacent ordinary mappings can then extend their predecessor in place.
+#[derive(Clone)]
+struct AllocationHint {
+    primary: Range<Vaddr>,
+    // The page-aligned start leaves enough low bits for a leaf-sized page count.
+    window_start_and_pages: usize,
+}
+
+impl AllocationHint {
+    fn new(primary: Range<Vaddr>) -> Self {
+        Self { primary, window_start_and_pages: 0 }
+    }
+
+    fn window(&self) -> Range<Vaddr> {
+        let start = self.window_start_and_pages.align_down(PAGE_SIZE);
+        let pages = self.window_start_and_pages % PAGE_SIZE;
+        start..start + pages * PAGE_SIZE
+    }
+
+    fn set_window(&mut self, range: Range<Vaddr>) {
+        const { assert!(page_size_at(2) / PAGE_SIZE < PAGE_SIZE); }
+        debug_assert!(range.start.is_multiple_of(PAGE_SIZE));
+        debug_assert!(range.end.is_multiple_of(PAGE_SIZE));
+        debug_assert!(range.len() <= page_size_at(2));
+        self.window_start_and_pages = range.start | (range.len() / PAGE_SIZE);
+    }
+
+    fn truncate(&mut self, range: &Range<Vaddr>) {
+        self.primary = truncate_get_largest(&self.primary, range);
+        self.set_window(truncate_get_largest(&self.window(), range));
+    }
+
+    fn allocate(&mut self, size: usize, align: usize, prefer_single_leaf: bool) -> Result<Vaddr> {
+        let span = page_size_at(2);
+        if prefer_single_leaf && size <= span {
+            let window = self.window();
+            let next = window.start.align_up(align);
+            if window.end.saturating_sub(next) >= size {
+                self.set_window(next + size..window.end);
+                return Ok(next);
+            }
+        }
+
+        let top = alloc_from_free_range(self.primary.clone(), size, align)?;
+        let va = if prefer_single_leaf {
+            leaf_contained_start(top, size, self.primary.start)
+        } else {
+            top
+        };
+        if prefer_single_leaf && size <= span {
+            let leaf = va.align_down(span);
+            let first = self.primary.start.max(leaf).align_up(align);
+            let end = self.primary.end.min(leaf + span);
+            if end.saturating_sub(first) >= size {
+                self.primary = truncate_get_largest(&self.primary, &(first..end));
+                self.set_window(first + size..end);
+                return Ok(first);
+            }
+        }
+        self.primary = truncate_get_largest(&self.primary, &(va..va + size));
+        Ok(va)
+    }
+}
+
+const _: () = assert!(size_of::<SpinLock<AllocationHint>>() <= 32);
+
 /// A virtual address range allocator.
 pub(super) struct VirtualAddressAllocator {
     /// Per-CPU hints, which may overlap mappings or pending selections.
     /// Every cached allocation must revalidate authoritative Aux metadata under PT.
     /// Lock order: PT -> one cache. Never acquire PT while holding a cache lock.
-    must_be_free: CpuLocalBox<SpinLock<Range<Vaddr>>>,
+    must_be_free: CpuLocalBox<SpinLock<AllocationHint>>,
     #[cfg(ktest)]
     test_pause: tests::Pause,
 }
@@ -39,7 +106,7 @@ pub(super) struct VirtualAddressAllocator {
 impl VirtualAddressAllocator {
     /// Creates a new allocator that covers the entire VM range.
     pub(super) fn new() -> Result<Self> {
-        let must_be_free = alloc_cpu_local(|cpu| SpinLock::new(assigned_range_on_cpu(cpu)))?;
+        let must_be_free = alloc_cpu_local(|cpu| SpinLock::new(AllocationHint::new(assigned_range_on_cpu(cpu))))?;
         Ok(Self {
             must_be_free,
             #[cfg(ktest)]
@@ -90,7 +157,7 @@ impl VirtualAddressAllocator {
                 .get_on_cpu(cpu.try_into().unwrap())
                 .try_lock()
             {
-                *hint = truncate_get_largest(&hint, range);
+                hint.truncate(range);
             }
         }
         cursor
@@ -243,17 +310,10 @@ impl VirtualAddressAllocator {
         align: usize,
         prefer_single_leaf: bool,
     ) -> Result<Vaddr> {
-        let mut must_be_free = self.must_be_free.get_on_cpu(cpu).lock();
-
-        alloc_from_free_range(must_be_free.clone(), size, align).map(|va| {
-            let va = if prefer_single_leaf {
-                leaf_contained_start(va, size, must_be_free.start)
-            } else {
-                va
-            };
-            *must_be_free = truncate_get_largest(&must_be_free, &(va..va + size));
-            va
-        })
+        self.must_be_free
+            .get_on_cpu(cpu)
+            .lock()
+            .allocate(size, align, prefer_single_leaf)
     }
 
     fn try_lock_and_alloc_from<'a>(
@@ -284,8 +344,8 @@ impl VirtualAddressAllocator {
                 let cpu_id = CpuId::try_from(cpu).unwrap();
                 let free_remain = get_intersected_range(&remain, &assigned_range_on_cpu(cpu_id));
                 let mut hint = self.must_be_free.get_on_cpu(cpu_id).lock();
-                if free_remain.len() > hint.len() {
-                    *hint = free_remain;
+                if free_remain.len() > hint.primary.len() {
+                    *hint = AllocationHint::new(free_remain);
                 }
             }
         }

@@ -232,7 +232,7 @@ fn read_byte(vmar: &Vmar, address: usize) -> u8 {
 
 fn empty_hints(vmar: &Vmar) {
     for cpu in all_cpus() {
-        *vmar.allocator.must_be_free.get_on_cpu(cpu).lock() = 0..0;
+        *vmar.allocator.must_be_free.get_on_cpu(cpu).lock() = AllocationHint::new(0..0);
     }
 }
 
@@ -256,7 +256,7 @@ fn fixed_mapping_completes_while_hint_is_held() {
     let remote = remote_cpu(controller_guard.current_cpu());
     let cache_cpu =
         CpuId::try_from(cpu_range_for_vaddr_range(&(address..address + PAGE_SIZE)).start).unwrap();
-    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = address..address + PAGE_SIZE;
+    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = AllocationHint::new(address..address + PAGE_SIZE);
     vmar.allocator.test_pause.arm(remote, FIXED);
     let result = Arc::new(SpinLock::<Option<Result<Vaddr>>>::new(None));
     let completed = Arc::new(AtomicBool::new(false));
@@ -284,7 +284,7 @@ fn fixed_mapping_completes_while_hint_is_held() {
     // existing bounded wait is only a fail-safe: release even on failure so
     // the blocking implementation can finish and join before we assert.
     let completed_while_held = wait_flag(&completed);
-    let retained_stale_hint = hint.contains(&address);
+    let retained_stale_hint = hint.primary.contains(&address);
     drop(hint);
     drop(controller_guard);
     worker.join();
@@ -374,7 +374,7 @@ fn stale_hint_preserves_mapping(kind: StaleHint) {
     // Simulate skipped fixed-path maintenance. Only this hint is usable, so
     // the first cached attempt must encounter the installed read-only mapping.
     empty_hints(&vmar);
-    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = occupied.clone();
+    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = AllocationHint::new(occupied.clone());
     let stage = if matches!(kind, StaleHint::CoveringRemap) {
         REMAP_CACHED
     } else {
@@ -500,7 +500,7 @@ fn pending_refill_collision(remap: bool) {
         write_byte(&vmar, source, 0x71);
     }
     empty_hints(&vmar);
-    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = address..address + PAGE_SIZE;
+    *vmar.allocator.must_be_free.get_on_cpu(cache_cpu).lock() = AllocationHint::new(address..address + PAGE_SIZE);
     vmar.allocator
         .test_pause
         .arm(remote, if remap { REMAP_CACHED } else { CACHED });
@@ -546,6 +546,7 @@ fn pending_refill_collision(remap: bool) {
         .must_be_free
         .get_on_cpu(cache_cpu)
         .lock()
+        .primary
         .contains(&address);
     let winner = map(
         &vmar,
@@ -1025,7 +1026,7 @@ fn exhausted_current_hint_uses_other_hint_then_slow_search() {
     // Keep the current CPU stable while consuming a different CPU cache.
     let other_address = assigned_range_on_cpu(allocation_cpu(remote)).start + 32 * PAGE_SIZE;
     *vmar.allocator.must_be_free.get_on_cpu(remote).lock() =
-        other_address..other_address + PAGE_SIZE;
+        AllocationHint::new(other_address..other_address + PAGE_SIZE);
     let allocated = vmar
         .new_map(NonZeroUsize::new(PAGE_SIZE).unwrap(), VmPerms::READ)
         .unwrap()
@@ -1074,4 +1075,19 @@ fn fixed_range_crosses_assigned_cache_boundary() {
         .unwrap();
     assert_eq!(vmar.get_mappings_total_size(), before);
     assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+}
+
+#[ktest]
+fn leaf_window_alignment_and_fixed_invalidation() {
+    let span = page_size_at(2);
+    let mut hint = AllocationHint::new(PAGE_SIZE..3 * span - PAGE_SIZE);
+    assert_eq!(hint.allocate(PAGE_SIZE, PAGE_SIZE, true).unwrap(), 2 * span);
+    let fixed = 2 * span + 4 * PAGE_SIZE..2 * span + 8 * PAGE_SIZE;
+    hint.truncate(&fixed);
+    assert_eq!(hint.allocate(3 * PAGE_SIZE, 4 * PAGE_SIZE, true).unwrap(), fixed.end);
+    assert_eq!(hint.allocate(PAGE_SIZE, PAGE_SIZE, true).unwrap(), fixed.end + 3 * PAGE_SIZE);
+    assert_eq!(hint.allocate(span, span, true).unwrap(), span);
+    let mut tight = AllocationHint::new(span - PAGE_SIZE..span + PAGE_SIZE);
+    assert_eq!(tight.allocate(2 * PAGE_SIZE, PAGE_SIZE, true).unwrap(), span - PAGE_SIZE);
+    assert!(tight.allocate(PAGE_SIZE, PAGE_SIZE, true).is_err());
 }
