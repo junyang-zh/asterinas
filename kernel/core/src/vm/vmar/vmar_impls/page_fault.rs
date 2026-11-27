@@ -140,14 +140,38 @@ impl Vmar {
             cursor.jump(address.align_down(PAGE_SIZE)).unwrap();
             while cursor.push_level_if_exists().is_some() {}
 
+            let vacant_leaf = cursor.level() == 1 && matches!(cursor.query(), VmQueriedItem::None);
             let Some(PteRangeMeta::VmMapping(vm_mapping)) =
-                cursor.aux_meta().inner.find_one(&address)
+                cursor.aux_meta_mut().inner.find_one_mut(&address)
             else {
                 return_errno_with_message!(
                     Errno::EACCES,
                     "handle_page_fault: no VM mappings contain the page fault address"
                 );
             };
+
+            // A missing PTE in an existing leaf needs no metadata delegation.
+            // Install an ordinary private anonymous page while its mapping and
+            // the prepared zeroed frame are both available under this cursor.
+            if vacant_leaf
+                && range_handled == (0..0)
+                && !page_fault_info.is_forced()
+                && !vm_mapping.handle_page_faults_around()
+                && !vm_mapping.is_shared()
+                && matches!(vm_mapping.mapped_mem(), MappedMemory::Anonymous)
+                && vm_mapping.perms().contains(page_fault_info.required_perms)
+            {
+                let prop = fault_page_property(
+                    vm_mapping.perms(),
+                    page_fault_info.required_perms.contains(VmPerms::WRITE),
+                );
+                let rss_type = vm_mapping.rss_type();
+                vm_mapping.add_frames_mapped(1);
+                cursor.map(prepared.take().into(), prop);
+                rs_as_delta.add_rs(rss_type, 1);
+                cursor.flush_pending_tlb();
+                break 'retry;
+            }
 
             let range_to_handle = range_to_handle(vm_mapping, page_fault_info);
             if range_handled.is_empty() {
@@ -489,12 +513,7 @@ fn handle_one_page(
                 perms
             };
 
-            let mut page_flags = vm_perms.into();
-            page_flags |= PageFlags::ACCESSED;
-            if is_write {
-                page_flags |= PageFlags::DIRTY;
-            }
-            let map_prop = PageProperty::new_user(page_flags, CachePolicy::Writeback);
+            let map_prop = fault_page_property(vm_perms, is_write);
 
             let rss_type = vm_mapping.rss_type();
             vm_mapping.add_frames_mapped(1);
@@ -509,6 +528,14 @@ fn handle_one_page(
     }
 
     Ok(())
+}
+
+fn fault_page_property(perms: VmPerms, is_write: bool) -> PageProperty {
+    let mut flags = PageFlags::from(perms) | PageFlags::ACCESSED;
+    if is_write {
+        flags |= PageFlags::DIRTY;
+    }
+    PageProperty::new_user(flags, CachePolicy::Writeback)
 }
 
 fn prepare_page(
@@ -769,6 +796,45 @@ mod test {
         assert_eq!(cursor.guard_level(), 1);
         assert!(
             matches!(cursor.query(), VmQueriedItem::MappedRam { prop, .. } if prop.flags.contains(PageFlags::R) && !prop.flags.contains(PageFlags::W))
+        );
+    }
+
+    #[ktest]
+    fn vacant_anonymous_leaf_keeps_permissions_and_counts_only_new_pages() {
+        let vmar = new_vmar();
+        let base = page_size_at(2);
+        let split = base + 3 * PAGE_SIZE;
+        let end = split + PAGE_SIZE;
+        map_anon(&vmar, base..split, VmPerms::READ | VmPerms::WRITE);
+        map_anon(&vmar, split..end, VmPerms::READ);
+        let fault = |addr, perms| vmar.handle_page_fault(&PageFaultInfo::new(addr, perms));
+        fault(base, VmPerms::READ).unwrap();
+        fault(base + PAGE_SIZE + 7, VmPerms::WRITE).unwrap();
+        fault(base + PAGE_SIZE + 7, VmPerms::WRITE).unwrap();
+        assert_eq!(
+            fault(split, VmPerms::WRITE).unwrap_err().error(),
+            Errno::EACCES
+        );
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 2);
+        fault(split, VmPerms::READ).unwrap();
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 3);
+        let guard = disable_preempt();
+        let mut cursor = vmar
+            .vm_space
+            .cursor_mut_base_pages(&guard, &(base..end))
+            .unwrap();
+        cursor.jump(base + PAGE_SIZE).unwrap();
+        assert!(
+            matches!(cursor.query(), VmQueriedItem::MappedRam { prop, .. }
+            if prop.flags.contains(PageFlags::RW | PageFlags::ACCESSED | PageFlags::DIRTY))
+        );
+        cursor.jump(base + 2 * PAGE_SIZE).unwrap();
+        assert!(matches!(cursor.query(), VmQueriedItem::None));
+        cursor.jump(split).unwrap();
+        assert!(
+            matches!(cursor.query(), VmQueriedItem::MappedRam { prop, .. }
+            if prop.flags.contains(PageFlags::R | PageFlags::ACCESSED)
+                && !prop.flags.intersects(PageFlags::W | PageFlags::DIRTY))
         );
     }
 
