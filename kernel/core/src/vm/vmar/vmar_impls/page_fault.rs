@@ -604,6 +604,28 @@ mod test {
     }
 
     #[ktest]
+    fn bridge_two_resident_anonymous_neighbors_preserves_counts_and_permissions() {
+        let vmar = new_vmar();
+        let base = page_size_at(2);
+        let perms = VmPerms::READ | VmPerms::WRITE;
+        for index in [0, 2] {
+            let start = base + index * PAGE_SIZE;
+            map_anon(&vmar, start..start + PAGE_SIZE, perms);
+            vmar.handle_page_fault(&PageFaultInfo::new(start, VmPerms::WRITE)).unwrap();
+        }
+        map_anon(&vmar, base + PAGE_SIZE..base + 2 * PAGE_SIZE, perms);
+        map_anon(&vmar, base + 3 * PAGE_SIZE..base + 4 * PAGE_SIZE, VmPerms::READ);
+        let mut seen = Vec::new();
+        vmar.for_each_mapping(base..base + 4 * PAGE_SIZE, true, |mapping| {
+            seen.push((mapping.map_to_addr(), mapping.map_size(), mapping.frames_mapped()));
+        }).unwrap();
+        assert_eq!(seen, [(base, 3 * PAGE_SIZE, Some(2)), (base + 3 * PAGE_SIZE, PAGE_SIZE, Some(0))]);
+        assert!(vmar.handle_page_fault(&PageFaultInfo::new(base + 3 * PAGE_SIZE, VmPerms::WRITE)).is_err());
+        vmar.remove_mapping(base..base + 4 * PAGE_SIZE).unwrap();
+        assert_eq!(vmar.get_rss_counter(RssType::Anon), 0);
+    }
+
+    #[ktest]
     fn protect_preserves_resident_page_status_and_write_faults() {
         let vmar = new_vmar();
         let addr = page_size_at(2);

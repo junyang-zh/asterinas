@@ -634,6 +634,17 @@ impl VmMapping {
         }
     }
 
+    /// Extends this mapping to include a compatible right neighbor. The
+    /// backing reference and starting offset already belong to the left end.
+    pub(super) fn extend_right(&mut self, right: &VmMapping) -> bool {
+        if !can_merge(self, right) {
+            return false;
+        }
+        self.map_size = NonZeroUsize::new(self.map_size() + right.map_size()).unwrap();
+        self.frames_mapped = self.frames_mapped.zip(right.frames_mapped).map(|(l, r)| l + r);
+        true
+    }
+
     /// Change the perms of the mapping.
     pub(super) fn protect(self, cursor: &mut CursorMut<PerPtMeta>, perms: VmPerms) -> Self {
         // For device mappings, they're shared as we have checked that when

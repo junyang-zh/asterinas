@@ -341,24 +341,23 @@ impl PerPtMeta {
     /// Make sure the insertion doesn't exceed address space limit.
     fn insert_try_merge(&mut self, vm_mapping: VmMapping) {
         let mut vm_mapping = vm_mapping;
-        let addr = vm_mapping.map_to_addr();
-
-        if let Some(PteRangeMeta::VmMapping(prev)) = self.inner.find_prev(&addr) {
-            let (new_mapping, to_remove) = vm_mapping.try_merge_with(prev);
-            vm_mapping = new_mapping;
-            if let Some(addr) = to_remove {
-                self.inner.remove(&addr);
-            }
+        let mut cursor = self.inner.gap_before(&vm_mapping.map_to_addr());
+        if let Some((_, PteRangeMeta::VmMapping(next))) = cursor.peek_next()
+            && vm_mapping.extend_right(next)
+        {
+            cursor.remove_next().unwrap();
         }
-
-        if let Some(PteRangeMeta::VmMapping(next)) = self.inner.find_next(&addr) {
-            let (new_mapping, to_remove) = vm_mapping.try_merge_with(next);
-            vm_mapping = new_mapping;
-            if let Some(addr) = to_remove {
-                self.inner.remove(&addr);
-            }
+        if let Some((_, PteRangeMeta::VmMapping(prev))) = cursor.peek_prev()
+            && prev.extend_right(&vm_mapping)
+        {
+            return;
         }
-
-        self.inner.insert(PteRangeMeta::VmMapping(vm_mapping));
+        // Removing the successor leaves the cursor in the enlarged gap.
+        cursor
+            .insert_before(
+                vm_mapping.map_to_addr(),
+                PteRangeMeta::VmMapping(vm_mapping),
+            )
+            .expect("merged mapping must fit between its neighbors");
     }
 }

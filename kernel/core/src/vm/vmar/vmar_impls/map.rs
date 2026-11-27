@@ -662,6 +662,19 @@ fn readahead_for_populate(vmo: Arc<Vmo>, vmo_offset: usize, map_size: NonZeroUsi
 }
 
 pub(super) fn map_to_page_table(cursor: &mut VmarCursorMut<'_>, vm_mapping: VmMapping) {
+    // A range wholly contained in the locked leaf cannot have a ChildPt
+    // entry at this level. Its mapping can be merged at this leaf directly.
+    if cursor.guard_level() == 1 {
+        let span = ostd::mm::page_size_at(2);
+        let start = vm_mapping.map_to_addr();
+        if start / span == (vm_mapping.map_end() - 1) / span
+            && start / span == cursor.virt_addr() / span
+        {
+            cursor.jump(start).unwrap();
+            cursor.aux_meta_mut().insert_try_merge(vm_mapping);
+            return;
+        }
+    }
     let max_level = cursor.guard_level();
     for (mapping, level) in vm_mapping.split_for_pt(max_level) {
         cursor.jump(mapping.map_to_addr()).unwrap();
