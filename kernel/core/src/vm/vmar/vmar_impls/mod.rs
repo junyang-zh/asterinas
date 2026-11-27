@@ -260,7 +260,17 @@ ostd::check_aux_pt_meta_layout!(PerPtMeta);
 impl AuxPageTableMeta for PerPtMeta {
     #[cfg(feature = "memory_accounting")]
     fn allocation_snapshot(&self) -> ostd::mm::heap::accounting::AllocationSnapshot {
-        self.inner.allocation_snapshot()
+        let mut snapshot = self.inner.allocation_snapshot();
+        for value in self.inner.iter() {
+            if let PteRangeMeta::VmMapping(mapping) = value
+                && let Some(layout) = mapping.backing_layout()
+            {
+                snapshot.allocations += 1;
+                snapshot.requested_bytes += layout.size();
+                snapshot.charged_bytes += ostd::mm::heap::accounting::charged_size(layout);
+            }
+        }
+        snapshot
     }
 
     fn new_root_page_table() -> Self {
@@ -341,6 +351,31 @@ impl PerPtMeta {
     /// Make sure the insertion doesn't exceed address space limit.
     fn insert_try_merge(&mut self, vm_mapping: VmMapping) {
         let mut vm_mapping = vm_mapping;
+        if let Some(values) = self.inner.small_mut() {
+            let index = values.partition_point(|m| m.range().start < vm_mapping.map_to_addr());
+            let (before, after) = values.split_at_mut(index);
+            let merged_next = if let Some(PteRangeMeta::VmMapping(next)) = after.first()
+                && vm_mapping.extend_right(next)
+            {
+                Some(next.map_to_addr())
+            } else {
+                None
+            };
+            if let Some(PteRangeMeta::VmMapping(prev)) = before.last_mut()
+                && prev.extend_right(&vm_mapping)
+            {
+                if let Some(key) = merged_next {
+                    self.inner.remove(&key);
+                }
+                return;
+            }
+            if merged_next.is_some() {
+                after[0] = PteRangeMeta::VmMapping(vm_mapping);
+            } else {
+                self.inner.insert(PteRangeMeta::VmMapping(vm_mapping));
+            }
+            return;
+        }
         let mut cursor = self.inner.gap_before(&vm_mapping.map_to_addr());
         if let Some((_, PteRangeMeta::VmMapping(next))) = cursor.peek_next()
             && vm_mapping.extend_right(next)

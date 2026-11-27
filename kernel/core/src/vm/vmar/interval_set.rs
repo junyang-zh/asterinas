@@ -2,6 +2,7 @@
 
 //! Intervals and interval sets used in VMARs.
 
+use alloc::vec::Vec;
 use alloc::collections::btree_map::{BTreeMap, Cursor, CursorMut};
 use core::ops::Range;
 
@@ -19,6 +20,11 @@ type IntervalCursor<'a, K, V> = Cursor<'a, K, V>;
 type IntervalCursorMut<'a, K, V> = CursorMut<'a, K, V>;
 #[cfg(feature = "memory_accounting")]
 type IntervalCursorMut<'a, K, V> = CursorMut<'a, K, V, IntervalAllocator>;
+
+#[cfg(not(feature = "memory_accounting"))]
+type IntervalArray<V> = Vec<V>;
+#[cfg(feature = "memory_accounting")]
+type IntervalArray<V> = Vec<V, IntervalAllocator>;
 
 /// The interval of an item in an interval set.
 ///
@@ -38,9 +44,18 @@ where
     K: Clone + Ord,
     V: Interval<K>,
 {
-    btree: IntervalMap<K, V>,
+    storage: Storage<K, V>,
     #[cfg(feature = "memory_accounting")]
     accounting: IntervalAllocator,
+}
+
+/// Most leaf tables contain either zero intervals or one mapping. Keep
+/// that interval in the page-table metadata until a second key is needed.
+#[derive(Debug)]
+enum Storage<K, V> {
+    Inline(Option<V>),
+    Array(IntervalArray<V>),
+    Tree(IntervalMap<K, V>),
 }
 
 impl<K, V> Default for IntervalSet<K, V>
@@ -58,18 +73,25 @@ where
     K: Clone + Ord,
     V: Interval<K>,
 {
+    // Keep moderately populated page tables in one allocation. Bound the
+    // bytes shifted on insertion and switch dense or highly fragmented
+    // tables to the B-tree.
+    fn array_limit() -> usize {
+        (4 * ostd::mm::PAGE_SIZE / size_of::<V>().max(1)).clamp(2, 512)
+    }
+
     /// Creates a new interval set.
     #[cfg(not(feature = "memory_accounting"))]
     pub(crate) const fn new() -> Self {
         Self {
-            btree: BTreeMap::new(),
+            storage: Storage::Inline(None),
         }
     }
 
     #[cfg(feature = "memory_accounting")]
     pub(crate) fn new() -> Self {
         let accounting = IntervalAllocator::new();
-        Self { btree: BTreeMap::new_in(accounting.clone()), accounting }
+        Self { storage: Storage::Inline(None), accounting }
     }
 
     #[cfg(feature = "memory_accounting")]
@@ -77,107 +99,205 @@ where
         self.accounting.snapshot()
     }
 
-    /// Returns the number of elements in the interval set.
-    /// Inserts an interval item into the interval set.
-    pub(crate) fn insert(&mut self, item: V) {
-        let range = item.range();
-        self.btree.insert(range.start, item);
-    }
-
-    /// Removes an interval item from the interval set.
-    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
-        self.btree.remove(key)
-    }
-
-    /// Returns an iterator over the interval items in the interval set.
     #[cfg(ktest)]
-    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &V> {
-        self.btree.values()
-    }
-
-    /// Finds an interval item that contains the given point.
-    ///
-    /// If no such item exists, returns [`None`]. Otherwise, returns the item
-    /// that contains the point.
-    pub(crate) fn find_one(&self, point: &K) -> Option<&V> {
-        let cursor = self.btree.lower_bound(core::ops::Bound::Excluded(point));
-        // There's only one previous element that may contain the point.
-        // If it doesn't, there's no other chances.
-        cursor
-            .peek_prev()
-            .and_then(|(_, v)| (v.range().end > *point).then_some(v))
-    }
-
-    /// Finds an interval item that contains the given point.
-    ///
-    /// If no such item exists, returns [`None`]. Otherwise, returns the
-    /// mutable reference to the item that contains the point.
-    pub(super) fn find_one_mut(&mut self, point: &K) -> Option<&mut V> {
-        // Only the last interval starting at or before the point can contain it.
-        self.btree
-            .range_mut((core::ops::Bound::Unbounded, core::ops::Bound::Included(point)))
-            .next_back()
-            .and_then(|(_, value)| (value.range().end > *point).then_some(value))
-    }
-
-    /// Finds all interval items that intersect with the given range.
-    pub(crate) fn find<'a>(&'a self, range: &Range<K>) -> IntervalIter<'a, K, V> {
-        let cursor = self
-            .btree
-            .lower_bound(core::ops::Bound::Excluded(&range.start));
-        IntervalIter {
-            cursor,
-            range: range.clone(),
-            peeked_prev: false,
+    pub(super) fn inline_mut(&mut self) -> Option<&mut Option<V>> {
+        match &mut self.storage {
+            Storage::Inline(slot) => Some(slot),
+            Storage::Array(_) | Storage::Tree(_) => None,
         }
     }
 
-    /// Positions a cursor between the neighbors of an unmapped address.
+    /// Small sets retain their sorted values directly without a separate key.
+    pub(super) fn small_mut(&mut self) -> Option<&mut [V]> {
+        match &mut self.storage {
+            Storage::Inline(slot) => Some(slot.as_mut_slice()),
+            Storage::Array(pair) => Some(pair.as_mut_slice()),
+            Storage::Tree(_) => None,
+        }
+    }
+
+    fn ensure_tree(&mut self) -> &mut IntervalMap<K, V> {
+        if !matches!(self.storage, Storage::Tree(_)) {
+            #[cfg(feature = "memory_accounting")]
+            let mut tree = BTreeMap::new_in(self.accounting.clone());
+            #[cfg(not(feature = "memory_accounting"))]
+            let mut tree = BTreeMap::new();
+            match core::mem::replace(&mut self.storage, Storage::Inline(None)) {
+                Storage::Inline(Some(old)) => { tree.insert(old.range().start, old); }
+                Storage::Array(pair) => {
+                    for old in pair { tree.insert(old.range().start, old); }
+                }
+                Storage::Inline(None) => {}
+                Storage::Tree(_) => unreachable!(),
+            }
+            self.storage = Storage::Tree(tree);
+        }
+        let Storage::Tree(tree) = &mut self.storage else { unreachable!() };
+        tree
+    }
+
+    /// Inserts or replaces the interval keyed by its lower endpoint.
+    pub(crate) fn insert(&mut self, item: V) {
+        let start = item.range().start;
+        match &mut self.storage {
+            Storage::Inline(slot) => {
+                if slot.as_ref().is_none_or(|old| old.range().start == start) {
+                    *slot = Some(item);
+                } else {
+                    let old = slot.take().unwrap();
+                    let items = if old.range().start < start { [old, item] } else { [item, old] };
+                    #[cfg(not(feature = "memory_accounting"))]
+                    let mut array = Vec::with_capacity(2);
+                    #[cfg(feature = "memory_accounting")]
+                    let mut array = Vec::with_capacity_in(2, self.accounting.clone());
+                    array.extend(items);
+                    self.storage = Storage::Array(array);
+                }
+                return;
+            }
+            Storage::Array(array) => {
+                let index = array.partition_point(|v| v.range().start < start);
+                if let Some(old) = array.get_mut(index)
+                    && old.range().start == start
+                {
+                    *old = item;
+                    return;
+                }
+                if array.len() < Self::array_limit() {
+                    if array.len() == array.capacity() {
+                        let next = (array.len() + (array.len() / 2).max(1)).min(Self::array_limit());
+                        array.reserve_exact(next - array.len());
+                    }
+                    array.insert(index, item);
+                    return;
+                }
+            }
+            Storage::Tree(_) => {}
+        }
+        self.ensure_tree().insert(start, item);
+    }
+
+    fn take_from_array(&mut self, index: usize) -> V {
+        let Storage::Array(array) = &mut self.storage else { unreachable!() };
+        let taken = array.remove(index);
+        if array.len() == 1 {
+            let last = array.pop();
+            self.storage = Storage::Inline(last);
+        } else if array.len() <= array.capacity() / 4 {
+            array.shrink_to(2 * array.len());
+        }
+        taken
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        match &mut self.storage {
+            Storage::Inline(slot) => slot.take_if(|v| v.range().start == *key),
+            Storage::Array(pair) => {
+                let index = pair.binary_search_by(|v| v.range().start.cmp(key)).ok()?;
+                Some(self.take_from_array(index))
+            }
+            Storage::Tree(tree) => tree.remove(key),
+        }
+    }
+
+    #[cfg(any(ktest, feature = "memory_accounting"))]
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &V> {
+        let (single, tree) = match &self.storage {
+            Storage::Inline(slot) => (slot.as_slice(), None),
+            Storage::Array(pair) => (pair.as_slice(), None),
+            Storage::Tree(tree) => (&[][..], Some(tree.values())),
+        };
+        single.into_iter().chain(tree.into_iter().flatten())
+    }
+
+    pub(crate) fn find_one(&self, point: &K) -> Option<&V> {
+        match &self.storage {
+            Storage::Inline(slot) => slot.as_ref().filter(|v| v.range().contains(point)),
+            Storage::Array(array) => array.get(array.partition_point(|v| v.range().end <= *point))
+                .filter(|v| v.range().start <= *point),
+            Storage::Tree(tree) => tree.lower_bound(core::ops::Bound::Excluded(point))
+                .peek_prev().and_then(|(_, v)| (v.range().end > *point).then_some(v)),
+        }
+    }
+
+    pub(super) fn find_one_mut(&mut self, point: &K) -> Option<&mut V> {
+        match &mut self.storage {
+            Storage::Inline(slot) => slot.as_mut().filter(|v| v.range().contains(point)),
+            Storage::Array(array) => {
+                let index = array.partition_point(|v| v.range().end <= *point);
+                array.get_mut(index).filter(|v| v.range().start <= *point)
+            }
+            Storage::Tree(tree) => tree.range_mut((core::ops::Bound::Unbounded, core::ops::Bound::Included(point)))
+                .next_back().and_then(|(_, v)| (v.range().end > *point).then_some(v)),
+        }
+    }
+
+    /// Finds all interval items that intersect with the given range.
+    pub(crate) fn find<'a>(&'a self, range: &Range<K>) -> impl Iterator<Item = &'a V> {
+        let (small, tree) = match &self.storage {
+            Storage::Inline(slot) => (slot.as_slice(), None),
+            Storage::Array(pair) => (pair.as_slice(), None),
+            Storage::Tree(tree) => (&[][..], Some(IntervalIter {
+                cursor: tree.lower_bound(core::ops::Bound::Excluded(&range.start)),
+                range: range.clone(),
+                peeked_prev: false,
+            })),
+        };
+        let range = range.clone();
+        let first = small.partition_point(|v| v.range().end <= range.start);
+        small[first..].iter().take_while(move |v| {
+            let start = v.range().start;
+            start <= range.start || start < range.end
+        }).chain(tree.into_iter().flatten())
+    }
+
+    pub(super) fn first_intersection(&self, range: &Range<K>) -> Option<&V> {
+        self.find(range).next()
+    }
+
     pub(super) fn gap_before(&mut self, point: &K) -> IntervalCursorMut<'_, K, V> {
-        self.btree
-            .lower_bound_mut(core::ops::Bound::Included(point))
+        self.ensure_tree().lower_bound_mut(core::ops::Bound::Included(point))
     }
 
-    /// Finds the last interval that covers any address smaller the point.
-    ///
-    /// If no such item exists, returns [`None`].
     pub(crate) fn find_prev(&self, point: &K) -> Option<&V> {
-        self.btree
-            .upper_bound(core::ops::Bound::Excluded(point))
-            .peek_prev()
-            .map(|(_, v)| v)
+        match &self.storage {
+            Storage::Inline(slot) => slot.as_ref().filter(|v| v.range().start < *point),
+            Storage::Array(array) => array[..array.partition_point(|v| v.range().start < *point)].last(),
+            Storage::Tree(tree) => tree.upper_bound(core::ops::Bound::Excluded(point))
+                .peek_prev().map(|(_, v)| v),
+        }
     }
 
-    /// Finds the first interval that covers any address greater the point.
-    ///
-    /// If no such item exists, returns [`None`].
     pub(crate) fn find_next(&self, point: &K) -> Option<&V> {
-        let cursor = self.btree.lower_bound(core::ops::Bound::Excluded(point));
-
-        if let Some((_, v)) = cursor.peek_prev()
-            && v.range().end > *point
-        {
+        let tree = match &self.storage {
+            Storage::Inline(slot) => return slot.as_ref().filter(|v| v.range().end > *point),
+            Storage::Array(array) => return array.get(array.partition_point(|v| v.range().end <= *point)),
+            Storage::Tree(tree) => tree,
+        };
+        let cursor = tree.lower_bound(core::ops::Bound::Excluded(point));
+        if let Some((_, v)) = cursor.peek_prev() && v.range().end > *point {
             Some(v)
         } else {
             cursor.peek_next().map(|(_, v)| v)
         }
     }
 
-    /// Takes an interval item that contains the given point.
-    ///
-    /// If no such item exists, returns [`None`]. Otherwise, returns the item
-    /// that contains the point.
     pub(crate) fn take_one(&mut self, point: &K) -> Option<V> {
-        let mut cursor = self
-            .btree
-            .lower_bound_mut(core::ops::Bound::Excluded(point));
-
-        if let Some((_, v)) = cursor.peek_prev()
-            && v.range().end > *point
-        {
+        let tree = match &mut self.storage {
+            Storage::Inline(slot) => return slot.take_if(|v| v.range().contains(point)),
+            Storage::Array(pair) => {
+                let index = pair.partition_point(|v| v.range().end <= *point);
+                if pair.get(index)?.range().start > *point {
+                    return None;
+                }
+                return Some(self.take_from_array(index));
+            }
+            Storage::Tree(tree) => tree,
+        };
+        let mut cursor = tree.lower_bound_mut(core::ops::Bound::Excluded(point));
+        if let Some((_, v)) = cursor.peek_prev() && v.range().end > *point {
             return Some(cursor.remove_prev().unwrap().1);
         }
-
         None
     }
 
@@ -188,7 +308,7 @@ where
     #[cfg(ktest)]
     pub(crate) fn take<'a>(&'a mut self, range: &Range<K>) -> IntervalDrain<'a, K, V> {
         let cursor = self
-            .btree
+            .ensure_tree()
             .lower_bound_mut(core::ops::Bound::Excluded(&range.start));
         IntervalDrain {
             cursor,
@@ -199,7 +319,7 @@ where
 
     /// Clears the interval set, removing all intervals.
     pub(crate) fn clear(&mut self) {
-        self.btree.clear();
+        self.storage = Storage::Inline(None);
     }
 }
 
@@ -307,14 +427,68 @@ mod tests {
         }
     }
 
+    #[ktest]
+    fn small_array_grows_replaces_and_preserves_order() {
+        let item = |start| TestInterval { range: start..start + 3 };
+        let mut set = IntervalSet::new();
+        set.insert(item(8));
+        set.insert(item(2));
+        assert!(matches!(&set.storage, Storage::Array(a) if a.len() == 2 && a.capacity() == 2));
+        assert_eq!(set.find(&(4..9)).count(), 2);
+        assert_eq!(set.find_next(&5).unwrap().range(), 8..11);
+        assert_eq!(set.find_prev(&8).unwrap().range(), 2..5);
+        set.insert(TestInterval {range: 2..6});
+        assert_eq!(set.take_one(&5).unwrap().range(), 2..6);
+        assert!(matches!(set.storage, Storage::Inline(Some(_))));
+        set.insert(item(20));
+        assert_eq!(set.remove(&8).unwrap().range(), 8..11);
+        set.insert(item(8)); set.insert(item(2));
+        assert!(matches!(set.storage, Storage::Array(_)));
+        assert_eq!(set.iter().map(|v| v.range().start).collect::<Vec<_>>(), vec![2,8,20]);
+        set.insert(item(30));
+        assert!(matches!(set.storage, Storage::Array(_)));
+        set.insert(item(25));
+        assert!(matches!(set.storage, Storage::Array(_)));
+        assert_eq!(set.iter().map(|v| v.range().start).collect::<Vec<_>>(), vec![2,8,20,25,30]);
+    }
+
+    #[ktest]
+    fn packed_intervals_spill_without_losing_covered_pages_or_gaps() {
+        let mut set = IntervalSet::new();
+        let limit = IntervalSet::<i32, TestInterval>::array_limit() as i32;
+        for i in (0..limit).rev() {
+            set.insert(TestInterval { range: 4*i..4*i+2 });
+        }
+        assert!(matches!(&set.storage, Storage::Array(a) if a.len() == limit as usize));
+        for i in 0..limit {
+            assert_eq!(set.find_one(&(4*i+1)).unwrap().range(), 4*i..4*i+2);
+            assert!(set.find_one(&(4*i+2)).is_none());
+            assert!(set.take_one(&(4*i+3)).is_none());
+        }
+        assert_eq!(set.find(&(3..10)).count(), 2);
+        set.find_one_mut(&5).unwrap().range.end = 7;
+        assert_eq!(set.take_one(&6).unwrap().range(), 4..7);
+        set.insert(TestInterval { range: 4..6 });
+        set.insert(TestInterval { range: 4*limit..4*limit+2 });
+        assert!(matches!(set.storage, Storage::Tree(_)));
+        assert_eq!(set.iter().count(), limit as usize + 1);
+        assert_eq!(set.find_prev(&(4*limit)).unwrap().range().start, 4*(limit-1));
+        assert_eq!(set.find_next(&(4*limit-1)).unwrap().range().start, 4*limit);
+    }
+
     #[cfg(feature = "memory_accounting")]
     #[ktest]
     fn btree_allocation_growth_and_clear() {
         let mut set = IntervalSet::new();
         assert_eq!(set.allocation_snapshot().allocations, 0);
-        for index in 0..512 {
+        let limit = IntervalSet::<i32, TestInterval>::array_limit() as i32;
+        for index in 0..limit {
             set.insert(TestInterval { range: index * 2..index * 2 + 1 });
         }
+        let array = set.allocation_snapshot();
+        assert_eq!(array.allocations, 1);
+        assert!(array.requested_bytes >= limit as usize * size_of::<TestInterval>());
+        set.insert(TestInterval { range: limit * 2..limit * 2 + 1 });
         let full = set.allocation_snapshot();
         assert!(full.allocations > 1);
         assert!(full.requested_bytes > 0);
@@ -402,6 +576,30 @@ mod tests {
 
         let taken: Vec<TestInterval> = set.take(&(35..45)).collect();
         assert_eq!(taken, vec![interval2]);
+    }
+
+    #[ktest]
+    fn singleton_lookup_replacement_and_promotion() {
+        let mut set = IntervalSet::new();
+        set.insert(TestInterval { range: 20..30 });
+        assert!(set.inline_mut().is_some());
+        assert!(set.find_one(&19).is_none());
+        assert!(set.find_one(&20).is_some());
+        assert!(set.find_one(&30).is_none());
+        assert!(set.find_prev(&20).is_none());
+        assert!(set.find_next(&20).is_some());
+        assert_eq!(set.find(&(10..21)).count(), 1);
+        assert_eq!(set.find(&(20..20)).count(), 1);
+        assert_eq!(set.find(&(30..40)).count(), 0);
+        set.insert(TestInterval { range: 20..32 });
+        assert!(set.find_one(&31).is_some());
+        set.insert(TestInterval { range: 40..45 });
+        assert!(set.inline_mut().is_none());
+        assert_eq!(set.find(&(29..41)).count(), 2);
+        assert_eq!(set.take_one(&41).unwrap().range, 40..45);
+        set.clear();
+        assert!(set.inline_mut().is_some());
+        assert!(set.find_next(&0).is_none());
     }
 
     #[ktest]
