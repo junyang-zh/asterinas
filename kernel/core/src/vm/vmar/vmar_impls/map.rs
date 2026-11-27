@@ -415,6 +415,24 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             let frames_mapped = map_populate(&mut cursor, vm_mapping);
             parent.add_rss_counter(rss_type, frames_mapped as isize);
         } else {
+            // Faults in an untouched full upper-level entry would all need to
+            // upgrade its parent. Delegate the first such interval while mmap
+            // still holds the covering writer. Later intervals stay sparse,
+            // including arbitrarily large reservations. No user frame is mapped.
+            if cursor.guard_level() >= 3 && perms.contains(VmPerms::WRITE)
+                && !vm_mapping.is_shared() && matches!(vm_mapping.mapped_mem(), MappedMemory::Anonymous)
+            {
+                let span = ostd::mm::page_size_at(3);
+                if let Some(start) = map_to_addr.checked_next_multiple_of(span)
+                    && affected_range.end.saturating_sub(start) >= span
+                {
+                    cursor.jump(start).unwrap();
+                    cursor.adjust_level(2);
+                    let level = cursor.guard_level();
+                    cursor.adjust_level(level);
+                    cursor.jump(map_to_addr).unwrap();
+                }
+            }
             map_to_page_table(&mut cursor, vm_mapping);
         }
 

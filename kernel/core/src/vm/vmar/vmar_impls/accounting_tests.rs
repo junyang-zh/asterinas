@@ -820,3 +820,33 @@ fn fork_and_clear_keep_shared_alias_registration_exact() {
     assert!(check(child_key).is_empty());
     assert_eq!(check(vmar.weak_self.clone()), expected);
 }
+
+
+#[ktest]
+fn large_anon_reservation_delegates_one_full_interval_and_keeps_rss_lazy() {
+    let vmar = new_vmar();
+    let span = ostd::mm::page_size_at(3);
+    let start = 8 * span - PAGE_SIZE;
+    let end = 12 * span + PAGE_SIZE;
+    let limit = RLimit64::new_for_accounting_test(RLIM_INFINITY);
+    let before = vmar.get_rss_counter(RssType::Anon);
+    map(&vmar, start, (end - start) / PAGE_SIZE, &limit).unwrap();
+    {
+        let guard = disable_preempt();
+        let mut cursor = vmar.vm_space().cursor(&guard, &(0..VMAR_CAP_ADDR)).unwrap();
+        for (va, expected) in [(8 * span, 2), (9 * span, 3), (10 * span, 3)] {
+            cursor.jump(va).unwrap();
+            while cursor.push_level_if_exists().is_some() {}
+            assert_eq!(cursor.level(), expected);
+        }
+    }
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), before);
+    for (va,value) in [(start,11),(8 * span,22),(9 * span,33),(end-PAGE_SIZE,44)] {
+        write_byte(&vmar, va, value);
+        assert_eq!(read_byte(&vmar, va), value);
+    }
+    assert_consistent(&vmar);
+    vmar.remove_mapping(start..end).unwrap();
+    assert_eq!(vmar.get_rss_counter(RssType::Anon), before);
+    assert_consistent(&vmar);
+}
