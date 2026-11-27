@@ -764,3 +764,32 @@ fn private_file_write_fault_preserves_sibling_pages() {
     assert_eq!(read_byte(&vmar, ADDR + 2 * PAGE_SIZE), 0);
     assert_consistent(&vmar);
 }
+
+#[ktest]
+fn fixed_leaf_holes_and_partial_replacement_preserve_data_and_charges() {
+    let vmar = new_vmar();
+    let base = vmar.get_mappings_total_size();
+    let limit = RLimit64::new_for_accounting_test((base + 7 * PAGE_SIZE) as u64);
+    let rights = VmPerms::READ | VmPerms::WRITE;
+    let fixed = |page: usize, pages: usize| {
+        vmar.new_map(NonZeroUsize::new(pages * PAGE_SIZE).unwrap(), rights)
+            .unwrap()
+            .offset(ADDR + page * PAGE_SIZE, OffsetType::Fixed)
+            .build_with_rlimit_as(&limit)
+    };
+    for (page, byte) in [(1, 11), (4, 44), (7, 77)] {
+        fixed(page, 1).unwrap();
+        write_byte(&vmar, ADDR + page * PAGE_SIZE, byte);
+    }
+    fixed(2, 2).unwrap();
+    assert_eq!(read_byte(&vmar, ADDR + 2 * PAGE_SIZE), 0);
+    assert_eq!(read_byte(&vmar, ADDR + 4 * PAGE_SIZE), 44);
+    fixed(3, 4).unwrap();
+    assert_eq!(vmar.get_mappings_total_size(), base + 7 * PAGE_SIZE);
+    assert_eq!(read_byte(&vmar, ADDR + 4 * PAGE_SIZE), 0);
+    assert_eq!(read_byte(&vmar, ADDR + PAGE_SIZE), 11);
+    assert_eq!(read_byte(&vmar, ADDR + 7 * PAGE_SIZE), 77);
+    assert_eq!(fixed(8, 1).unwrap_err().error(), Errno::ENOMEM);
+    assert!(!present(&vmar, ADDR + 8 * PAGE_SIZE));
+    assert_consistent(&vmar);
+}

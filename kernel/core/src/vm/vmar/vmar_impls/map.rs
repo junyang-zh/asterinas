@@ -358,8 +358,12 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
             stack_cpu,
         )?;
 
-        let replaces_existing = matches!(offset, Some((_, OffsetType::Fixed)));
         let affected_range = map_to_addr..map_to_addr + map_size.get();
+        // The locked leaf contains all mapping metadata for this range.
+        // A hole needs neither reverse-map collection nor removal.
+        let replaces_existing = matches!(offset, Some((_, OffsetType::Fixed)))
+            && (cursor.guard_level() != 1
+                || cursor.aux_meta().inner.find(&affected_range).next().is_some());
         let old_rmap_entries = if replaces_existing {
             Vmar::snapshot_rmap_entries(&mut cursor, core::slice::from_ref(&affected_range))
         } else {
